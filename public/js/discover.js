@@ -246,6 +246,29 @@ function exploreKeyword(input) {
     <a href="#" data-filterq="${esc(keys.join(' '))}">show my matching stars</a></p>`;
   exploreTheme('kw:' + keys.join('+'), keys, members);
 }
+/** Suggestions around one starred repo: the same signals as a theme (searches, repos whose README mentions it, its
+ *  most-starred forks, links in its README), with keywords picked from the repo in this order:
+ *    1. words of its name ("scrcpy", "orca slicer")
+ *    2. its topics that other stars of yours share, most shared first ("android", "3d-printer"),
+ *       then its remaining topics
+ *    3. description words found in 3+ of your stars ("speech"), which skips one-off words like "robust" */
+function exploreRepo(repo) {
+  const df = new Map();
+  for (const r of S.repos) for (const t of repoWords(r).keys()) df.set(t, (df.get(t) || 0) + 1);
+  const byShared = list => [...new Set(list)].sort((a, b) => (df.get(b) || 0) - (df.get(a) || 0));
+  const name = nameWords(repo.name);
+  const topics = byShared(repo.topics.filter(t => !STOP.has(t)));
+  const shared = topics.filter(t => df.get(t) >= 2), rest = topics.filter(t => !(df.get(t) >= 2));
+  const about = byShared(words(repo.about)).filter(t => df.get(t) >= 3);
+  const keys = [...new Set([...name, ...shared, ...rest, ...about])].slice(0, 4);
+  if (!keys.length) keys.push(repo.name.toLowerCase());
+  openPanel();
+  $('#dbody').innerHTML = `<p>✨ Suggestions related to <b>${esc(repo.full)}</b>
+    <span class="muted">· based on ${keys.map(k => `“${esc(k)}”`).join(', ')}, repos mentioning it, its forks and its README links</span></p>`;
+  $('#insights').scrollIntoView({block: 'start', behavior: 'smooth'});
+  exploreTheme('repo:' + repo.id, keys, [repo]);
+}
+
 const keywordMembers = keys => S.repos
   .filter(r => keys.some(k => (r.full + ' ' + r.about + ' ' + r.topics.join(' ')).toLowerCase().includes(k) || readmeLower(r).includes(k)))
   .sort((a, b) => b.stars - a.stars);
@@ -293,17 +316,24 @@ function themesHTML() {
     group('Niches', t => t.members.length <= 25) + group('Broad interests', t => t.members.length > 25);
 }
 
+/** Opens the panel with its tab bar and empty body/result areas, without loading any tab content. */
+function openPanel(activeTab = null) {
+  const box = $('#insights');
+  box.classList.add('show');
+  const tabs = [['themes', 'Your themes'], ['mentions', 'Linked from your READMEs'], ['owners', 'Owners you like'], ['overview', 'Patterns']];
+  box.innerHTML = `<div class="tabs">${tabs.map(([k, l]) => `<button data-dtab="${k}" class="${activeTab === k ? 'on' : ''}">${l}</button>`).join('')}
+      <form id="kwForm"><input id="kw" placeholder="Explore any keyword, e.g. scrcpy" aria-label="Keyword"><button>Explore</button></form></div>
+    <div id="dbody"></div><div id="dres"></div>`;
+  $('#kwForm').onsubmit = e => { e.preventDefault(); exploreKeyword($('#kw').value); };
+}
+
 /** Opens/closes the panel (no argument) or switches tab. */
 function show(newTab) {
   const box = $('#insights');
   if (!newTab) { box.classList.toggle('show'); if (!box.classList.contains('show')) return; }
   if (!S.repos.length) { box.innerHTML = '<p class="muted">Load some stars first.</p>'; return; }
   tab = newTab || tab;
-  const tabs = [['themes', 'Your themes'], ['mentions', 'Linked from your READMEs'], ['owners', 'Owners you like'], ['overview', 'Patterns']];
-  box.innerHTML = `<div class="tabs">${tabs.map(([k, l]) => `<button data-dtab="${k}" class="${tab === k ? 'on' : ''}">${l}</button>`).join('')}
-      <form id="kwForm"><input id="kw" placeholder="Explore any keyword, e.g. scrcpy" aria-label="Keyword"><button>Explore</button></form></div>
-    <div id="dbody"></div><div id="dres"></div>`;
-  $('#kwForm').onsubmit = e => { e.preventDefault(); exploreKeyword($('#kw').value); };
+  openPanel(tab);
   if (tab === 'themes') $('#dbody').innerHTML = themesHTML();
   else if (tab === 'mentions') exploreMentions();
   else if (tab === 'owners') exploreOwners();
@@ -341,6 +371,10 @@ async function toggleStar(full, btn) {
 
 export function initDiscover() {
   $('#toggleInsights').onclick = () => show();
+  window.addEventListener('suggest-for', e => {   // "✨ Show suggestions" on a repo card (list.js)
+    const repo = S.repos.find(r => r.id === e.detail);
+    if (repo) exploreRepo(repo);
+  });
   $('#insights').addEventListener('click', async e => {
     const t = e.target.closest('[data-dtab],[data-theme],[data-dismiss],[data-refresh],[data-filterq],[data-star]');
     if (!t) return;

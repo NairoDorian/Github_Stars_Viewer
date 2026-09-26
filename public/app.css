@@ -50,6 +50,7 @@ aside h3,#insights h3{font-size:12px;text-transform:uppercase;color:var(--muted)
 .snip{font-size:12px;color:var(--muted);border-left:2px solid var(--star);padding-left:8px;overflow-wrap:anywhere}
 mark{background:var(--star);color:#000;border-radius:2px}
 #more{margin:16px auto;display:block}
+.similar{align-self:flex-start;margin-top:auto;padding:2px 10px;font-size:12px;color:var(--accent);background:transparent}
 
 /* ---- discover panel ---- */
 #insights{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin:0 16px 16px;display:none}

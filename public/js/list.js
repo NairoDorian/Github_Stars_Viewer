@@ -66,6 +66,7 @@ function card(r, snip, re) {
       <span title="${esc(r.starred)}">starred ${ago(r.starred)}</span>
       ${home ? `<a href="${esc(home)}" target="_blank" rel="noopener">site ↗</a>` : ''}
     </div>
+    <button class="similar" data-similar="${esc(r.id)}" title="Find repos related to this one that you haven't starred">✨ Show suggestions</button>
   </div>`;
 }
 
@@ -121,6 +122,11 @@ export function initList() {
   $('#sort').onchange = () => { limit = PAGE; render(); };
   $('#inReadme').onchange = () => render();
   $('#more').onclick = () => { limit += PAGE; render(); };
+  // "✨ Show suggestions" on a card: discover.js listens (an event keeps list.js independent of discover.js).
+  $('#list').addEventListener('click', e => {
+    const b = e.target.closest('[data-similar]');
+    if (b) window.dispatchEvent(new CustomEvent('suggest-for', {detail: Number(b.dataset.similar)}));
+  });
   // Facet and chip clicks (sidebar and cards) toggle the matching filter.
   document.addEventListener('click', e => {
     const el = e.target.closest('#facets [data-lang], #facets [data-topic], #facets [data-owner], #list [data-topic], #list [data-owner]');

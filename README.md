@@ -15,6 +15,7 @@ No build step and no dependencies. The same code runs online (GitHub Pages) or l
 - **Search** name, owner, description and topics, with highlighting. Press `/` to focus the search box.
 - **Search inside READMEs.** Click *Index READMEs* once, then tick *Search in READMEs*. Matches show a snippet.
 - **Filters** by language, topic and owner.
+- **✨ Show suggestions** on any starred repo: related repos you haven't starred yet, based on that repo's name and topics, repos whose README mentions it, its most-starred forks and the links in its README.
 - **🧭 Discover & suggestions:**
   - **Your themes.** Clusters detected automatically in your stars, for example *scrcpy*, *ReVanced*, *Kokoro TTS*. Pick one to find related repos you haven't starred yet. Suggestions come from:
     - keyword and topic search
