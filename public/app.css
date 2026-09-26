@@ -2,6 +2,7 @@
 :root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--star:#e3b341;--chip:#1f2937}
 @media (prefers-color-scheme: light){:root{--bg:#f6f8fa;--panel:#fff;--border:#d0d7de;--text:#1f2328;--muted:#656d76;--accent:#0969da;--star:#9a6700;--chip:#eef2f6}}
 *{box-sizing:border-box}
+[hidden]{display:none!important}   /* never let a display rule override the hidden attribute */
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
 a{color:var(--accent)}
 code{font-size:12px;background:var(--chip);padding:1px 4px;border-radius:4px}

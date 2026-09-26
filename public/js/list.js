@@ -4,7 +4,7 @@ import {$, esc, escRe, fmtN, ago, when, safeUrl, tally} from './util.js';
 import {activityNow, starGains, ACTIVITY_SPAN, ACTIVITY_BUCKETS} from './github.js';
 import {curveFor, curveGains, watchStarCharts} from './starhistory.js';
 
-const PAGE = 500;                                  // cards rendered per "page"; more via the Show more button
+const PAGE = 200;   // cards rendered per step; more load automatically when you reach the end (or via Show more)
 const filters = {lang: null, topic: null, owner: null};
 let limit = PAGE;
 
@@ -167,9 +167,9 @@ export function render() {
   const filtered = Object.values(filters).some(Boolean);
   $('#count').textContent = `${out.length} of ${S.repos.length} repos` + (filtered ? ' (filtered: click a facet again to clear)' : '');
   $('#list').innerHTML = out.slice(0, limit).map(x => card(x.r, x.snip, re)).join('');
-  const more = $('#more');
-  more.hidden = out.length <= limit;
-  more.textContent = `Show more (${out.length - limit} left)`;
+  const left = out.length - limit, more = $('#more');
+  more.hidden = left <= 0;   // everything shown: no button at all
+  if (left > 0) more.textContent = `Show more (${left} left)`;
   renderFacets();
   watchStarCharts($('#list'));
 }
@@ -201,7 +201,11 @@ export function initList() {
   $('#q').oninput = () => { clearTimeout(timer); timer = setTimeout(() => { limit = PAGE; render(); }, 120); };
   $('#sort').onchange = () => { limit = PAGE; render(); };
   $('#inReadme').onchange = () => render();
-  $('#more').onclick = () => { limit += PAGE; render(); };
+  const showMore = () => { if (!$('#more').hidden) { limit += PAGE; render(); } };
+  $('#more').onclick = showMore;
+  // Infinite scroll: when the button comes near the viewport, load the next step automatically.
+  if (typeof IntersectionObserver !== 'undefined')
+    new IntersectionObserver(es => { if (es.some(e => e.isIntersecting)) showMore(); }, {rootMargin: '600px'}).observe($('#more'));
   // "✨ Show suggestions" on a card: discover.js listens (an event keeps list.js independent of discover.js).
   $('#list').addEventListener('click', e => {
     const b = e.target.closest('[data-similar]');
