@@ -2,7 +2,7 @@
 import {S, readmeText, readmeLower} from './state.js';
 import {$, esc, escRe, fmtN, ago, when, safeUrl, tally} from './util.js';
 import {activityNow, starGains, ACTIVITY_SPAN, ACTIVITY_BUCKETS} from './github.js';
-import {curveFor, curveGains, watchStarCharts} from './starhistory.js';
+import {curveFor, starsAt, watchStarCharts} from './starhistory.js';
 
 const PAGE = 200;   // cards rendered per step; more load automatically when you reach the end (or via Show more)
 const filters = {lang: null, topic: null, owner: null};
@@ -73,6 +73,21 @@ function sparkbars(counts, {end, unit, cls}) {
   return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="${unit}s per 2 weeks, last 12 months">${bars}</svg>`;
 }
 
+/** Full star timeline, from the repo's first star to today: a cumulative area (x scaled per repo) with invisible
+ *  hover segments that show the date range, the total at its end and the stars gained in it. */
+function starTimeline(pts) {
+  const t0 = pts[0][0], t1 = Date.now(), span = Math.max(1, t1 - t0), max = Math.max(1, starsAt(pts, t1));
+  const N = 60, x = t => (t - t0) / span * W, y = v => H - 1 - v / max * (H - 3);
+  const line = Array.from({length: N + 1}, (_, i) => { const t = t0 + span * i / N; return `${x(t).toFixed(1)},${y(starsAt(pts, t)).toFixed(1)}`; });
+  const month = t => new Date(t).toLocaleDateString(undefined, {month: 'short', year: 'numeric'});
+  const tips = Array.from({length: 26}, (_, i) => {
+    const a = t0 + span * i / 26, b = t0 + span * (i + 1) / 26, va = Math.round(starsAt(pts, a)), vb = Math.round(starsAt(pts, b));
+    return `<rect class="hit" x="${x(a).toFixed(1)}" y="0" width="${(W / 26).toFixed(1)}" height="${H}"><title>${month(a)} – ${month(b)}: ${vb.toLocaleString()} stars (+${(vb - va).toLocaleString()})</title></rect>`;
+  }).join('');
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="stars over the repo's whole life">
+    <path class="s-area" d="M0,${H} L${line.join(' L')} L${W},${H} Z"/><path class="s-line" d="M${line.join(' L')}" vector-effect="non-scaling-stroke"/>${tips}</svg>`;
+}
+
 /** Commits row (GitHub) + stars row. Stars come from star-history.com (full history, loaded lazily when the card
  *  scrolls into view, see starhistory.js); if it has no data for a repo, the app's own daily star-count samples are used. */
 const shown = new Map();   // lower-cased full name → repo object, so a card can be redrawn when its star history arrives
@@ -88,9 +103,9 @@ export function activityHTML(r) {
   }
   const empty = Array(ACTIVITY_BUCKETS).fill(null);
   if (curve?.pts) {
-    const gains = curveGains(curve.pts, ACTIVITY_BUCKETS, ACTIVITY_SPAN), total = gains.reduce((a, b) => a + b, 0);
-    rows.push(`<span class="act-label">Stars</span>${sparkbars(gains, {end: Date.now(), unit: 'new star', cls: 's'})}
-      <span class="act-val" title="new stars in the last 12 months (star history from star-history.com)">+${fmtN(total)}<small> / yr</small></span>`);
+    const pts = curve.pts, total = Math.max(pts.at(-1)[1], r.stars ?? r.stargazers_count ?? 0);
+    rows.push(`<span class="act-label">Stars</span>${starTimeline(pts)}
+      <span class="act-val" title="${fmtN(total)} stars since ${day(pts[0][0])} ${new Date(pts[0][0]).getFullYear()} (full history from star-history.com)">${fmtN(total)}<small> since ${new Date(pts[0][0]).getFullYear()}</small></span>`);
   } else if (!curve && full) {   // not loaded yet: same frame, filled in when star-history.com answers
     rows.push(`<span class="act-label">Stars</span>${sparkbars(empty, {end: Date.now(), unit: 'new star', cls: 's'})}
       <span class="act-val muted"><small>loading…</small></span>`);

@@ -63,6 +63,9 @@ mark{background:var(--star);color:#000;border-radius:2px}
 .spark rect.zero{fill:var(--muted);opacity:.45}
 .spark rect.nodata{fill:var(--muted);opacity:.18}
 .spark rect:hover{opacity:.7}
+.spark .s-area{fill:var(--star);opacity:.25}
+.spark .s-line{fill:none;stroke:var(--star);stroke-width:2;stroke-linejoin:round}
+.spark rect.hit{fill:transparent}.spark rect.hit:hover{fill:var(--text);opacity:.08}
 .langs{display:flex;flex-direction:column;gap:4px}
 .langbar{display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--chip)}
 .langbar i{display:block;height:100%;min-width:1px}

@@ -103,7 +103,7 @@ export function parseStarHistorySvg(svgText) {
 }
 
 /** Stars at time t, interpolated on the curve (0 before the first star). */
-function starsAt(pts, t) {
+export function starsAt(pts, t) {
   if (t <= pts[0][0]) return 0;
   if (t >= pts.at(-1)[0]) return pts.at(-1)[1];
   let i = 1; while (pts[i][0] < t) i++;

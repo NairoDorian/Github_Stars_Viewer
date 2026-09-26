@@ -15,9 +15,9 @@ No build step and no dependencies. The same code runs online (GitHub Pages) or l
 - **Search** name, owner, description and topics, with highlighting. Press `/` to focus the search box.
 - **Search inside READMEs.** Click *Index READMEs* once, then tick *Search in READMEs*. Matches show a snippet.
 - **Filters** by language, topic and owner.
-- **Activity charts** on every card (last 12 months, per 2 weeks):
-  - **Commits:** counted on GitHub, with the total per year.
-  - **Stars:** full star history from [star-history.com](https://www.star-history.com), which keeps its own copy of star data now that GitHub no longer shares star dates. Charts load lazily as cards scroll into view and are cached for a week. If it has no data for a repo, the app's own daily star-count samples are used instead.
+- **Activity charts** on every card:
+  - **Commits:** last 12 months per 2 weeks, counted on GitHub, with the total per year.
+  - **Stars:** the **whole timeline**, from the first star to today, as a curve (hover for the count at any time). The data is the full star history from [star-history.com](https://www.star-history.com), which keeps its own copy of star data now that GitHub no longer shares star dates. Charts load lazily as cards scroll into view and are cached for a week. If it has no data for a repo, the app's own daily star-count samples are used instead.
 
   Each bar has a tooltip with its dates and count.
 - **✨ Show suggestions** on any starred repo: related repos you haven't starred yet, based on that repo's name and topics, repos whose README mentions it, its most-starred forks and the links in its README.
