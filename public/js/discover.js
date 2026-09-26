@@ -182,7 +182,7 @@ async function explore(id, {force = false, depth = 0}, run) {
     }
     S.disc.results[id] = {...(old || {}), ...result, items, at: old?.at || Date.now(), depth, forkPolicy,
       sortDatesAt: depth ? null : undefined,   // a deeper page adds candidates that need dates too
-      exhausted: depth >= MAX_DEPTH};
+      exhausted: depth >= MAX_DEPTH || !!result.note?.some(n => /rate limited|token rejected/i.test(n))};
     await saveDisc(g);
     updated = true;
   } catch (e) { progress('⚠ ' + e.message); }
@@ -371,10 +371,16 @@ async function fillSortDates(id, res) {
   if (!S.token || res.sortDatesAt || sortAttempted.has(res)) return;
   sortAttempted.add(res);
   sortPending.add(res);
-  $('#dres .discovery-note').textContent = 'Checking exact commit and release dates for the full result list…';
+  const note = $('#dres .discovery-note');
+  if (note) note.textContent = 'Checking exact commit and release dates for the full result list…';
   const g = S.gen, candidates = visible(res);
   let details;
   try { details = await repoSortDetails(candidates.map(c => c.x.full_name)); }
+  catch (e) {
+    sortIncomplete.add(res);
+    if (g === S.gen && current === id) status('⚠ Could not check suggestion sort dates: ' + e.message);
+    return;
+  }
   finally { sortPending.delete(res); }
   if (g !== S.gen || S.disc.results[id] !== res) return;
   for (const c of candidates) {
@@ -397,7 +403,7 @@ function showResults(id) {
   const low = items.length < MIN_VISIBLE && (!res.exhausted || res.forkPolicy !== S.hideForks);
   const restoreForks = !S.hideForks && res.forkPolicy === true;
   const empty = !items.length && res.exhausted && !low
-    ? `<p>No more suggestions here: everything found is starred or dismissed. Try ↻ Refresh later, another theme, or a keyword.</p>` : '';
+    ? `<p>No suggestions available from this search right now. Try ↻ Refresh later, another theme, or a keyword.</p>` : '';
   el.dataset.resultId = id;
   el.innerHTML = `<div class="discovery-controls"><span class="muted">${items.length} suggestions · found ${ago(res.at)}</span>
       <label>Sort <select id="discoverySort" aria-label="Sort suggestions">${SORT_OPTIONS.filter(([key]) => key !== 'starred')
@@ -415,11 +421,13 @@ function showResults(id) {
 }
 
 /** Hydrate only the cards on screen, then persist those details with the discovery result. */
-let cardBusy = false;
+let cardBusy = false, activeCardId = null, waitingCardId = null;
 async function fillCardDetails(id, onScreen) {
   const need = onScreen.filter(c => c.x.cardDetailsVersion !== 2);
-  if (!S.token || cardBusy || !need.length) return;
+  if (!S.token || !need.length) return;
+  if (cardBusy) { if (id !== activeCardId) waitingCardId = id; return; }
   cardBusy = true;
+  activeCardId = id;
   const g = S.gen;
   let updated = false;
   try {
@@ -430,8 +438,11 @@ async function fillCardDetails(id, onScreen) {
       if (d) { Object.assign(c.x, d, {cardDetailsVersion: 2}); updated = true; }
     }
     if (updated) await saveDisc(g);
-  } finally { cardBusy = false; }
-  if (updated && current && !busy && g === S.gen) showResults(current);
+  } catch (e) { if (g === S.gen && current === id) status('⚠ Could not load suggestion card details: ' + e.message); }
+  finally { cardBusy = false; activeCardId = null; }
+  const refreshWaiting = waitingCardId === current;
+  waitingCardId = null;
+  if ((updated || refreshWaiting) && current && !busy && g === S.gen) showResults(current);
 }
 
 function overviewHTML() {
@@ -489,25 +500,46 @@ export const closeDiscover = () => $('#insights').classList.remove('show');
    Only for your own list: a star always goes to the token owner's account. */
 async function starSuggestion(full, btn) {
   if (!S.token) { needToken(); return status('⚠ Starring needs a token. See the 🔑 panel.'); }
+  const g = S.gen, user = ukey(), token = S.token;
+  const candidate = S.disc.results[current]?.items.find(c => c.x.full_name.toLowerCase() === full.toLowerCase())?.x;
+  let starred = false;
   btn.disabled = true;
   btn.textContent = 'Starring…';
   try {
     const me = await whoAmI();
-    if (me.toLowerCase() !== ukey()) throw new Error(`You're viewing ${S.user}'s stars. Starring only works on your own list (${me}).`);
+    if (g !== S.gen || user !== ukey() || token !== S.token) throw new Error('Profile or token changed; try again.');
+    if (me.toLowerCase() !== user) throw new Error(`You're viewing ${S.user}'s stars. Starring only works on your own list (${me}).`);
     const code = await setStar(full, true);
     if (code === 403 || code === 404) { needToken(); throw new Error('Your token can read but not star. Create one with the "public_repo" scope (the 🔑 panel explains how).'); }
     if (code >= 300) throw new Error('GitHub ' + code);
-    // Add it to your stars locally right away (1 request) instead of re-syncing everything.
-    const x = await (await gh('/repos/' + full)).json();
-    S.repos = [mapStar({starred_at: new Date().toISOString(), repo: x}), ...S.repos];
+    starred = true;
+    if (g !== S.gen || user !== ukey()) return status(`★ Starred ${full} on GitHub. Reload ${user}'s stars to see it here.`);
+    // Prefer fresh REST metadata, but keep the successful star visible even if that follow-up request fails.
+    let x;
+    try {
+      const response = await gh('/repos/' + full);
+      if (!response.ok) throw new Error('repository metadata unavailable');
+      x = await response.json();
+      if (!x?.owner?.login) throw new Error('repository metadata incomplete');
+    }
+    catch {
+      const [owner, name] = full.split('/');
+      x = {...candidate, id: candidate?.id, full_name: full, name, owner: candidate?.owner || {login: owner},
+        html_url: `https://github.com/${full}`, topics: candidate?.topics || []};
+    }
+    if (g !== S.gen || user !== ukey()) return status(`★ Starred ${full} on GitHub. Reload ${user}'s stars to see it here.`);
+    const repo = mapStar({starred_at: new Date().toISOString(), repo: x});
+    S.repos = [repo, ...S.repos.filter(r => (repo.id == null || r.id !== repo.id) && r.full.toLowerCase() !== full.toLowerCase())];
     S.starPages = [];   // page ETags are outdated now; the next check refetches the list
-    await saveStars(); render();
-    status(`★ Starred ${full} on GitHub (unstar it from github.com if that was a mistake)`);
-    showResults(current);   // the starred card disappears and the next suggestion takes its place
+    const saved = await saveStars(g);
+    if (g !== S.gen) return;
+    render();
+    status(`★ Starred ${full} on GitHub${saved ? '' : ' · ⚠ local cache could not be saved; check for updates after reloading'}`);
+    if (current) showResults(current);   // the starred card disappears and the next suggestion takes its place
   } catch (e) {
-    status('⚠ ' + e.message);
-    btn.disabled = false;
-    btn.textContent = '☆ Star';
+    if (g !== S.gen && !starred) return;
+    status((starred ? `★ Starred ${full} on GitHub, but this view could not update: ` : '⚠ ') + e.message);
+    if (!starred) { btn.disabled = false; btn.textContent = '☆ Star'; }
   }
 }
 

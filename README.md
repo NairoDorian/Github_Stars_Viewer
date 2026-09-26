@@ -19,7 +19,7 @@ No build step and no dependencies. The same code runs online (GitHub Pages) or l
 - **Hide forks** in both your starred repos and Discover suggestions with one persistent toolbar toggle. Existing cached suggestions are filtered immediately; when too few non-forks remain, Discover searches for more and skips fork-specific sources. The toggle uses GitHub's fork designation.
 - **Activity charts** on every card:
   - **Commits:** last 12 months per 2 weeks, counted on GitHub, with the total per year.
-  - **Stars:** the **whole timeline**, from the first star to today, as a curve (hover for the count at any time). The data is the full star history from [star-history.com](https://www.star-history.com), which keeps its own copy of star data now that GitHub no longer shares star dates. Charts load lazily as cards scroll into view and are cached for a week. If it has no data for a repo, the app's own daily star-count samples are used instead.
+  - **Stars:** the **whole timeline**, from the first star to today, as a curve (hover for the count at any time). The data comes from [star-history.com](https://www.star-history.com) in one chart request per repo, avoiding many pages of GitHub history requests. Charts load lazily as cards scroll into view and are cached for a week. If it has no data for a repo, the app's own daily star-count samples are used instead.
 
   Each bar has a tooltip with its dates and count.
 - **✨ Show suggestions** on any starred repo: related repos you haven't starred yet, based on that repo's name and topics, repos whose README mentions it, its most-starred forks and the links in its README.
@@ -40,7 +40,7 @@ No build step and no dependencies. The same code runs online (GitHub Pages) or l
   - When fewer than 12 are left, the next page of every source is fetched automatically, so there's always something to suggest until GitHub runs out of results.
 - **Smart updates.** *Check for updates* does as little work as possible:
   - Star-list pages are fetched in parallel. Unchanged pages come back as tiny `304` answers (free with a token) and are rebuilt from the cache.
-  - A repo whose `pushed_at` date hasn't changed is skipped: no request at all.
+  - A repo whose `pushed_at` date hasn't changed usually needs no detail request; a periodic max-age check also catches release-only changes.
   - Repos that did change get release, last commit and README **git hash** in batched GraphQL calls, several calls in parallel.
   - A README is downloaded again only if its hash changed.
 
@@ -78,6 +78,8 @@ Then use <http://localhost:8787> (set `PORT` to change the port). Keep the serve
 Opening `public/index.html` directly as a file doesn't work, because browsers don't run JavaScript modules from `file://`.
 
 The local server listens on `127.0.0.1` only. It refuses requests from other websites, including DNS-rebinding tricks, so no web page can read your cached token. It writes cache files atomically, so they can't be corrupted.
+
+Run `npm run check` to syntax-check the server and all browser modules on Windows, macOS or Linux.
 
 ## Project layout
 

@@ -134,10 +134,9 @@ export function activityNow(a) {
   return [...a.counts.slice(shift), ...Array(shift).fill(0)];
 }
 
-/* Star activity. GitHub no longer lists who starred a repo or when (REST /stargazers answers 404, GraphQL
-   `stargazers` returns no edges), so star growth is recorded here instead: every check already downloads each repo's
+/* Star activity fallback when the external whole-life chart is unavailable: every check already downloads each repo's
    current star count, and one sample per day is kept in `r.starHist` = [[dayTimestamp, count], …] (≤ 400 days).
-   The chart shows real gains between samples; it starts empty and fills in as the app is used. */
+   The fallback shows gains between local samples; it fills in as the app is used. */
 const DAY_MS = 864e5, MAX_SAMPLES = 400;
 export function recordStars(hist, count, now = Date.now()) {
   const day = Math.floor(now / DAY_MS) * DAY_MS, h = hist ? [...hist] : [];
@@ -211,13 +210,18 @@ export async function gitSha(text) {
   return [...new Uint8Array(await crypto.subtle.digest('SHA-1', all))].map(x => x.toString(16).padStart(2, '0')).join('');
 }
 
-let me = null;
-/** Login of the token's owner (cached for the session). */
+let me = null, meToken = null;
+/** Login of the token's owner. Bind the memoized value to the token, including across in-flight requests. */
 export async function whoAmI() {
-  if (!me) me = (await (await gh('/user')).json()).login;
+  const token = S.token;
+  if (me && meToken === token) return me;
+  const login = (await (await gh('/user')).json()).login;
+  if (S.token !== token) throw new Error('Token changed while checking its owner; try again.');
+  me = login;
+  meToken = token;
   return me;
 }
-export const forgetMe = () => { me = null; };
+export const forgetMe = () => { me = null; meToken = null; };
 
 /** Stars (on=true) or unstars a repo for the token's owner. Returns the HTTP status (204 = done). */
 export async function setStar(full, on) {

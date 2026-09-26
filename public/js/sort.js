@@ -22,7 +22,8 @@ const value = (repo, key) => {
     case 'release': return Date.parse(r.releaseAt || '') || null;
     case 'created': return Date.parse(r.created || r.created_at || '') || null;
     case 'name': return (r.name || r.full_name?.split('/')[1] || '').toLowerCase();
-    case 'owner': return (r.owner || r.full_name?.split('/')[0] || '').toLowerCase();
+    // Starred cards store an owner login; discovery candidates store the REST/GraphQL owner object.
+    case 'owner': return (typeof r.owner === 'string' ? r.owner : r.owner?.login || r.full_name?.split('/')[0] || '').toLowerCase();
   }
   return null;
 };

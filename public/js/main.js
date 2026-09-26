@@ -21,17 +21,16 @@ import {initToken} from './token.js';
 /** "NairoDorian", "@NairoDorian" or "https://github.com/NairoDorian?tab=stars" → "NairoDorian". */
 function parseUser(v) {
   v = v.trim();
-  const m = v.match(/github\.com\/([^/?#]+)/);
-  return (m ? m[1] : v).replace(/^@/, '');
+  const m = v.match(/^(?:https?:\/\/)?(?:www\.)?github\.com\/([^/?#]+)(?:[/?#].*)?$/i);
+  const user = m ? m[1] : v.replace(/^@/, '');
+  return /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(user) ? user : '';
 }
 
 /** Shows the cached data instantly, then checks GitHub for changes in the background. */
 async function load() {
   const u = parseUser($('#user').value);
-  if (!u) return;
+  if (!u) return status('⚠ Enter a GitHub username or profile URL.');
   const g = ++S.gen;          // running jobs see the new generation and stop without saving
-  await waitIdle();
-  if (g !== S.gen) return;    // another load started meanwhile
   S.user = u;
   $('#user').value = u;
   history.replaceState(null, '', '?user=' + encodeURIComponent(u));
@@ -53,6 +52,9 @@ async function load() {
   S.readmes = readmes || {};
   migrateReadmes();
   if ($('#inReadme').checked) render();
+  // Show the new user's cache immediately. The old profile's network job can finish before this sync starts.
+  await waitIdle();
+  if (g !== S.gen) return;
   await task(sync);
 }
 

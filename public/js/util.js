@@ -9,13 +9,20 @@ export const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;',
 /** Only http(s) links are allowed into href: blocks `javascript:` URLs that a repo could set as its homepage. */
 export const safeUrl = u => /^https?:\/\//i.test(u || '') ? u : '';
 
-/** 1234 → "1.2k", 45678 → "46k". */
-export const fmtN = n => n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n ?? 0);
+/** Compact counts, including millions; bad cached values display as zero instead of NaN. */
+export function fmtN(n) {
+  const value = Number(n ?? 0);
+  if (!Number.isFinite(value)) return '0';
+  if (value >= 1e6) return (value / 1e6).toFixed(value >= 1e7 ? 0 : 1) + 'M';
+  if (value >= 1e3) return (value / 1e3).toFixed(value >= 1e4 ? 0 : 1) + 'k';
+  return String(value);
+}
 
 /** ISO date → "3d ago". */
 export function ago(d) {
   if (!d) return '—';
   const s = (Date.now() - new Date(d)) / 1000;
+  if (!Number.isFinite(s)) return '—';
   for (const [u, v] of [['y', 31536000], ['mo', 2592000], ['d', 86400], ['h', 3600], ['m', 60]]) if (s >= v) return Math.floor(s / v) + u + ' ago';
   return 'just now';
 }

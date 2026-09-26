@@ -1,8 +1,8 @@
 /* Star history from star-history.com.
 
-   GitHub no longer serves star timestamps (REST /stargazers → 401/404, GraphQL `stargazers` → empty), but
-   star-history.com keeps its own copy. Its public chart endpoint returns an SVG (CORS allowed, CDN-cached for a day);
-   we read the curve and the axes back into real [time, stars] points and draw our own chart from them.
+   GitHub exposes paginated stargazer history, but a whole-life chart for hundreds of repos would need many requests.
+   star-history.com's public chart endpoint returns one SVG per repo (CORS allowed, CDN-cached for a day);
+   we read the curve and axes back into real [time, stars] points and draw our own chart from them.
 
    Loading is lazy: only charts scrolled into view are fetched (4 at a time), then cached for a week in
    `starcurves` (shared by all users and by suggestion cards). When a curve arrives, a `star-curve` event lets
@@ -13,7 +13,23 @@ import {put} from './store.js';
 const TTL = 7 * 864e5, FAIL_TTL = 864e5, CONCURRENCY = 4;
 const key = full => full.toLowerCase();
 
-export const curveFor = full => S.starCurves[key(full)];
+// Older SVG curves sometimes contain two counts at the same timestamp. Normalize once per cached object;
+// this repairs existing local data in memory without forcing a download of every saved chart.
+const normalized = new WeakSet();
+export function curveFor(full) {
+  const c = S.starCurves[key(full)];
+  if (!c?.pts || normalized.has(c)) return c;
+  const points = c.pts.filter(p => Array.isArray(p) && Number.isFinite(p[0]) && Number.isFinite(p[1]))
+    .sort((a, b) => a[0] - b[0]);
+  const unique = [];
+  for (const [t, stars] of points) {
+    if (unique.at(-1)?.[0] === t) unique.at(-1)[1] = Math.max(unique.at(-1)[1], stars);
+    else unique.push([t, Math.max(unique.at(-1)?.[1] || 0, stars)]);
+  }
+  c.pts = unique.length >= 2 ? unique : null;
+  normalized.add(c);
+  return c;
+}
 /** Curve to draw: any saved one with points (even from an older parser), so charts don't blink while refreshing. */
 export const drawableCurve = full => { const c = curveFor(full); return c?.pts ? c : c && fresh(c) ? c : null; };
 // Bump PARSER when parsing improves: entries saved by an older parser (e.g. "unavailable" because a label format
@@ -139,16 +155,24 @@ export function parseStarHistorySvg(svgText) {
   const xToT = fit(dates.map(d => [d.x, d.t])), yToV = fit(yTicks.map(t => [t.y, t.v]));
   const pts = pathPoints(curve.getAttribute('d')).map(([x, y]) => [Math.round(xToT(x) / 36e5) * 36e5, Math.max(0, Math.round(yToV(y)))]);
   pts.sort((a, b) => a[0] - b[0]);
-  for (let i = 1; i < pts.length; i++) pts[i][1] = Math.max(pts[i][1], pts[i - 1][1]);   // stars only accumulate on the curve
-  return pts.length >= 2 ? pts : null;
+  const unique = [];
+  for (const [t, stars] of pts) {
+    if (!Number.isFinite(t) || !Number.isFinite(stars)) continue;
+    if (unique.at(-1)?.[0] === t) unique.at(-1)[1] = Math.max(unique.at(-1)[1], stars);
+    else unique.push([t, Math.max(unique.at(-1)?.[1] || 0, stars)]);   // cumulative stars do not decrease
+  }
+  return unique.length >= 2 ? unique : null;
 }
 
-/** Stars at time t, interpolated on the curve (0 before the first star). */
+/** Stars at time t, interpolated on the curve (0 before the first sample). Binary search keeps whole-life charts fast. */
 export function starsAt(pts, t) {
-  if (t <= pts[0][0]) return 0;
+  if (t < pts[0][0]) return 0;
+  if (t === pts[0][0]) return pts[0][1];
   if (t >= pts.at(-1)[0]) return pts.at(-1)[1];
-  let i = 1; while (pts[i][0] < t) i++;
-  const [t0, v0] = pts[i - 1], [t1, v1] = pts[i];
+  let lo = 1, hi = pts.length - 1;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (pts[mid][0] < t) lo = mid + 1; else hi = mid; }
+  const [t0, v0] = pts[lo - 1], [t1, v1] = pts[lo];
+  if (t0 === t1) return Math.max(v0, v1);   // defensive for a caller passing unnormalized points
   return v0 + (v1 - v0) * (t - t0) / (t1 - t0);
 }
 
@@ -184,7 +208,8 @@ function pump() {
   while (active < CONCURRENCY && queue.length) {
     const full = queue.shift();
     active++;
-    load(full).finally(() => { active--; pending.delete(key(full)); pump(); });
+    load(full).catch(() => { /* malformed or unavailable chart: leave it uncached for a later render */ })
+      .finally(() => { active--; pending.delete(key(full)); pump(); });
   }
 }
 

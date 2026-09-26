@@ -9,20 +9,23 @@ const PANEL_STATE = 'tokenPanelOpen';   // localStorage: remembered open/closed 
 /** Checks the token against GitHub: validity, rate limits, and (classic tokens) whether it may star. */
 async function checkToken() {
   const summary = $('#tpSummary'), limit = $('#limit');
+  const token = S.token;
   try {
     const r = await ghFetch('/rate_limit', {headers: headers()});
+    if (token !== S.token) return;   // a slower check for the previous token must not overwrite the new status
     if (r.status === 401) {
       summary.textContent = '· ⚠ token rejected';
       limit.textContent = '⚠ Token rejected: check it was copied fully and hasn\'t expired.';
       return;
     }
     const {resources: {core, graphql}} = await r.json();
+    if (token !== S.token) return;
     const scopes = r.headers.get('X-OAuth-Scopes');   // classic tokens only; null for fine-grained tokens
     const star = scopes == null ? '' : /\b(public_)?repo\b/.test(scopes) ? ' · ★ can star' : ' · read-only (add "public_repo" to star)';
     summary.textContent = S.token ? '· ✅ set' + star : '· not set (60 requests/hour)';
     limit.textContent = `${S.token ? '✅ Token OK' + star : 'No token'} · REST: ${core.remaining}/${core.limit} left ` +
       `(resets ${new Date(core.reset * 1000).toLocaleTimeString()})` + (graphql ? ` · GraphQL: ${graphql.remaining}/${graphql.limit}` : '');
-  } catch (e) { limit.textContent = '⚠ ' + e.message; }
+  } catch (e) { if (token === S.token) limit.textContent = '⚠ ' + e.message; }
 }
 
 /** Opens or closes the panel. `remember` saves the choice; panels opened automatically aren't remembered. */

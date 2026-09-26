@@ -5,7 +5,7 @@
   "description": "Browse, search and get suggestions from any GitHub user's starred repos. Local cache, no dependencies.",
   "scripts": {
     "start": "node server.js --open",
-    "check": "node --check server.js && for f in public/js/*.js; do node --check \"$f\" || exit 1; done"
+    "check": "node scripts/check.cjs"
   },
   "engines": { "node": ">=18" }
 }

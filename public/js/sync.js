@@ -3,8 +3,8 @@
   Checks, cheapest first:
    1. Star list: every page fetched in parallel, each with its ETag. An unchanged page answers 304 (tiny, and free
       against the rate limit) and is rebuilt from the cache.
-   2. `pushed_at` is the "dirty" flag: if it didn't change since a repo was cached, nothing in it changed
-      (no commit → no new README/commit date) → zero requests for that repo.
+   2. `pushed_at` is a cheap change hint: an unchanged value skips most detail requests. A periodic max-age check
+      catches changes such as release metadata that need not move `pushed_at`.
    3. Repos that did change: one GraphQL call per 20 repos (8 in parallel) returns latest release + last commit +
       README hash together.
    4. README hash equal to the cached one (or to the hash of the cached text) → no download. Only READMEs that really
@@ -36,31 +36,39 @@ let running = null;
 /** Runs job(gen) unless another job is running. Errors end up in the status line. */
 export function task(job) {
   if (running) { status('⏳ Busy with another task, please wait'); return running; }
-  running = job(S.gen).catch(e => status('⚠ ' + e.message)).finally(() => { running = null; });
+  const g = S.gen;
+  running = job(g).catch(e => { if (g === S.gen) status('⚠ ' + e.message); }).finally(() => { running = null; });
   return running;
 }
 export const waitIdle = () => running || Promise.resolve();
 
 /** Older caches keyed READMEs by "owner/name" and stored plain strings: convert in place, no re-download. */
 export function migrateReadmes() {
-  const byFull = new Map(S.repos.map(r => [r.full, r]));
+  const byFull = new Map(S.repos.map(r => [r.full.toLowerCase(), r]));
+  const byId = new Map(S.repos.map(r => [String(r.id), r]));
   for (const [k, v] of Object.entries(S.readmes)) {
     if (typeof v !== 'string' && !k.includes('/')) continue;
-    const r = byFull.get(k);
+    const r = byFull.get(k.toLowerCase()) || byId.get(k);
+    if (!r) continue;   // unknown entries are pruned only after a successful star-list refresh
+    // Plain-string caches have no Git hash or check date. Keep the text, but verify it on the next sync.
+    const target = rkey(r), replacement = typeof v === 'string' ? {...readmeRecord(r, {t: v}), at: 0, pushed: null} : v;
     delete S.readmes[k];
-    if (r) S.readmes[rkey(r)] = typeof v === 'string' ? readmeRecord(r, {t: v}) : v;
+    if (target === k || !S.readmes[target]) S.readmes[target] = replacement;
   }
 }
 
 // ---- 1. star list ----
 /** All pages in parallel, each conditional on its cached ETag. Returns [{etag, ids, items, hit}] in page order. */
 async function fetchStarPages(g) {
+  const user = S.user;   // an older check must not switch its remaining page requests to a newly selected profile
+  const cachedPages = S.starPages;
   const cachedById = new Map(S.repos.map(r => [r.id, r]));
   const fetchPage = async (p, useEtag = true) => {
-    const old = S.starPages[p - 1];
-    const r = await gh(`/users/${encodeURIComponent(S.user)}/starred?per_page=100&page=${p}`,
+    if (g !== S.gen) return {items: [], ids: [], last: 0};
+    const old = cachedPages[p - 1];
+    const r = await gh(`/users/${encodeURIComponent(user)}/starred?per_page=100&page=${p}`,
       {Accept: 'application/vnd.github.star+json', ...(useEtag && old?.etag ? {'If-None-Match': old.etag} : {})});
-    if (r.status === 404) throw new Error(`User "${S.user}" not found`);
+    if (r.status === 404) throw new Error(`User "${user}" not found`);
     if (r.status === 304) {
       const items = old.ids.map(id => cachedById.get(id));
       if (items.every(Boolean)) return {etag: old.etag, ids: old.ids, items: items.map(x => ({...x})), last: 0, hit: true};
@@ -71,7 +79,8 @@ async function fetchStarPages(g) {
     return {etag: r.headers.get('ETag'), ids: items.map(x => x.id), items, last, hit: false};
   };
   const first = await fetchPage(1);
-  const lastPage = first.last || (first.hit ? S.starPages.length : 1) || 1;
+  if (g !== S.gen) return [];
+  const lastPage = first.last || (first.hit ? cachedPages.length : 1) || 1;
   const pages = [first];
   await pool(Array.from({length: lastPage - 1}, (_, i) => i + 2), 10, async p => { pages[p - 1] = await fetchPage(p); });
   // The list may have grown beyond what the cache knew: continue while pages come back full.
@@ -114,6 +123,7 @@ export async function sync(g) {
   for (const k of Object.keys(S.readmes)) if (!keep.has(k)) delete S.readmes[k];   // unstarred
   await saveStars(g);
   if (removed) await saveReadmes(g);
+  if (g !== S.gen) return;   // a profile change may happen while a large cache file is being written
 
   const diff = [added && `+${added} new`, changed && `${changed} with new commits`, renamed && `${renamed} renamed`,
     removed && `−${removed} unstarred`].filter(Boolean).join(' · ') || 'list up to date';
@@ -150,15 +160,18 @@ async function refreshDetails(g, {wantReadmes, wantEnrich}) {
     }
     const now = Date.now();
     for (const [j, r] of batch.entries()) {
-      const d = data['r' + j];   // null = deleted/private/blocked: still marked checked so it isn't retried every sync
-      Object.assign(r, {release: d?.latestRelease?.tagName, releaseAt: d?.latestRelease?.publishedAt, langs: languageShares(d?.languages), activity: parseActivity(d, now0),
-        commitAt: d?.defaultBranchRef?.target?.committedDate, enrichedAt: now, enrichedPushed: r.pushed});
+      if (g !== S.gen) return;   // never write an old profile's results into the newly loaded profile
+      const d = data['r' + j];
+      if (!d) { skipped++; continue; }   // GraphQL may omit one repo; keep its old details and retry later
+      Object.assign(r, {release: d.latestRelease?.tagName, releaseAt: d.latestRelease?.publishedAt, langs: languageShares(d.languages), activity: parseActivity(d, now0),
+        commitAt: d.defaultBranchRef?.target?.committedDate, enrichedAt: now, enrichedPushed: r.pushed});
       if (!wantReadmes || !needsReadme(r)) continue;
       const k = rkey(r), c = S.readmes[k];
-      if (!d) { S.readmes[k] = c ? {...c, at: now, pushed: r.pushed} : readmeRecord(r, {}); continue; }
       const hit = README_NAMES.map((path, i) => d['m' + i] && {path, oid: d['m' + i].oid}).find(Boolean);
       if (!hit) { viaRest.push(r); continue; }
-      if (c && (c.sha === hit.oid || (!c.sha && c.t && await gitSha(c.t) === hit.oid))) {
+      const sameSha = c && (c.sha === hit.oid || (!c.sha && c.t && await gitSha(c.t) === hit.oid));
+      if (g !== S.gen) return;
+      if (sameSha) {
         Object.assign(c, {sha: hit.oid, path: hit.path, at: now, pushed: r.pushed}); same++;
       } else download.push({r, ...hit});
     }
@@ -174,6 +187,7 @@ async function refreshDetails(g, {wantReadmes, wantEnrich}) {
     let data;
     try { data = await gql('query{' + batch.map((x, j) => repoQ('r' + j, x.r.owner, x.r.name, `object(expression:${JSON.stringify('HEAD:' + x.path)}){...on Blob{text}}`)).join(' ') + '}'); }
     catch (e) { fatal = e; return; }
+    if (g !== S.gen) return;
     batch.forEach((x, j) => {
       const text = data['r' + j]?.object?.text;
       if (text == null) { viaRest.push(x.r); return; }   // binary or too large for GraphQL: REST handles it
@@ -184,12 +198,13 @@ async function refreshDetails(g, {wantReadmes, wantEnrich}) {
   });
 
   const rest = viaRest.length && !fatal ? await restReadmes(g, viaRest, true) : null;
+  if (g !== S.gen) return {summary: ''};
   await saveReadmes(g);
   if (g !== S.gen) return {summary: ''};
   render();
   return {summary: `${todo.length} changed repos checked` +
     (wantReadmes ? ` · READMEs: ${same + (rest?.same || 0)} unchanged, ${got + (rest?.got || 0)} downloaded` : '') +
-    (skipped ? ` · ${skipped} skipped (GitHub timeout, retried next check)` : '') + (fatal ? ` · ⚠ ${fatal.message} (progress saved)` : '')};
+    (skipped ? ` · ${skipped} skipped (GitHub omitted results or timed out; retried next check)` : '') + (fatal ? ` · ⚠ ${fatal.message} (progress saved)` : '')};
 }
 
 /** REST path (no token, or unusual README names). ETag conditional requests make "unchanged" nearly free. */
@@ -205,11 +220,15 @@ async function restReadmes(g, todo, quiet = false) {
       if (g !== S.gen) return;
       if (res.status === 304) { Object.assign(c, {at: Date.now(), pushed: r.pushed}); same++; }
       else if (res.status === 404) S.readmes[k] = readmeRecord(r, {});   // repo has no README
-      else { S.readmes[k] = readmeRecord(r, {t: (await res.text()).slice(0, README_MAX_CHARS), etag: res.headers.get('ETag')}); got++; }
+      else {
+        const text = await res.text();
+        if (g !== S.gen) return;
+        S.readmes[k] = readmeRecord(r, {t: text.slice(0, README_MAX_CHARS), etag: res.headers.get('ETag')}); got++;
+      }
     } catch (e) { if (/Rate limited|Token/.test(e.message)) fatal = e; else failed++; }   // transient: retried next time
     if (!quiet && ++done % 25 === 0) status(`READMEs ${done}/${todo.length}…`);
   });
-  if (!quiet) { await saveReadmes(g); render(); }
+  if (!quiet && g === S.gen) { await saveReadmes(g); if (g === S.gen) render(); }
   return {got, same, summary: `READMEs: ${same} unchanged, ${got} downloaded${failed ? `, ${failed} failed (retried next time)` : ''}` +
     (fatal ? ` · ⚠ ${fatal.message}` : '')};
 }
