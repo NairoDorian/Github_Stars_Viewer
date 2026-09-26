@@ -10,7 +10,7 @@ let limit = PAGE;
 const hayCache = new WeakMap();
 function hay(r) {
   let h = hayCache.get(r);
-  if (h === undefined) hayCache.set(r, h = [r.full, r.about, r.topics.join(' '), r.lang].join(' ').toLowerCase());
+  if (h === undefined) hayCache.set(r, h = [r.full, r.about, r.topics.join(' '), r.lang, ...(r.langs || []).map(l => l[0])].join(' ').toLowerCase());
   return h;
 }
 
@@ -49,6 +49,18 @@ const SORTS = {
   created: r => -time(r.created),
 };
 
+/** GitHub-style language breakdown: a colored bar plus every language with its share, largest first.
+ *  Filled in by "Fetch releases & commits" / checks with a token (r.langs = [[name, percent, color], …]). */
+function languagesHTML(r) {
+  if (!r.langs?.length) return '';
+  const color = c => /^#[0-9a-f]{3,8}$/i.test(c || '') ? c : '#8b949e';   // only real hex colors reach the style attribute
+  const pct = p => p >= 0.1 ? p + '%' : '&lt;0.1%';
+  return `<div class="langs">
+    <div class="langbar">${r.langs.filter(([, p]) => p >= 0.1).map(([n, p, c]) => `<i style="width:${p}%;background:${color(c)}" title="${esc(n)} ${p}%"></i>`).join('')}</div>
+    <div class="langlist">${r.langs.map(([n, p, c]) => `<span><b style="background:${color(c)}"></b>${esc(n)} <span class="muted">${pct(p)}</span></span>`).join('')}</div>
+  </div>`;
+}
+
 function card(r, snip, re) {
   const avatar = r.avatar ? `${r.avatar}${r.avatar.includes('?') ? '&' : '?'}s=36` : '';
   const home = safeUrl(r.homepage);
@@ -66,6 +78,7 @@ function card(r, snip, re) {
       <span title="${esc(r.starred)}">starred ${ago(r.starred)}</span>
       ${home ? `<a href="${esc(home)}" target="_blank" rel="noopener">site ↗</a>` : ''}
     </div>
+    ${languagesHTML(r)}
     <button class="similar" data-similar="${esc(r.id)}" title="Find repos related to this one that you haven't starred">✨ Show suggestions</button>
   </div>`;
 }

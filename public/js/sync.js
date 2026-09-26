@@ -20,14 +20,20 @@ import {render} from './list.js';
 
 const ENRICH_MAX_AGE = 7 * DAY, README_MAX_AGE = 30 * DAY, README_MAX_CHARS = 100_000;
 const README_NAMES = ['README.md', 'readme.md'];   // checked via GraphQL; covers most repos
-const DETAIL_FIELDS = ['release', 'releaseAt', 'commitAt', 'enrichedAt', 'enrichedPushed'];
+const DETAIL_FIELDS = ['release', 'releaseAt', 'commitAt', 'langs', 'enrichedAt', 'enrichedPushed'];
 
 const spread = r => ((r.id || 0) % 7) * DAY;
-export const needsEnrich = r => !r.enrichedAt || r.enrichedPushed !== r.pushed || Date.now() - r.enrichedAt > ENRICH_MAX_AGE + spread(r);
+// `!r.langs`: repos cached before language breakdowns existed get them on the next check (one-time).
+export const needsEnrich = r => !r.enrichedAt || !r.langs || r.enrichedPushed !== r.pushed || Date.now() - r.enrichedAt > ENRICH_MAX_AGE + spread(r);
 export const needsReadme = r => {
   const c = S.readmes[rkey(r)];
   return !c || c.pushed !== r.pushed || Date.now() - c.at > README_MAX_AGE + spread(r);
 };
+/** GraphQL languages → [[name, percent, color], …] (all languages, largest first, like GitHub's sidebar). */
+function languageShares(l) {
+  if (!l?.totalSize) return [];
+  return l.edges.map(e => [e.node.name, Math.round(e.size / l.totalSize * 1000) / 10, e.node.color || null]);
+}
 const readmeRecord = (r, fields) => ({t: '', sha: null, etag: null, path: null, ...fields, at: Date.now(), pushed: r.pushed});
 
 // ---- one network job at a time ----
@@ -130,7 +136,8 @@ async function refreshDetails(g, {wantReadmes, wantEnrich}) {
   const todo = S.repos.filter(r => (wantEnrich && needsEnrich(r)) || (wantReadmes && needsReadme(r)));
   if (!todo.length) return {summary: 'details up to date (0 requests)'};
 
-  const fields = 'latestRelease{tagName publishedAt} defaultBranchRef{target{...on Commit{committedDate}}}' +
+  const fields = 'latestRelease{tagName publishedAt} defaultBranchRef{target{...on Commit{committedDate}}} ' +
+    'languages(first:100,orderBy:{field:SIZE,direction:DESC}){totalSize edges{size node{name color}}}' +
     (wantReadmes ? ' ' + README_NAMES.map((n, k) => `m${k}:object(expression:${JSON.stringify('HEAD:' + n)}){...on Blob{oid}}`).join(' ') : '');
   const download = [], viaRest = [];
   let checked = 0, same = 0, fatal = null;
@@ -143,7 +150,7 @@ async function refreshDetails(g, {wantReadmes, wantEnrich}) {
     const now = Date.now();
     for (const [j, r] of batch.entries()) {
       const d = data['r' + j];   // null = deleted/private/blocked: still marked checked so it isn't retried every sync
-      Object.assign(r, {release: d?.latestRelease?.tagName, releaseAt: d?.latestRelease?.publishedAt,
+      Object.assign(r, {release: d?.latestRelease?.tagName, releaseAt: d?.latestRelease?.publishedAt, langs: languageShares(d?.languages),
         commitAt: d?.defaultBranchRef?.target?.committedDate, enrichedAt: now, enrichedPushed: r.pushed});
       if (!wantReadmes || !needsReadme(r)) continue;
       const k = rkey(r), c = S.readmes[k];

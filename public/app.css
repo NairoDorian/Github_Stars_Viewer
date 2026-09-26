@@ -50,6 +50,11 @@ aside h3,#insights h3{font-size:12px;text-transform:uppercase;color:var(--muted)
 .snip{font-size:12px;color:var(--muted);border-left:2px solid var(--star);padding-left:8px;overflow-wrap:anywhere}
 mark{background:var(--star);color:#000;border-radius:2px}
 #more{margin:16px auto;display:block}
+.langs{display:flex;flex-direction:column;gap:4px}
+.langbar{display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--chip)}
+.langbar i{display:block;height:100%;min-width:1px}
+.langlist{display:flex;flex-wrap:wrap;gap:2px 10px;font-size:11px}
+.langlist b{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;vertical-align:baseline}
 .similar{align-self:flex-start;margin-top:auto;padding:2px 10px;font-size:12px;color:var(--accent);background:transparent}
 
 /* ---- discover panel ---- */

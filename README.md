@@ -10,7 +10,7 @@ No build step and no dependencies. The same code runs online (GitHub Pages) or l
 ## Features
 
 - **All stars at once.** Every page of the star list is fetched in parallel, then cached so reopening is instant.
-- **Rich cards.** About text, owner, stars, forks, language, license, topics, homepage, last commit, latest release and when you starred it.
+- **Rich cards.** About text, owner, stars, forks, license, **every language with its share** (GitHub-style colored bar), topics, homepage, last commit, latest release and when you starred it.
 - **Sort** by recently starred, most stars, last commit, last release, name or newest repo.
 - **Search** name, owner, description and topics, with highlighting. Press `/` to focus the search box.
 - **Search inside READMEs.** Click *Index READMEs* once, then tick *Search in READMEs*. Matches show a snippet.
