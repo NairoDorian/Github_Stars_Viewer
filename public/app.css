@@ -59,7 +59,7 @@ mark{background:var(--star);color:#000;border-radius:2px}
 .spark{width:100%;height:24px;display:block}
 .spark rect.c{fill:var(--accent)}.spark rect.s{fill:var(--star)}
 .spark rect.zero{fill:var(--muted);opacity:.45}
-.spark rect.nodata{fill:var(--muted);opacity:.12}
+.spark rect.nodata{fill:var(--muted);opacity:.18}
 .spark rect:hover{opacity:.7}
 .langs{display:flex;flex-direction:column;gap:4px}
 .langbar{display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--chip)}

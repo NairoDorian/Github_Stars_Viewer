@@ -1,7 +1,7 @@
 // The main list: search, facet filters, sorting and rendering of repo cards.
 import {S, readmeText, readmeLower} from './state.js';
 import {$, esc, escRe, fmtN, ago, safeUrl, tally} from './util.js';
-import {activityNow, starGains, ACTIVITY_SPAN} from './github.js';
+import {activityNow, starGains, ACTIVITY_SPAN, ACTIVITY_BUCKETS} from './github.js';
 
 const PAGE = 500;                                  // cards rendered per "page"; more via the Show more button
 const filters = {lang: null, topic: null, owner: null};
@@ -87,8 +87,9 @@ export function activityHTML(r) {
     rows.push(`<span class="act-label">Stars</span>${sparkbars(gains, {end: Date.now(), unit: 'new star', cls: 's'})}
       <span class="act-val" title="stars gained since ${day(since)} (tracked by this app)">${gained >= 0 ? '+' : ''}${fmtN(gained)}<small> since ${day(since)}</small></span>`);
   } else if (hist?.length) {
-    rows.push(`<span class="act-label">Stars</span><span class="act-note" title="GitHub no longer shares when people starred a repo, so this app records each repo's star count once a day; the chart fills in over time">tracking growth since ${day(hist[0][0])}</span>
-      <span class="act-val">${fmtN(hist.at(-1)[1])}<small> ★</small></span>`);
+    // Only one day recorded so far: same chart frame, every period "not tracked yet", so it reads like the commits row.
+    rows.push(`<span class="act-label">Stars</span>${sparkbars(Array(ACTIVITY_BUCKETS).fill(null), {end: Date.now(), unit: 'new star', cls: 's'})}
+      <span class="act-val" title="GitHub no longer shares when people starred a repo, so this app records each repo's star count once a day (since ${day(hist[0][0])}); the bars fill in from there">${fmtN(hist.at(-1)[1])}<small> ★ · since ${day(hist[0][0])}</small></span>`);
   }
   return `<div class="activity" title="last 12 months, per 2 weeks">${rows.join('')}</div>`;
 }
