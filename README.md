@@ -15,6 +15,11 @@ No build step and no dependencies. The same code runs online (GitHub Pages) or l
 - **Search** name, owner, description and topics, with highlighting. Press `/` to focus the search box.
 - **Search inside READMEs.** Click *Index READMEs* once, then tick *Search in READMEs*. Matches show a snippet.
 - **Filters** by language, topic and owner.
+- **Activity charts** on every card (last 12 months, per 2 weeks):
+  - **Commits:** counted on GitHub, with the total per year.
+  - **Stars:** growth recorded by the app. GitHub no longer shares when people starred a repo, so each check saves every repo's star count once a day, and the chart fills in over time.
+
+  Each bar has a tooltip with its dates and count.
 - **✨ Show suggestions** on any starred repo: related repos you haven't starred yet, based on that repo's name and topics, repos whose README mentions it, its most-starred forks and the links in its README.
 - **🧭 Discover & suggestions:**
   - **Your themes.** Clusters detected automatically in your stars, for example *scrcpy*, *ReVanced*, *Kokoro TTS*. Pick one to find related repos you haven't starred yet. Suggestions come from:

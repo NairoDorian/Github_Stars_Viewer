@@ -50,6 +50,17 @@ aside h3,#insights h3{font-size:12px;text-transform:uppercase;color:var(--muted)
 .snip{font-size:12px;color:var(--muted);border-left:2px solid var(--star);padding-left:8px;overflow-wrap:anywhere}
 mark{background:var(--star);color:#000;border-radius:2px}
 #more{margin:16px auto;display:block}
+/* activity mini-charts (commits / stars per 2 weeks, 12 months) */
+.activity{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:4px 8px;padding:6px 8px;border-radius:6px;background:var(--chip)}
+.act-label{font-size:11px;color:var(--muted);width:52px}
+.act-val{font-size:12px;font-weight:600;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.act-val small{font-weight:400;color:var(--muted)}
+.act-note{font-size:11px;color:var(--muted);line-height:1.3}
+.spark{width:100%;height:24px;display:block}
+.spark rect.c{fill:var(--accent)}.spark rect.s{fill:var(--star)}
+.spark rect.zero{fill:var(--muted);opacity:.45}
+.spark rect.nodata{fill:var(--muted);opacity:.12}
+.spark rect:hover{opacity:.7}
 .langs{display:flex;flex-direction:column;gap:4px}
 .langbar{display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--chip)}
 .langbar i{display:block;height:100%;min-width:1px}

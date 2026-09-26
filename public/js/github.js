@@ -111,16 +111,66 @@ export function languageShares(l) {
   return l.edges.map(e => [e.node.name, Math.round(e.size / l.totalSize * 1000) / 10, e.node.color || null]);
 }
 
-/** Language breakdowns for many "owner/name" (needs a token): 40 repos per GraphQL call, 4 calls in parallel.
- *  Returns Map(lower-cased full name → shares). Repos that fail or don't exist get [] so they aren't retried. */
-export async function repoLanguages(fulls) {
+/* Commit activity: commits on the default branch per 2-week bucket over the last 12 months (26 buckets, oldest
+   first), counted by GraphQL `history(since, until)`. Unlike REST /stats/commit_activity it never answers
+   "202, still computing", and it batches with the other details. Stored as {end, counts}: `end` = when it was
+   counted, so a cached graph can be shifted forward later (see activityNow). */
+export const ACTIVITY_BUCKETS = 26, ACTIVITY_SPAN = 14 * 864e5;
+export function activityFields(end = Date.now()) {
+  const iso = t => new Date(t).toISOString();
+  return 'defaultBranchRef{target{...on Commit{' + Array.from({length: ACTIVITY_BUCKETS}, (_, k) =>
+    `a${k}:history(since:"${iso(end - (ACTIVITY_BUCKETS - k) * ACTIVITY_SPAN)}",until:"${iso(end - (ACTIVITY_BUCKETS - k - 1) * ACTIVITY_SPAN)}"){totalCount}`).join(' ') + '}}}';
+}
+export function parseActivity(repoData, end) {
+  const t = repoData?.defaultBranchRef?.target;
+  return t ? {end, counts: Array.from({length: ACTIVITY_BUCKETS}, (_, k) => t['a' + k]?.totalCount ?? 0)} : null;
+}
+/** The 26 buckets ending now. Buckets after `end` are 0: the repo wasn't pushed since (otherwise it's re-counted). */
+export function activityNow(a) {
+  if (!a?.counts) return null;
+  const shift = Math.min(ACTIVITY_BUCKETS, Math.max(0, Math.floor((Date.now() - a.end) / ACTIVITY_SPAN)));
+  return [...a.counts.slice(shift), ...Array(shift).fill(0)];
+}
+
+/* Star activity. GitHub no longer lists who starred a repo or when (REST /stargazers answers 404, GraphQL
+   `stargazers` returns no edges), so star growth is recorded here instead: every check already downloads each repo's
+   current star count, and one sample per day is kept in `r.starHist` = [[dayTimestamp, count], …] (≤ 400 days).
+   The chart shows real gains between samples; it starts empty and fills in as the app is used. */
+const DAY_MS = 864e5, MAX_SAMPLES = 400;
+export function recordStars(hist, count, now = Date.now()) {
+  const day = Math.floor(now / DAY_MS) * DAY_MS, h = hist ? [...hist] : [];
+  if (h.length && h.at(-1)[0] === day) h[h.length - 1] = [day, count]; else h.push([day, count]);
+  return h.length > MAX_SAMPLES ? h.slice(-MAX_SAMPLES) : h;
+}
+/** Stars gained per 2-week bucket over the last 12 months from the samples. Buckets before the first sample are
+ *  null ("not tracked yet"). Returns null until there are 2 samples on different days. */
+export function starGains(hist, now = Date.now()) {
+  if (!hist || hist.length < 2) return null;
+  const start = now - ACTIVITY_BUCKETS * ACTIVITY_SPAN, counts = Array(ACTIVITY_BUCKETS).fill(null);
+  const first = hist[0][0];
+  for (let i = 0; i < ACTIVITY_BUCKETS; i++) if (start + (i + 1) * ACTIVITY_SPAN > first) counts[i] = 0;
+  for (let i = 1; i < hist.length; i++) {   // spread each gain over its days, then add to buckets
+    const [t0, c0] = hist[i - 1], [t1, c1] = hist[i], days = Math.max(1, Math.round((t1 - t0) / DAY_MS)), per = (c1 - c0) / days;
+    for (let d = 0; d < days; d++) {
+      const t = t0 + (d + 1) * DAY_MS, k = Math.floor((t - start) / ACTIVITY_SPAN);
+      if (k >= 0 && k < ACTIVITY_BUCKETS) counts[k] = (counts[k] ?? 0) + per;
+    }
+  }
+  return counts.map(v => v == null ? null : Math.round(v));
+}
+
+/** Languages and commit activity for many "owner/name" (needs a token): 20 repos per GraphQL call, 6 in parallel.
+ *  Returns Map(lower-cased full name → {langs, activity}). Failed lookups get empty values so they aren't retried. */
+export async function repoCardDetails(fulls) {
   const out = new Map();
   if (!S.token) return out;
-  await pool(chunks(fulls, 40), 4, async batch => {
+  const end = Date.now(), fields = LANG_FIELDS + ' ' + activityFields(end);
+  await pool(chunks(fulls, 20), 6, async batch => {
     let data;
-    try { data = await gql('query{' + batch.map((f, j) => { const [o, n] = f.split('/'); return repoQ('r' + j, o, n, LANG_FIELDS); }).join(' ') + '}'); }
+    try { data = await gql('query{' + batch.map((f, j) => { const [o, n] = f.split('/'); return repoQ('r' + j, o, n, fields); }).join(' ') + '}'); }
     catch { return; }
-    batch.forEach((f, j) => out.set(f.toLowerCase(), languageShares(data['r' + j]?.languages)));
+    batch.forEach((f, j) => out.set(f.toLowerCase(), {langs: languageShares(data['r' + j]?.languages),
+      activity: parseActivity(data['r' + j], end)}));
   });
   return out;
 }

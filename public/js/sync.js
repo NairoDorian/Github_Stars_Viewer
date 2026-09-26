@@ -14,17 +14,17 @@
   Nothing is deleted before its replacement arrived: a failed or aborted refresh always leaves the previous data. */
 import {S, rkey} from './state.js';
 import {DAY, status, secs, pool, chunks} from './util.js';
-import {gh, gql, repoQ, mapStar, gitSha, needToken, LANG_FIELDS, languageShares} from './github.js';
+import {gh, gql, repoQ, mapStar, gitSha, needToken, LANG_FIELDS, languageShares, activityFields, parseActivity, recordStars} from './github.js';
 import {saveStars, saveReadmes} from './store.js';
 import {render} from './list.js';
 
 const ENRICH_MAX_AGE = 7 * DAY, README_MAX_AGE = 30 * DAY, README_MAX_CHARS = 100_000;
 const README_NAMES = ['README.md', 'readme.md'];   // checked via GraphQL; covers most repos
-const DETAIL_FIELDS = ['release', 'releaseAt', 'commitAt', 'langs', 'enrichedAt', 'enrichedPushed'];
+const DETAIL_FIELDS = ['release', 'releaseAt', 'commitAt', 'langs', 'activity', 'enrichedAt', 'enrichedPushed'];
 
 const spread = r => ((r.id || 0) % 7) * DAY;
-// `!r.langs`: repos cached before language breakdowns existed get them on the next check (one-time).
-export const needsEnrich = r => !r.enrichedAt || !r.langs || r.enrichedPushed !== r.pushed || Date.now() - r.enrichedAt > ENRICH_MAX_AGE + spread(r);
+// `!r.langs` / `r.activity === undefined`: repos cached before these existed get them on the next check (one-time).
+export const needsEnrich = r => !r.enrichedAt || !r.langs || r.activity === undefined || r.enrichedPushed !== r.pushed || Date.now() - r.enrichedAt > ENRICH_MAX_AGE + spread(r);
 export const needsReadme = r => {
   const c = S.readmes[rkey(r)];
   return !c || c.pushed !== r.pushed || Date.now() - c.at > README_MAX_AGE + spread(r);
@@ -97,7 +97,8 @@ export async function sync(g) {
     if (!o) { added++; continue; }
     if (o.full !== r.full) renamed++;
     if (o.pushed !== r.pushed) changed++;
-    for (const f of DETAIL_FIELDS) r[f] = o[f];   // keep details; needsEnrich() decides if they're still valid
+    for (const f of DETAIL_FIELDS) r[f] = o[f];
+    r.starHist = o.starHist;   // keep details; needsEnrich() decides if they're still valid
     const oldKey = rkey(o), newKey = rkey(r);      // old caches had no id: re-key the README entry
     if (oldKey !== newKey && S.readmes[oldKey]) { S.readmes[newKey] = S.readmes[oldKey]; delete S.readmes[oldKey]; }
   }
@@ -107,6 +108,7 @@ export async function sync(g) {
   const hadReadmes = Object.keys(S.readmes).length > 0;
 
   S.repos = [...fresh.values()];
+  for (const r of S.repos) r.starHist = recordStars(r.starHist, r.stars);   // one sample per day → star growth charts
   S.starPages = pages.map(({etag, ids}) => ({etag, ids}));
   const keep = new Set(S.repos.map(rkey));
   for (const k of Object.keys(S.readmes)) if (!keep.has(k)) delete S.readmes[k];   // unstarred
@@ -131,21 +133,25 @@ async function refreshDetails(g, {wantReadmes, wantEnrich}) {
   const todo = S.repos.filter(r => (wantEnrich && needsEnrich(r)) || (wantReadmes && needsReadme(r)));
   if (!todo.length) return {summary: 'details up to date (0 requests)'};
 
+  const now0 = Date.now();   // activity buckets are counted up to this moment
   const fields = 'latestRelease{tagName publishedAt} defaultBranchRef{target{...on Commit{committedDate}}} ' +
-    LANG_FIELDS +
+    LANG_FIELDS + ' ' + activityFields(now0) +
     (wantReadmes ? ' ' + README_NAMES.map((n, k) => `m${k}:object(expression:${JSON.stringify('HEAD:' + n)}){...on Blob{oid}}`).join(' ') : '');
   const download = [], viaRest = [];
-  let checked = 0, same = 0, fatal = null;
+  let checked = 0, same = 0, skipped = 0, fatal = null;
 
-  await pool(chunks(todo, 20), 8, async batch => {
+  await pool(chunks(todo, 10), 10, async batch => {
     if (fatal || g !== S.gen) return;
     let data;
     try { data = await gql('query{' + batch.map((r, j) => repoQ('r' + j, r.owner, r.name, fields)).join(' ') + '}'); }
-    catch (e) { fatal = e; return; }
+    catch (e) {   // auth/rate limit: stop; anything else (timeout…): skip this batch, it's retried next check
+      if (/Token|rate limit/i.test(e.message)) fatal = e; else skipped += batch.length;
+      return;
+    }
     const now = Date.now();
     for (const [j, r] of batch.entries()) {
       const d = data['r' + j];   // null = deleted/private/blocked: still marked checked so it isn't retried every sync
-      Object.assign(r, {release: d?.latestRelease?.tagName, releaseAt: d?.latestRelease?.publishedAt, langs: languageShares(d?.languages),
+      Object.assign(r, {release: d?.latestRelease?.tagName, releaseAt: d?.latestRelease?.publishedAt, langs: languageShares(d?.languages), activity: parseActivity(d, now0),
         commitAt: d?.defaultBranchRef?.target?.committedDate, enrichedAt: now, enrichedPushed: r.pushed});
       if (!wantReadmes || !needsReadme(r)) continue;
       const k = rkey(r), c = S.readmes[k];
@@ -183,7 +189,7 @@ async function refreshDetails(g, {wantReadmes, wantEnrich}) {
   render();
   return {summary: `${todo.length} changed repos checked` +
     (wantReadmes ? ` · READMEs: ${same + (rest?.same || 0)} unchanged, ${got + (rest?.got || 0)} downloaded` : '') +
-    (fatal ? ` · ⚠ ${fatal.message} (progress saved)` : '')};
+    (skipped ? ` · ${skipped} skipped (GitHub timeout, retried next check)` : '') + (fatal ? ` · ⚠ ${fatal.message} (progress saved)` : '')};
 }
 
 /** REST path (no token, or unusual README names). ETag conditional requests make "unchanged" nearly free. */

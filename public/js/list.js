@@ -1,6 +1,7 @@
 // The main list: search, facet filters, sorting and rendering of repo cards.
 import {S, readmeText, readmeLower} from './state.js';
 import {$, esc, escRe, fmtN, ago, safeUrl, tally} from './util.js';
+import {activityNow, starGains, ACTIVITY_SPAN} from './github.js';
 
 const PAGE = 500;                                  // cards rendered per "page"; more via the Show more button
 const filters = {lang: null, topic: null, owner: null};
@@ -52,6 +53,46 @@ const SORTS = {
 /** GitHub-style language breakdown: a colored bar plus every language with its share, largest first.
  *  Takes anything with a `langs` array ([[name, percent, color], …]): starred repos (filled in by checks with a token)
  *  and suggestion cards (filled in by discover.js). */
+/* ---- activity mini-charts: commits and stars per 2 weeks over the last 12 months ----
+   One series each, so no legend: the row label names it. Bars have a 2px gap, a 1px baseline tick for empty
+   periods (the rhythm stays readable), faint full-height blocks for periods the data doesn't cover, and a native
+   tooltip per bar. Values are text in ink colors; only the bars carry the series color. */
+const W = 260, H = 26, BAR = 8, GAP = 2;
+const day = t => new Date(t).toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
+
+function sparkbars(counts, {end, unit, cls}) {
+  const n = counts.length, max = Math.max(1, ...counts.filter(v => v != null)), start = end - n * ACTIVITY_SPAN;
+  const bars = counts.map((v, i) => {
+    const from = start + i * ACTIVITY_SPAN, to = from + ACTIVITY_SPAN, x = i * (BAR + GAP);
+    const tip = `${day(from)} – ${day(to)}`;
+    if (v == null) return `<rect class="nodata" x="${x}" y="0" width="${BAR}" height="${H}" rx="1"><title>${tip}: not tracked yet</title></rect>`;
+    const h = v ? Math.max(2, Math.round(v / max * (H - 1))) : 1;
+    return `<rect class="${v ? cls : 'zero'}" x="${x}" y="${H - h}" width="${BAR}" height="${h}" rx="${v ? 1.5 : 0}"><title>${tip}: ${v} ${unit}${v === 1 ? '' : 's'}</title></rect>`;
+  }).join('');
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="${unit}s per 2 weeks, last 12 months">${bars}</svg>`;
+}
+
+/** Commits row (from GitHub) + stars row (growth recorded by this app from daily star counts, see github.js). */
+export function activityHTML(r) {
+  const commits = activityNow(r.activity), hist = r.starHist, gains = starGains(hist);
+  if (!commits && !hist?.length) return '';
+  const rows = [];
+  if (commits) {
+    const total = commits.reduce((a, b) => a + b, 0);
+    rows.push(`<span class="act-label">Commits</span>${sparkbars(commits, {end: Date.now(), unit: 'commit', cls: 'c'})}
+      <span class="act-val" title="commits on the default branch in the last 12 months">${fmtN(total)}<small> / yr</small></span>`);
+  }
+  if (gains) {
+    const since = hist[0][0], gained = hist.at(-1)[1] - hist[0][1];
+    rows.push(`<span class="act-label">Stars</span>${sparkbars(gains, {end: Date.now(), unit: 'new star', cls: 's'})}
+      <span class="act-val" title="stars gained since ${day(since)} (tracked by this app)">${gained >= 0 ? '+' : ''}${fmtN(gained)}<small> since ${day(since)}</small></span>`);
+  } else if (hist?.length) {
+    rows.push(`<span class="act-label">Stars</span><span class="act-note" title="GitHub no longer shares when people starred a repo, so this app records each repo's star count once a day; the chart fills in over time">tracking growth since ${day(hist[0][0])}</span>
+      <span class="act-val">${fmtN(hist.at(-1)[1])}<small> ★</small></span>`);
+  }
+  return `<div class="activity" title="last 12 months, per 2 weeks">${rows.join('')}</div>`;
+}
+
 export function languagesHTML(r) {
   if (!r.langs?.length) return '';
   const color = c => /^#[0-9a-f]{3,8}$/i.test(c || '') ? c : '#8b949e';   // only real hex colors reach the style attribute
@@ -79,7 +120,7 @@ function card(r, snip, re) {
       <span title="${esc(r.starred)}">starred ${ago(r.starred)}</span>
       ${home ? `<a href="${esc(home)}" target="_blank" rel="noopener">site ↗</a>` : ''}
     </div>
-    ${languagesHTML(r)}
+    ${activityHTML(r)}${languagesHTML(r)}
     <button class="similar" data-similar="${esc(r.id)}" title="Find repos related to this one that you haven't starred">✨ Show suggestions</button>
   </div>`;
 }
