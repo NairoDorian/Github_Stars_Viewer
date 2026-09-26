@@ -11,10 +11,12 @@ No build step and no dependencies. The same code runs online (GitHub Pages) or l
 
 - **All stars at once.** Every page of the star list is fetched in parallel, then cached so reopening is instant.
 - **Rich cards everywhere.** Starred repos and Discover suggestions share the same layout: About text, owner, stars, forks, open issues, license, **every language with its share**, topics, homepage, creation date, **🕒 last commit**, latest release and activity charts. Starred cards also show when you starred them; suggestion cards show why they were recommended.
+- **More ways to view every repo.** Compact links on every card open GitDiagram, DeepWiki, GitIngest, UIthub, github.dev, and GitHistory. GitHistory animates a file rather than a whole repository; its link opens the cached README path when known, otherwise `README.md`.
 - **Sort** your stars by recently starred, most or fewest stars, last commit, last release, name, owner or newest repo. Every Discover result also has sorting, with **Best match** as its default. Exact release and commit sorting across suggestions needs a token.
 - **Search** name, owner, description and topics, with highlighting. Press `/` to focus the search box.
 - **Search inside READMEs.** Click *Index READMEs* once, then tick *Search in READMEs*. Matches show a snippet.
 - **Filters** by language, topic and owner.
+- **Hide forks** in both your starred repos and Discover suggestions with one persistent toolbar toggle. Existing cached suggestions are filtered immediately; when too few non-forks remain, Discover searches for more and skips fork-specific sources. The toggle uses GitHub's fork designation.
 - **Activity charts** on every card:
   - **Commits:** last 12 months per 2 weeks, counted on GitHub, with the total per year.
   - **Stars:** the **whole timeline**, from the first star to today, as a curve (hover for the count at any time). The data is the full star history from [star-history.com](https://www.star-history.com), which keeps its own copy of star data now that GitHub no longer shares star dates. Charts load lazily as cards scroll into view and are cached for a week. If it has no data for a repo, the app's own daily star-count samples are used instead.

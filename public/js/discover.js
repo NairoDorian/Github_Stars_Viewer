@@ -4,11 +4,12 @@
      scored so that words naming projects and tight clusters win ("scrcpy") over broad words ("android").
      Words covering the same repos are merged into one theme.
   2. For a theme, candidates come from independent signals, each adding points and a visible reason:
-     keyword search (name/description/README, forks included) · topic search · repos whose README mentions one of the
+     keyword search (name/description/README) · topic search · repos whose README mentions one of the
      theme's projects · most-starred forks of the theme's top repos · links inside your cached READMEs.
   3. Ranking = relevance to the theme + number of signals + popularity − staleness. Curated "awesome" lists are pushed
      down, and a fork doesn't get credit for README text it inherited from its parent.
-  Starred and dismissed (✕) repos are always excluded. Results are cached for 3 days in data/discover_<user>.json. */
+  Starred and dismissed (✕) repos are always excluded. The optional fork filter excludes GitHub-marked forks
+  from cached results and new searches. Results are cached for 3 days in data/discover_<user>.json. */
 import {S, ukey, readmeText, readmeLower, starredSet, starredIds} from './state.js';
 import {$, DAY, esc, ago, status, tally} from './util.js';
 import {gh, ghSearch, repoMeta, repoCardDetails, repoSortDetails, mapStar, whoAmI, setStar, needToken} from './github.js';
@@ -101,10 +102,10 @@ function excluded(x) {
 }
 
 /** Collects candidates from all signals, then scores them against the theme keywords. */
-function collector(keys) {
+function collector(keys, hideForks = S.hideForks) {
   const cands = new Map();
   const add = (x, reason, pts) => {
-    if (!x?.full_name || excluded(x)) return;
+    if (!x?.full_name || excluded(x) || (hideForks && x.fork)) return;
     const k = x.full_name.toLowerCase();
     let c = cands.get(k);
     if (!c) cands.set(k, c = {x, reasons: [], sig: 0});
@@ -129,7 +130,7 @@ function collector(keys) {
       stargazers_count: x.stargazers_count, forks_count: x.forks_count, open_issues_count: x.open_issues_count,
       created_at: x.created_at, pushed_at: x.pushed_at, homepage: x.homepage, owner: x.owner,
       license: typeof x.license === 'string' ? x.license : x.license?.spdx_id,
-      archived: x.archived, fork: x.fork, language: x.language, topics: tp.slice(0, 12)}, reasons, score: +score.toFixed(1)};
+      archived: x.archived, fork: x.fork, language: x.language, branch: x.default_branch, topics: tp.slice(0, 12)}, reasons, score: +score.toFixed(1)};
   }).filter(c => c.score > 0).sort((a, b) => b.score - a.score);
   return {add, finish};
 }
@@ -137,20 +138,35 @@ function collector(keys) {
 /* ---------------- explorers ----------------
   Every explorer takes a `depth`: 0 = first run, 1, 2… = "fetch the next page of every source". When fewer than
   MIN_VISIBLE suggestions are left (after starring or dismissing), the next depth runs automatically and its finds are
-  merged in, so there's always something to suggest. When a deeper run adds nothing new, the result is marked
-  `exhausted` and no more requests are made for it (↻ Refresh starts over). */
+  merged in. Search pages are bounded by MAX_DEPTH; ↻ Refresh starts over. */
 const MIN_VISIBLE = 12, MAX_DEPTH = 5;
 let busy = false;
 const fresh = id => { const r = S.disc.results[id]; return r && Date.now() - r.at < DISC_TTL; };
-const progress = text => { const el = $('#dres'); if (el) el.innerHTML = `<p class="muted">⏳ ${esc(text)}</p>`; };
-const visible = res => res.items.filter(c => !excluded(c.x));
+const progress = text => {
+  const el = $('#dres');
+  if (!el) return;
+  const html = `<p class="muted discovery-progress">${esc(text)}</p>`;
+  // Keep cached, already-filtered cards visible while a replacement page is fetched.
+  if (el.dataset.resultId === current && el.querySelector('.discovery-controls')) {
+    const note = el.querySelector('.discovery-progress');
+    if (note) note.outerHTML = html;
+    else el.insertAdjacentHTML('afterbegin', html);
+  } else {
+    el.innerHTML = html;
+    delete el.dataset.resultId;
+  }
+};
+const visible = res => res.items.filter(c => !excluded(c.x) && (!S.hideForks || !c.x.fork));
 
 /** Runs an explorer (depth 0 replaces the result, deeper runs merge into it), saves it and shows it. */
 async function explore(id, {force = false, depth = 0}, run) {
   if (!force && !depth && fresh(id)) return showResults(id);
   if (busy) return status('⏳ Discovery already running, please wait');
+  if (current !== id) { current = id; shown = PAGE; }
   busy = true;
   const g = S.gen;
+  const forkPolicy = S.hideForks;
+  let updated = false;
   try {
     const result = await run(g, depth);
     if (g !== S.gen || !result) return;
@@ -164,20 +180,27 @@ async function explore(id, {force = false, depth = 0}, run) {
       }
       items = [...byName.values()].sort((a, b) => b.score - a.score);
     }
-    const added = old ? items.length - old.items.length : items.length;
-    S.disc.results[id] = {...(old || {}), ...result, items, at: old?.at || Date.now(), depth,
+    S.disc.results[id] = {...(old || {}), ...result, items, at: old?.at || Date.now(), depth, forkPolicy,
       sortDatesAt: depth ? null : undefined,   // a deeper page adds candidates that need dates too
-      exhausted: depth >= MAX_DEPTH || (depth > 0 && added === 0)};
+      exhausted: depth >= MAX_DEPTH};
     await saveDisc(g);
-    showResults(id);
+    updated = true;
   } catch (e) { progress('⚠ ' + e.message); }
   finally { busy = false; }
+  if (updated && g === S.gen && current === id) showResults(id);
 }
 
 /** Fetches the next depth for a result (used when it runs low). */
 function topUp(id) {
   const res = S.disc.results[id];
-  if (!res || res.exhausted || busy) return;
+  if (!res || busy) return;
+  // Old cached searches may have spent their pages on forks. Search page 1 again with fork:false.
+  if (res.forkPolicy !== S.hideForks) {
+    if (id === 'mentions') return exploreMentions({force: true});
+    if (id === 'owners') return exploreOwners({force: true});
+    return exploreTheme(id, res.keys, membersOf(res), {force: true});
+  }
+  if (res.exhausted) return;
   const depth = (res.depth || 0) + 1;
   if (id === 'mentions') return exploreMentions({depth});
   if (id === 'owners') return exploreOwners({depth});
@@ -190,7 +213,8 @@ const membersOf = res => {
 
 function exploreTheme(id, keys, members, opts = {}) {
   return explore(id, opts, async (g, depth) => {
-    const {add, finish} = collector(keys), note = [];
+    const hideForks = S.hideForks;
+    const {add, finish} = collector(keys, hideForks), note = [];
     const page = depth + 1;
     const step = async (label, fn) => {
       if (g !== S.gen) return;
@@ -198,25 +222,25 @@ function exploreTheme(id, keys, members, opts = {}) {
       try { await fn(); } catch (e) { note.push(`${label.replace(/…$/, '')}: ${e.message}`); }
     };
     const n = S.token ? 3 : 1;   // search API allows 30/min with a token, 10/min without
-    // 1. keyword searches, forks included (a fork is often exactly what you're after)
+    // 1. Keyword searches: ask GitHub for non-forks directly when the filter is active.
     for (const k of keys.slice(0, n)) await step(`Searching “${k}”…`, async () => {
-      for (const x of await ghSearch(`${k} in:name,description,readme fork:true`, 60, page)) add(x, `matches “${k}”`, 1);
+      for (const x of await ghSearch(`${k} in:name,description,readme fork:${hideForks ? 'false' : 'true'}`, 60, page)) add(x, `matches “${k}”`, 1);
     });
     if (keys.length > 1) await step('Searching keyword combination…', async () => {
-      for (const x of await ghSearch(`${keys[0]} ${keys[1]} fork:true`, 40, page)) add(x, `matches “${keys[0]} + ${keys[1]}”`, 1.5);
+      for (const x of await ghSearch(`${keys[0]} ${keys[1]} fork:${hideForks ? 'false' : 'true'}`, 40, page)) add(x, `matches “${keys[0]} + ${keys[1]}”`, 1.5);
     });
     // 2. topic search, for keys that are real topics among your stars
     for (const k of keys.filter(k => members.some(r => r.topics.includes(k))).slice(0, n)) await step(`Topic ${k}…`, async () => {
-      for (const x of await ghSearch(`topic:${k}`, 40, page)) add(x, `topic: ${k}`, 1.5);
+      for (const x of await ghSearch(`topic:${k}${hideForks ? ' fork:false' : ''}`, 40, page)) add(x, `topic: ${k}`, 1.5);
     });
     // 3. repos whose README mentions one of the theme's projects (GUIs, wrappers, add-ons, alternatives)
     for (const name of members.map(r => r.name).filter(x => x.length >= 5 && !STOP.has(x.toLowerCase())).slice(0, n)) {
       await step(`Repos mentioning ${name}…`, async () => {
-        for (const x of await ghSearch(`"${name}" in:readme fork:true`, 40, page)) add(x, `README mentions ${name}`, 2);
+        for (const x of await ghSearch(`"${name}" in:readme fork:${hideForks ? 'false' : 'true'}`, 40, page)) add(x, `README mentions ${name}`, 2);
       });
     }
     // 4. most-starred forks of the theme's top repos
-    for (const r of members.filter(r => !r.fork).slice(0, n)) await step(`Forks of ${r.full}…`, async () => {
+    for (const r of (hideForks ? [] : members.filter(r => !r.fork).slice(0, n))) await step(`Forks of ${r.full}…`, async () => {
       const res = await gh(`/repos/${r.full}/forks?sort=stargazers&per_page=100&page=${page}`);
       if (res.ok) for (const x of await res.json()) if (x.stargazers_count >= 1) add(x, `fork of ${r.full}`, 2);
     });
@@ -277,7 +301,7 @@ function exploreOwners(opts = {}) {
       if (g !== S.gen) return null;
       const page = i >= per * depth ? 1 : depth + 1;   // owners new in this round start at page 1
       progress(`${depth ? 'Finding more… ' : ''}Top repos of ${o}…`);
-      try { for (const x of await ghSearch(`user:${o}`, 15, page)) add(x, `by ${o}: you starred ${n} of their repos`, n); }
+      try { for (const x of await ghSearch(`user:${o}${S.hideForks ? ' fork:false' : ''}`, 15, page)) add(x, `by ${o}: you starred ${n} of their repos`, n); }
       catch (e) { note.push(e.message); break; }
     }
     return {items: finish(), note};
@@ -336,7 +360,7 @@ function suggestionRepo(x) {
     url: x.html_url || `https://github.com/${x.full_name}`, about: x.description, homepage: x.homepage,
     stars: x.stargazers_count, forks: x.forks_count, issues: x.open_issues_count, lang: x.language,
     topics: x.topics || [], license: typeof x.license === 'string' ? x.license : x.license?.spdx_id,
-    archived: x.archived, fork: x.fork, created: x.created_at, pushed: x.pushed_at,
+    archived: x.archived, fork: x.fork, branch: x.branch || x.default_branch, created: x.created_at, pushed: x.pushed_at,
     release: x.release, releaseAt: x.releaseAt, commitAt: x.commitAt, activity: x.activity, langs: x.langs};
 }
 
@@ -370,20 +394,22 @@ function showResults(id) {
   if (!res || !el) return;
   if (id !== current) { current = id; shown = PAGE; }
   const items = sortRepos([...visible(res)], discoverySort);
-  const low = items.length < MIN_VISIBLE && !res.exhausted;
-  const empty = !items.length && res.exhausted
+  const low = items.length < MIN_VISIBLE && (!res.exhausted || res.forkPolicy !== S.hideForks);
+  const restoreForks = !S.hideForks && res.forkPolicy === true;
+  const empty = !items.length && res.exhausted && !low
     ? `<p>No more suggestions here: everything found is starred or dismissed. Try ↻ Refresh later, another theme, or a keyword.</p>` : '';
+  el.dataset.resultId = id;
   el.innerHTML = `<div class="discovery-controls"><span class="muted">${items.length} suggestions · found ${ago(res.at)}</span>
       <label>Sort <select id="discoverySort" aria-label="Sort suggestions">${SORT_OPTIONS.filter(([key]) => key !== 'starred')
         .map(([key, label]) => `<option value="${key}"${discoverySort === key ? ' selected' : ''}>${label}</option>`).join('')}</select></label>
       <button data-refresh="${esc(id)}">↻ Refresh</button></div>
     <p class="muted discovery-note">${(discoverySort === 'release' || discoverySort === 'commit') ?
       (!S.token ? 'Add a token for exact commit and release dates.' : sortPending.has(res) ? 'Checking exact dates…' : sortIncomplete.has(res) ? 'Some dates could not be checked; refresh to retry.' : '') : ''}
-      ${low ? ' · ⏳ finding more…' : ''}${res.note?.length ? `<br>⚠ ${res.note.map(esc).join(' · ')}` : ''}</p>
+      ${low || restoreForks ? ' · ⏳ finding more…' : ''}${res.note?.length ? `<br>⚠ ${res.note.map(esc).join(' · ')}` : ''}</p>
     ${empty}<ul class="sugg">${items.slice(0, shown).map(c => card(suggestionRepo(c.x), {suggestion: true, reasons: c.reasons})).join('')}</ul>
     ${items.length > shown ? `<button data-more>Show more (${items.length - shown} left)</button>` : ''}`;
   watchStarCharts(el);   // star history of the suggestions loads as they scroll into view
-  if (low) topUp(id);   // runs in the background and re-renders when done
+  if (low || restoreForks) topUp(id);   // runs in the background and re-renders when done
   else fillCardDetails(id, items.slice(0, shown));
   if ((discoverySort === 'release' || discoverySort === 'commit') && S.token) fillSortDates(id, res);
 }
@@ -487,6 +513,9 @@ async function starSuggestion(full, btn) {
 
 export function initDiscover() {
   $('#toggleInsights').onclick = () => show();
+  window.addEventListener('fork-filter-change', () => {
+    if ($('#insights').classList.contains('show') && current) showResults(current);
+  });
   $('#insights').addEventListener('change', e => {
     if (e.target.id !== 'discoverySort') return;
     discoverySort = e.target.value;

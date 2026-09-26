@@ -132,6 +132,24 @@ export function languagesHTML(r) {
   </div>`;
 }
 
+/** Compact external views shared by starred and suggested repo cards. GitHistory animates one file, so use the
+ * cached README path when available and fall back to the usual README.md name. */
+function viewerLinks(r) {
+  const full = r.full.split('/').map(encodeURIComponent).join('/');
+  const branch = encodeURIComponent(r.branch || 'HEAD');
+  const path = (S.readmes[String(r.id)]?.path || 'README.md').split('/').map(encodeURIComponent).join('/');
+  const links = [
+    ['Diagram', `https://gitdiagram.com/${full}`, 'GitDiagram: repository architecture diagram'],
+    ['Wiki', `https://deepwiki.com/${full}`, 'DeepWiki: generated repository documentation'],
+    ['Ingest', `https://gitingest.com/${full}`, 'GitIngest: repository text for an LLM'],
+    ['UIthub', `https://uithub.com/${full}`, 'UIthub: repository context viewer'],
+    ['Code', `https://github.dev/${full}`, 'github.dev: browse code in VS Code'],
+    ['History', `https://github.githistory.xyz/${full}/blob/${branch}/${path}`, 'GitHistory: animate the README file history'],
+  ];
+  return `<nav class="repo-viewers" aria-label="Other views of ${esc(r.full)}">${links.map(([label, url, title]) =>
+    `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="${esc(title)}">${label}</a>`).join('')}</nav>`;
+}
+
 /** Shared card layout. Discovery passes a normalized repo plus reasons and actions. */
 export function card(r, {snip = null, re = null, suggestion = false, reasons = []} = {}) {
   const avatar = r.avatar ? `${r.avatar}${r.avatar.includes('?') ? '&' : '?'}s=36` : '';
@@ -152,7 +170,7 @@ export function card(r, {snip = null, re = null, suggestion = false, reasons = [
       ${r.starred ? `<span title="${esc(r.starred)}">starred ${ago(r.starred)}</span>` : ''}
       ${home ? `<a href="${esc(home)}" target="_blank" rel="noopener">site ↗</a>` : ''}
     </div>
-    ${activityHTML(r)}${languagesHTML(r)}
+    ${activityHTML(r)}${languagesHTML(r)}${viewerLinks(r)}
     ${suggestion ? `<div class="chips reasons">${reasons.slice(0, 5).map(reason => `<span class="why">${esc(reason)}</span>`).join('')}</div>
       <div class="suggestion-actions"><button class="starbtn" data-star="${esc(r.full)}" title="Star on GitHub">☆ Star</button>
       <button class="x" data-dismiss="${esc(r.full.toLowerCase())}" title="Never suggest this repo again">✕ Not interested</button></div>`
@@ -167,6 +185,7 @@ export function render() {
 
   const out = [];
   for (const r of S.repos) {
+    if (S.hideForks && r.fork) continue;
     if (filters.lang && r.lang !== filters.lang) continue;
     if (filters.topic && !r.topics.includes(filters.topic)) continue;
     if (filters.owner && r.owner !== filters.owner) continue;
@@ -175,8 +194,8 @@ export function render() {
   }
   sortRepos(out, $('#sort').value, 'name');
 
-  const filtered = Object.values(filters).some(Boolean);
-  $('#count').textContent = `${out.length} of ${S.repos.length} repos` + (filtered ? ' (filtered: click a facet again to clear)' : '');
+  const filtered = S.hideForks || Object.values(filters).some(Boolean);
+  $('#count').textContent = `${out.length} of ${S.repos.length} repos` + (filtered ? ' (filtered)' : '');
   $('#list').innerHTML = out.slice(0, limit).map(x => card(x.r, {snip: x.snip, re})).join('');
   const left = out.length - limit, more = $('#more');
   more.hidden = left <= 0;   // everything shown: no button at all
@@ -188,14 +207,15 @@ export function render() {
 // Facet counts only change when the repo list or the active filters change.
 let facetsKey = null;
 function renderFacets() {
-  const k = [S.repos, filters.lang, filters.topic, filters.owner];
+  const k = [S.repos, S.hideForks, filters.lang, filters.topic, filters.owner];
   if (facetsKey && k.every((v, i) => v === facetsKey[i])) return;
   facetsKey = k;
   const block = (title, kind, list, n) => `<h3>${title}</h3>` + list.slice(0, n).map(([v, c]) =>
     `<div class="facet ${filters[kind] === v ? 'on' : ''}" data-${kind}="${esc(v)}"><span title="${esc(v)}">${esc(v)}</span><span class="muted">${c}</span></div>`).join('');
-  $('#facets').innerHTML = block('Languages', 'lang', tally(S.repos, r => r.lang), 15) +
-    block('Topics', 'topic', tally(S.repos, r => r.topics), 30) +
-    block('Owners', 'owner', tally(S.repos, r => r.owner).filter(x => x[1] > 1), 15);
+  const source = S.hideForks ? S.repos.filter(r => !r.fork) : S.repos;
+  $('#facets').innerHTML = block('Languages', 'lang', tally(source, r => r.lang), 15) +
+    block('Topics', 'topic', tally(source, r => r.topics), 30) +
+    block('Owners', 'owner', tally(source, r => r.owner).filter(x => x[1] > 1), 15);
 }
 
 /** Puts a query in the search box (with README search on) and shows the matches. */
@@ -216,6 +236,15 @@ function setFacetsHidden(hide) {
 }
 
 export function initList() {
+  try { S.hideForks = localStorage.getItem('starsViewer.hideForks') === '1'; } catch {}
+  $('#hideForks').checked = S.hideForks;
+  $('#hideForks').onchange = e => {
+    S.hideForks = e.target.checked;
+    try { localStorage.setItem('starsViewer.hideForks', S.hideForks ? '1' : '0'); } catch {}
+    limit = PAGE;
+    render();
+    window.dispatchEvent(new CustomEvent('fork-filter-change'));
+  };
   let hidden = false;
   try { hidden = localStorage.getItem(FACETS_PREF) === '1'; } catch {}
   setFacetsHidden(hidden);

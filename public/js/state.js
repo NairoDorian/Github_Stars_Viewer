@@ -8,6 +8,7 @@ export const S = {
   readmes: {},       // {<repo id>: {t: text, sha, path, etag, at, pushed}}
   disc: {dismissed: [], results: {}},   // discovery cache (see discover.js)
   starCurves: {},    // {<owner/name lower-cased>: {at, pts: [[time, stars], …] | null}} from star-history.com (shared by all users)
+  hideForks: false,  // shared toolbar filter for starred repos and Discover
   gen: 0,            // bumped when the user changes: running jobs compare it and stop without saving
 };
 
