@@ -3,27 +3,11 @@ import {S, readmeText, readmeLower} from './state.js';
 import {$, esc, escRe, fmtN, ago, when, safeUrl, tally} from './util.js';
 import {activityNow, starGains, ACTIVITY_SPAN, ACTIVITY_BUCKETS} from './github.js';
 import {drawableCurve, starsAt, watchStarCharts} from './starhistory.js';
-import {SORT_OPTIONS, sortRepos, sortEditorHTML, editSortKeys, loadSortKeys} from './sort.js';
+import {sortRepos} from './sort.js';
 
 const PAGE = 200;   // cards rendered per step; more load automatically when you reach the end (or via Show more)
 const filters = {lang: null, topic: null, owner: null};
 let limit = PAGE;
-const STAR_SORT_PREF = 'starsViewer.starSortKeys';
-const STAR_SORT_KEYS = SORT_OPTIONS.map(([k]) => k).filter(k => k !== 'relevance');
-let starSortKeys = ['starred'];
-
-function showStarSort() { $('#starSort').innerHTML = sortEditorHTML(starSortKeys, STAR_SORT_KEYS); }
-function changeStarSort(e, action) {
-  const t = e.target.closest('[data-sort-index],[data-sort-action]');
-  if (!t || (action === 'change' && t.tagName !== 'SELECT')) return;
-  const next = editSortKeys(starSortKeys, action === 'change' ? action : t.dataset.sortAction,
-    Number(t.dataset.sortIndex), t.value, STAR_SORT_KEYS);
-  if (next.join('|') === starSortKeys.join('|')) return;
-  starSortKeys = next;
-  try { localStorage.setItem(STAR_SORT_PREF, JSON.stringify(next)); } catch {}
-  showStarSort();
-  limit = PAGE; render();
-}
 
 // Lower-cased searchable text per repo object (repo objects are replaced on sync, so this never goes stale).
 const hayCache = new WeakMap();
@@ -208,7 +192,7 @@ export function render() {
     const m = match(r, terms, inReadme);
     if (m) out.push({r, snip: m.snip});
   }
-  sortRepos(out, starSortKeys, 'name');
+  sortRepos(out, $('#sort').value, 'name');
 
   const filtered = S.hideForks || Object.values(filters).some(Boolean);
   $('#count').textContent = `${out.length} of ${S.repos.length} repos` + (filtered ? ' (filtered)' : '');
@@ -252,10 +236,6 @@ function setFacetsHidden(hide) {
 }
 
 export function initList() {
-  starSortKeys = loadSortKeys(STAR_SORT_PREF, STAR_SORT_KEYS, 'starred');
-  showStarSort();
-  $('#starSort').addEventListener('change', e => changeStarSort(e, 'change'));
-  $('#starSort').addEventListener('click', e => changeStarSort(e, 'click'));
   try { S.hideForks = localStorage.getItem('starsViewer.hideForks') === '1'; } catch {}
   $('#hideForks').checked = S.hideForks;
   $('#hideForks').onchange = e => {
@@ -272,6 +252,7 @@ export function initList() {
   window.addEventListener('star-curve', e => refreshActivity(e.detail));
   let timer;
   $('#q').oninput = () => { clearTimeout(timer); timer = setTimeout(() => { limit = PAGE; render(); }, 120); };
+  $('#sort').onchange = () => { limit = PAGE; render(); };
   $('#inReadme').onchange = () => render();
   const showMore = () => { if (!$('#more').hidden) { limit += PAGE; render(); } };
   $('#more').onclick = showMore;

@@ -16,7 +16,7 @@ import {gh, ghSearch, repoMeta, repoCardDetails, repoSortDetails, mapStar, whoAm
 import {saveDisc, saveStars} from './store.js';
 import {render, searchFor, card} from './list.js';
 import {watchStarCharts} from './starhistory.js';
-import {SORT_OPTIONS, sortRepos, sortEditorHTML, editSortKeys, loadSortKeys} from './sort.js';
+import {SORT_OPTIONS, sortRepos} from './sort.js';
 
 const DISC_TTL = 3 * DAY;
 
@@ -348,21 +348,10 @@ let tab = 'themes', themes = [];
 
 const PAGE = 40;
 let current = null, shown = PAGE;   // result on screen, and how many of its cards are shown
-const SORT_PREF = 'starsViewer.discoverySortKeys';
-const DISC_SORT_KEYS = SORT_OPTIONS.map(([k]) => k).filter(k => k !== 'starred');
-let discoverySortKeys = loadSortKeys(SORT_PREF, DISC_SORT_KEYS, 'relevance', 'starsViewer.discoverySort');
-
-function changeDiscoverySort(e, action) {
-  const t = e.target.closest('[data-sort-index],[data-sort-action]');
-  if (!t || (action === 'change' && t.tagName !== 'SELECT')) return;
-  const next = editSortKeys(discoverySortKeys, action === 'change' ? action : t.dataset.sortAction,
-    Number(t.dataset.sortIndex), t.value, DISC_SORT_KEYS);
-  if (next.join('|') === discoverySortKeys.join('|')) return;
-  discoverySortKeys = next;
-  try { localStorage.setItem(SORT_PREF, JSON.stringify(next)); } catch {}
-  shown = PAGE;
-  if (current) showResults(current);
-}
+const SORT_PREF = 'starsViewer.discoverySort';
+let discoverySort = 'relevance';
+try { discoverySort = localStorage.getItem(SORT_PREF) || 'relevance'; } catch {}
+if (!SORT_OPTIONS.some(([key]) => key === discoverySort) || discoverySort === 'starred') discoverySort = 'relevance';
 
 /** Old discovery caches have fewer fields; normalize them for the shared starred-repo card. */
 function suggestionRepo(x) {
@@ -404,16 +393,17 @@ function showResults(id) {
   const res = S.disc.results[id], el = $('#dres');
   if (!res || !el) return;
   if (id !== current) { current = id; shown = PAGE; }
-  const items = sortRepos([...visible(res)], discoverySortKeys);
+  const items = sortRepos([...visible(res)], discoverySort);
   const low = items.length < MIN_VISIBLE && (!res.exhausted || res.forkPolicy !== S.hideForks);
   const restoreForks = !S.hideForks && res.forkPolicy === true;
   const empty = !items.length && res.exhausted && !low
     ? `<p>No more suggestions here: everything found is starred or dismissed. Try ↻ Refresh later, another theme, or a keyword.</p>` : '';
   el.dataset.resultId = id;
   el.innerHTML = `<div class="discovery-controls"><span class="muted">${items.length} suggestions · found ${ago(res.at)}</span>
-      <div class="sort-editor" aria-label="Suggestion sorting">${sortEditorHTML(discoverySortKeys, DISC_SORT_KEYS)}</div>
+      <label>Sort <select id="discoverySort" aria-label="Sort suggestions">${SORT_OPTIONS.filter(([key]) => key !== 'starred')
+        .map(([key, label]) => `<option value="${key}"${discoverySort === key ? ' selected' : ''}>${label}</option>`).join('')}</select></label>
       <button data-refresh="${esc(id)}">↻ Refresh</button></div>
-    <p class="muted discovery-note">${(discoverySortKeys.includes('release') || discoverySortKeys.includes('commit')) ?
+    <p class="muted discovery-note">${(discoverySort === 'release' || discoverySort === 'commit') ?
       (!S.token ? 'Add a token for exact commit and release dates.' : sortPending.has(res) ? 'Checking exact dates…' : sortIncomplete.has(res) ? 'Some dates could not be checked; refresh to retry.' : '') : ''}
       ${low || restoreForks ? ' · ⏳ finding more…' : ''}${res.note?.length ? `<br>⚠ ${res.note.map(esc).join(' · ')}` : ''}</p>
     ${empty}<ul class="sugg">${items.slice(0, shown).map(c => card(suggestionRepo(c.x), {suggestion: true, reasons: c.reasons})).join('')}</ul>
@@ -421,7 +411,7 @@ function showResults(id) {
   watchStarCharts(el);   // star history of the suggestions loads as they scroll into view
   if (low || restoreForks) topUp(id);   // runs in the background and re-renders when done
   else fillCardDetails(id, items.slice(0, shown));
-  if ((discoverySortKeys.includes('release') || discoverySortKeys.includes('commit')) && S.token) fillSortDates(id, res);
+  if ((discoverySort === 'release' || discoverySort === 'commit') && S.token) fillSortDates(id, res);
 }
 
 /** Hydrate only the cards on screen, then persist those details with the discovery result. */
@@ -526,13 +516,18 @@ export function initDiscover() {
   window.addEventListener('fork-filter-change', () => {
     if ($('#insights').classList.contains('show') && current) showResults(current);
   });
-  $('#insights').addEventListener('change', e => changeDiscoverySort(e, 'change'));
+  $('#insights').addEventListener('change', e => {
+    if (e.target.id !== 'discoverySort') return;
+    discoverySort = e.target.value;
+    try { localStorage.setItem(SORT_PREF, discoverySort); } catch {}
+    shown = PAGE;
+    if (current) showResults(current);
+  });
   window.addEventListener('suggest-for', e => {   // "✨ Show suggestions" on a repo card (list.js)
     const repo = S.repos.find(r => r.id === e.detail);
     if (repo) exploreRepo(repo);
   });
   $('#insights').addEventListener('click', async e => {
-    if (e.target.closest('[data-sort-action]')) return changeDiscoverySort(e, 'click');
     const t = e.target.closest('[data-dtab],[data-theme],[data-dismiss],[data-refresh],[data-filterq],[data-pattern],[data-star],[data-more]');
     if (!t) return;
     const d = t.dataset;
