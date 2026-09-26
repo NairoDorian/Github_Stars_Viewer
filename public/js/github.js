@@ -87,7 +87,7 @@ export async function repoMeta(fulls) {
     }
     return out;
   }
-  const fields = 'databaseId nameWithOwner description stargazerCount pushedAt isArchived isFork url primaryLanguage{name} repositoryTopics(first:8){nodes{topic{name}}}';
+  const fields = 'databaseId nameWithOwner description stargazerCount forkCount createdAt pushedAt isArchived isFork url homepageUrl owner{login avatarUrl} licenseInfo{spdxId} primaryLanguage{name} repositoryTopics(first:12){nodes{topic{name}}}';
   await pool(chunks(fulls, 40), 4, async batch => {
     let data;
     try { data = await gql('query{' + batch.map((f, j) => { const [o, n] = f.split('/'); return repoQ('r' + j, o, n, fields); }).join(' ') + '}'); }
@@ -95,7 +95,9 @@ export async function repoMeta(fulls) {
     batch.forEach((f, j) => {
       const d = data['r' + j]; if (!d) return;
       out.set(f.toLowerCase(), {id: d.databaseId, full_name: d.nameWithOwner, description: d.description, stargazers_count: d.stargazerCount,
-        pushed_at: d.pushedAt, archived: d.isArchived, fork: d.isFork, html_url: d.url, language: d.primaryLanguage?.name,
+        forks_count: d.forkCount, created_at: d.createdAt, pushed_at: d.pushedAt, archived: d.isArchived, fork: d.isFork,
+        html_url: d.url, homepage: d.homepageUrl, owner: {login: d.owner.login, avatar_url: d.owner.avatarUrl},
+        license: d.licenseInfo ? {spdx_id: d.licenseInfo.spdxId} : null, language: d.primaryLanguage?.name,
         topics: d.repositoryTopics.nodes.map(x => x.topic.name)});
     });
   });
@@ -159,18 +161,43 @@ export function starGains(hist, now = Date.now()) {
   return counts.map(v => v == null ? null : Math.round(v));
 }
 
-/** Languages and commit activity for many "owner/name" (needs a token): 20 repos per GraphQL call, 6 in parallel.
- *  Returns Map(lower-cased full name → {langs, activity}). Failed lookups get empty values so they aren't retried. */
+/** Full card details for visible suggestions. Details are saved with the discovery result. */
 export async function repoCardDetails(fulls) {
   const out = new Map();
   if (!S.token) return out;
-  const end = Date.now(), fields = LANG_FIELDS + ' ' + activityFields(end) + ' lastCommit:defaultBranchRef{target{...on Commit{committedDate}}}';
-  await pool(chunks(fulls, 20), 6, async batch => {
+  const end = Date.now(), fields = LANG_FIELDS + ' ' + activityFields(end) +
+    ' lastCommit:defaultBranchRef{target{...on Commit{committedDate}}} latestRelease{tagName publishedAt}' +
+    ' forkCount createdAt pushedAt homepageUrl licenseInfo{spdxId} owner{login avatarUrl} issues(states:OPEN){totalCount}';
+  await pool(chunks(fulls, 10), 6, async batch => {
     let data;
     try { data = await gql('query{' + batch.map((f, j) => { const [o, n] = f.split('/'); return repoQ('r' + j, o, n, fields); }).join(' ') + '}'); }
     catch { return; }
-    batch.forEach((f, j) => out.set(f.toLowerCase(), {langs: languageShares(data['r' + j]?.languages),
-      activity: parseActivity(data['r' + j], end), commitAt: data['r' + j]?.lastCommit?.target?.committedDate || null}));
+    batch.forEach((f, j) => {
+      const d = data['r' + j];
+      if (!d) return;
+      out.set(f.toLowerCase(), {langs: languageShares(d.languages), activity: parseActivity(d, end),
+        commitAt: d.lastCommit?.target?.committedDate || null, release: d.latestRelease?.tagName || null,
+        releaseAt: d.latestRelease?.publishedAt || null, forks_count: d.forkCount, created_at: d.createdAt,
+        pushed_at: d.pushedAt, homepage: d.homepageUrl, license: d.licenseInfo?.spdxId || null,
+        open_issues_count: d.issues?.totalCount, owner: d.owner ? {login: d.owner.login, avatar_url: d.owner.avatarUrl} : null});
+    });
+  });
+  return out;
+}
+
+/** Cheap sort data for every candidate when exact commit/release order is requested. */
+export async function repoSortDetails(fulls) {
+  const out = new Map();
+  if (!S.token) return out;
+  const fields = 'lastCommit:defaultBranchRef{target{...on Commit{committedDate}}} latestRelease{tagName publishedAt}';
+  await pool(chunks(fulls, 40), 6, async batch => {
+    let data;
+    try { data = await gql('query{' + batch.map((f, j) => { const [o, n] = f.split('/'); return repoQ('r' + j, o, n, fields); }).join(' ') + '}'); }
+    catch { return; }
+    batch.forEach((f, j) => { const d = data['r' + j]; if (d) out.set(f.toLowerCase(), {
+      commitAt: d.lastCommit?.target?.committedDate || null,
+      release: d.latestRelease?.tagName || null, releaseAt: d.latestRelease?.publishedAt || null,
+    }); });
   });
   return out;
 }

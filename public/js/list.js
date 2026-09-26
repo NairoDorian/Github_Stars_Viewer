@@ -3,6 +3,7 @@ import {S, readmeText, readmeLower} from './state.js';
 import {$, esc, escRe, fmtN, ago, when, safeUrl, tally} from './util.js';
 import {activityNow, starGains, ACTIVITY_SPAN, ACTIVITY_BUCKETS} from './github.js';
 import {drawableCurve, starsAt, watchStarCharts} from './starhistory.js';
+import {sortRepos} from './sort.js';
 
 const PAGE = 200;   // cards rendered per step; more load automatically when you reach the end (or via Show more)
 const filters = {lang: null, topic: null, owner: null};
@@ -40,16 +41,6 @@ function hl(text, re) {
   }
   return out + esc(text.slice(last));
 }
-
-const time = d => d ? Date.parse(d) : 0;
-const SORTS = {
-  starred: r => -time(r.starred),
-  stars: r => -r.stars,
-  pushed: r => -time(r.commitAt || r.pushed),
-  release: r => -time(r.releaseAt),
-  name: r => r.name.toLowerCase(),
-  created: r => -time(r.created),
-};
 
 /** GitHub-style language breakdown: a colored bar plus every language with its share, largest first.
  *  Takes anything with a `langs` array ([[name, percent, color], …]): starred repos (filled in by checks with a token)
@@ -141,33 +132,38 @@ export function languagesHTML(r) {
   </div>`;
 }
 
-function card(r, snip, re) {
+/** Shared card layout. Discovery passes a normalized repo plus reasons and actions. */
+export function card(r, {snip = null, re = null, suggestion = false, reasons = []} = {}) {
   const avatar = r.avatar ? `${r.avatar}${r.avatar.includes('?') ? '&' : '?'}s=36` : '';
   const home = safeUrl(r.homepage);
   const license = r.license && r.license !== 'NOASSERTION' ? `<span>${esc(r.license)}</span>` : '';
-  return `<div class="card">
+  const tag = suggestion ? 'li' : 'div';
+  return `<${tag} class="card${suggestion ? ' suggestion-card' : ''}">
     <div class="owner">${avatar ? `<img src="${esc(avatar)}" loading="lazy" alt="">` : ''}<span class="chip" data-owner="${esc(r.owner)}">${esc(r.owner)}</span>${r.archived ? ' · archived' : ''}${r.fork ? ' · fork' : ''}</div>
     <a href="${esc(safeUrl(r.url))}" target="_blank" rel="noopener">${hl(r.name, re)}</a>
     <p class="desc">${r.about ? hl(r.about, re) : '<span class="muted">No description</span>'}</p>
     ${snip ? `<div class="snip">README: …${hl(snip, re)}…</div>` : ''}
-    <div class="chips">${r.topics.slice(0, 8).map(t => `<span class="chip" data-topic="${esc(t)}">${hl(t, re)}</span>`).join('')}</div>
+    <div class="chips">${(r.topics || []).slice(0, 8).map(t => `<span class="chip" data-topic="${esc(t)}">${hl(t, re)}</span>`).join('')}</div>
     <div class="meta">
-      <span>★ ${fmtN(r.stars)}</span><span>⑂ ${fmtN(r.forks)}</span>${r.lang ? `<span>● ${esc(r.lang)}</span>` : ''}${license}
-      <span class="lastcommit" title="Last commit: ${esc(when(r.commitAt || r.pushed))}${r.commitAt ? '' : ' (last push)'}">🕒 last commit ${ago(r.commitAt || r.pushed)}</span>
+      <span>★ ${fmtN(r.stars)}</span>${r.forks != null ? `<span>⑂ ${fmtN(r.forks)}</span>` : ''}${r.issues != null ? `<span title="Open issues">◉ ${fmtN(r.issues)} issues</span>` : ''}${r.lang ? `<span>● ${esc(r.lang)}</span>` : ''}${license}
+      ${(r.commitAt || r.pushed) ? `<span class="lastcommit" title="Last commit: ${esc(when(r.commitAt || r.pushed))}${r.commitAt ? '' : ' (last push)'}">🕒 last commit ${ago(r.commitAt || r.pushed)}</span>` : ''}
       ${r.release ? `<span title="${esc(r.releaseAt)}">🏷 ${esc(r.release)} · ${ago(r.releaseAt)}</span>` : ''}
-      <span title="${esc(r.starred)}">starred ${ago(r.starred)}</span>
+      ${r.created ? `<span title="Created ${esc(when(r.created))}">created ${ago(r.created)}</span>` : ''}
+      ${r.starred ? `<span title="${esc(r.starred)}">starred ${ago(r.starred)}</span>` : ''}
       ${home ? `<a href="${esc(home)}" target="_blank" rel="noopener">site ↗</a>` : ''}
     </div>
     ${activityHTML(r)}${languagesHTML(r)}
-    <button class="similar" data-similar="${esc(r.id)}" title="Find repos related to this one that you haven't starred">✨ Show suggestions</button>
-  </div>`;
+    ${suggestion ? `<div class="chips reasons">${reasons.slice(0, 5).map(reason => `<span class="why">${esc(reason)}</span>`).join('')}</div>
+      <div class="suggestion-actions"><button class="starbtn" data-star="${esc(r.full)}" title="Star on GitHub">☆ Star</button>
+      <button class="x" data-dismiss="${esc(r.full.toLowerCase())}" title="Never suggest this repo again">✕ Not interested</button></div>`
+      : `<button class="similar" data-similar="${esc(r.id)}" title="Find repos related to this one that you haven't starred">✨ Show suggestions</button>`}
+  </${tag}>`;
 }
 
 export function render() {
   const terms = $('#q').value.toLowerCase().split(/\s+/).filter(Boolean);
   const re = terms.length ? new RegExp(terms.map(escRe).join('|'), 'gi') : null;
   const inReadme = $('#inReadme').checked;
-  const key = SORTS[$('#sort').value] || SORTS.starred;
 
   const out = [];
   for (const r of S.repos) {
@@ -175,13 +171,13 @@ export function render() {
     if (filters.topic && !r.topics.includes(filters.topic)) continue;
     if (filters.owner && r.owner !== filters.owner) continue;
     const m = match(r, terms, inReadme);
-    if (m) out.push({r, snip: m.snip, k: key(r)});   // sort key computed once per repo
+    if (m) out.push({r, snip: m.snip});
   }
-  out.sort((a, b) => a.k < b.k ? -1 : a.k > b.k ? 1 : 0);
+  sortRepos(out, $('#sort').value, 'name');
 
   const filtered = Object.values(filters).some(Boolean);
   $('#count').textContent = `${out.length} of ${S.repos.length} repos` + (filtered ? ' (filtered: click a facet again to clear)' : '');
-  $('#list').innerHTML = out.slice(0, limit).map(x => card(x.r, x.snip, re)).join('');
+  $('#list').innerHTML = out.slice(0, limit).map(x => card(x.r, {snip: x.snip, re})).join('');
   const left = out.length - limit, more = $('#more');
   more.hidden = left <= 0;   // everything shown: no button at all
   if (left > 0) more.textContent = `Show more (${left} left)`;

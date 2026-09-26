@@ -10,8 +10,8 @@ No build step and no dependencies. The same code runs online (GitHub Pages) or l
 ## Features
 
 - **All stars at once.** Every page of the star list is fetched in parallel, then cached so reopening is instant.
-- **Rich cards.** About text, owner, stars, forks, license, **every language with its share** (GitHub-style colored bar), topics, homepage, **🕒 last commit** (exact date and time on hover), latest release and when you starred it.
-- **Sort** by recently starred, most stars, last commit, last release, name or newest repo.
+- **Rich cards everywhere.** Starred repos and Discover suggestions share the same layout: About text, owner, stars, forks, open issues, license, **every language with its share**, topics, homepage, creation date, **🕒 last commit**, latest release and activity charts. Starred cards also show when you starred them; suggestion cards show why they were recommended.
+- **Sort** your stars by recently starred, most or fewest stars, last commit, last release, name, owner or newest repo. Every Discover result also has sorting, with **Best match** as its default. Exact release and commit sorting across suggestions needs a token.
 - **Search** name, owner, description and topics, with highlighting. Press `/` to focus the search box.
 - **Search inside READMEs.** Click *Index READMEs* once, then tick *Search in READMEs*. Matches show a snippet.
 - **Filters** by language, topic and owner.
@@ -32,14 +32,14 @@ No build step and no dependencies. The same code runs online (GitHub Pages) or l
   - **Explore any keyword**, e.g. `adb`.
   - **Linked from your READMEs:** repos that several of your stars point to.
   - **Owners you like:** top repos from people you star often.
-  - **Patterns:** top topics, what you starred recently, languages, stars per year.
+  - **Patterns:** top topics, what you starred recently, languages, stars per year. Click a topic or language to find related repos and sort them.
   - **☆ Star** a suggestion directly on GitHub, or **✕** to never see it again. Either way the next suggestion takes its place.
   - Suggestions never include repos you've starred (checked by name and by GitHub id, so renamed repos can't slip through) or dismissed.
   - When fewer than 12 are left, the next page of every source is fetched automatically, so there's always something to suggest until GitHub runs out of results.
 - **Smart updates.** *Check for updates* does as little work as possible:
   - Star-list pages are fetched in parallel. Unchanged pages come back as tiny `304` answers (free with a token) and are rebuilt from the cache.
   - A repo whose `pushed_at` date hasn't changed is skipped: no request at all.
-  - Repos that did change get release, last commit and README **git hash** in one batched GraphQL call, 20 repos per call, several calls in parallel.
+  - Repos that did change get release, last commit and README **git hash** in batched GraphQL calls, several calls in parallel.
   - A README is downloaded again only if its hash changed.
 
 ## GitHub token (recommended)
