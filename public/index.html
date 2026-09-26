@@ -13,16 +13,7 @@
   <input id="user" placeholder="GitHub username or profile URL" size="28" aria-label="GitHub user">
   <button class="primary" id="load">Load stars</button>
   <input id="q" type="search" placeholder="Search name, owner, about, topics…  (press / to focus)" aria-label="Search">
-  <select id="sort" aria-label="Sort">
-    <option value="starred">Recently starred</option>
-    <option value="stars">Most stars</option>
-    <option value="starsAsc">Fewest stars</option>
-    <option value="commit">Last commit</option>
-    <option value="release">Last release</option>
-    <option value="name">Name</option>
-    <option value="owner">Owner</option>
-    <option value="created">Newest repo</option>
-  </select>
+  <div id="starSort" class="sort-editor" aria-label="Starred repository sorting"></div>
 </header>
 
 <!-- Shown only when the page is opened as a file (browsers don't run JS modules from file://). -->

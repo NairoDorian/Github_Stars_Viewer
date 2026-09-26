@@ -15,6 +15,13 @@ input,select,button{font:inherit;color:var(--text);background:var(--bg);border:1
 button{cursor:pointer}button:hover:not(:disabled){border-color:var(--accent)}button:disabled{opacity:.6;cursor:wait}
 button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
 #q{flex:1;min-width:200px}
+.sort-editor{display:flex;flex-wrap:wrap;align-items:center;gap:4px}
+.sort-caption{color:var(--muted);font-size:12px}
+.sort-rule{display:inline-flex;align-items:center;gap:2px;border:1px solid var(--border);border-radius:6px;padding:2px;background:var(--bg)}
+.sort-priority{font-size:11px;color:var(--muted);padding:0 4px}
+.sort-rule select{border:0;background:transparent;padding:3px 2px;max-width:145px;font-size:12px}
+.sort-rule button,.sort-editor>[data-sort-action]{padding:2px 5px;font-size:12px;line-height:1.4}
+.sort-rule button{border:0;background:transparent}
 .bar{padding:8px 16px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;color:var(--muted);font-size:13px}
 .banner{margin:16px;padding:12px 16px;border:1px solid var(--star);border-radius:8px;background:var(--panel)}
 
@@ -99,6 +106,7 @@ mark{background:var(--star);color:#000;border-radius:2px}
 .suggestion-actions .starbtn{color:var(--star);border-color:var(--star)}
 .suggestion-actions .x{margin-left:auto}
 .discovery-controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:8px 0}
+.discovery-controls .sort-editor{margin-left:auto}
 .discovery-controls label{display:flex;align-items:center;gap:6px;margin-left:auto}
 .discovery-note:empty{display:none}
 .reasons{margin-top:4px}
