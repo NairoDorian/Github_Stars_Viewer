@@ -30,6 +30,8 @@ button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
 
 /* ---- main list ---- */
 main{display:grid;grid-template-columns:260px 1fr;gap:16px;padding:0 16px 32px}
+/* sidebar hidden: the cards take the full width (one more column on wide screens) */
+main.nofacets{grid-template-columns:1fr}main.nofacets aside{display:none}
 @media (max-width:800px){main{grid-template-columns:1fr}aside{position:static!important;max-height:none!important}}
 aside{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px;align-self:start;position:sticky;top:70px;max-height:calc(100vh - 90px);overflow:auto}
 aside h3,#insights h3{font-size:12px;text-transform:uppercase;color:var(--muted);margin:12px 0 6px}

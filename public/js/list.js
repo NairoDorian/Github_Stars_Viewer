@@ -210,7 +210,20 @@ export function searchFor(q) {
   $('#q').scrollIntoView({block: 'nearest'});
 }
 
+const FACETS_PREF = 'starsViewer.hideFacets';   // localStorage: sidebar hidden?
+function setFacetsHidden(hide) {
+  document.querySelector('main').classList.toggle('nofacets', hide);
+  const b = $('#toggleFacets');
+  b.textContent = hide ? '◧ Show filters' : '◧ Hide filters';
+  b.setAttribute('aria-expanded', String(!hide));
+  try { localStorage.setItem(FACETS_PREF, hide ? '1' : '0'); } catch {}
+}
+
 export function initList() {
+  let hidden = false;
+  try { hidden = localStorage.getItem(FACETS_PREF) === '1'; } catch {}
+  setFacetsHidden(hidden);
+  $('#toggleFacets').onclick = () => setFacetsHidden(!document.querySelector('main').classList.contains('nofacets'));
   window.addEventListener('star-curve', e => refreshActivity(e.detail));
   let timer;
   $('#q').oninput = () => { clearTimeout(timer); timer = setTimeout(() => { limit = PAGE; render(); }, 120); };
