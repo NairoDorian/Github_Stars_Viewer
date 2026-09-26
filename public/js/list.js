@@ -50,8 +50,9 @@ const SORTS = {
 };
 
 /** GitHub-style language breakdown: a colored bar plus every language with its share, largest first.
- *  Filled in by "Fetch releases & commits" / checks with a token (r.langs = [[name, percent, color], …]). */
-function languagesHTML(r) {
+ *  Takes anything with a `langs` array ([[name, percent, color], …]): starred repos (filled in by checks with a token)
+ *  and suggestion cards (filled in by discover.js). */
+export function languagesHTML(r) {
   if (!r.langs?.length) return '';
   const color = c => /^#[0-9a-f]{3,8}$/i.test(c || '') ? c : '#8b949e';   // only real hex colors reach the style attribute
   const pct = p => p >= 0.1 ? p + '%' : '&lt;0.1%';

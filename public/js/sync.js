@@ -14,7 +14,7 @@
   Nothing is deleted before its replacement arrived: a failed or aborted refresh always leaves the previous data. */
 import {S, rkey} from './state.js';
 import {DAY, status, secs, pool, chunks} from './util.js';
-import {gh, gql, repoQ, mapStar, gitSha, needToken} from './github.js';
+import {gh, gql, repoQ, mapStar, gitSha, needToken, LANG_FIELDS, languageShares} from './github.js';
 import {saveStars, saveReadmes} from './store.js';
 import {render} from './list.js';
 
@@ -29,11 +29,6 @@ export const needsReadme = r => {
   const c = S.readmes[rkey(r)];
   return !c || c.pushed !== r.pushed || Date.now() - c.at > README_MAX_AGE + spread(r);
 };
-/** GraphQL languages → [[name, percent, color], …] (all languages, largest first, like GitHub's sidebar). */
-function languageShares(l) {
-  if (!l?.totalSize) return [];
-  return l.edges.map(e => [e.node.name, Math.round(e.size / l.totalSize * 1000) / 10, e.node.color || null]);
-}
 const readmeRecord = (r, fields) => ({t: '', sha: null, etag: null, path: null, ...fields, at: Date.now(), pushed: r.pushed});
 
 // ---- one network job at a time ----
@@ -137,7 +132,7 @@ async function refreshDetails(g, {wantReadmes, wantEnrich}) {
   if (!todo.length) return {summary: 'details up to date (0 requests)'};
 
   const fields = 'latestRelease{tagName publishedAt} defaultBranchRef{target{...on Commit{committedDate}}} ' +
-    'languages(first:100,orderBy:{field:SIZE,direction:DESC}){totalSize edges{size node{name color}}}' +
+    LANG_FIELDS +
     (wantReadmes ? ' ' + README_NAMES.map((n, k) => `m${k}:object(expression:${JSON.stringify('HEAD:' + n)}){...on Blob{oid}}`).join(' ') : '');
   const download = [], viaRest = [];
   let checked = 0, same = 0, fatal = null;

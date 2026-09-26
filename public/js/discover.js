@@ -11,9 +11,9 @@
   Starred and dismissed (✕) repos are always excluded. Results are cached for 3 days in data/discover_<user>.json. */
 import {S, ukey, readmeText, readmeLower, starredSet, starredIds} from './state.js';
 import {$, DAY, esc, fmtN, ago, safeUrl, status, tally} from './util.js';
-import {gh, ghSearch, repoMeta, mapStar, whoAmI, setStar, needToken} from './github.js';
+import {gh, ghSearch, repoMeta, repoLanguages, mapStar, whoAmI, setStar, needToken} from './github.js';
 import {saveDisc, saveStars} from './store.js';
-import {render, searchFor} from './list.js';
+import {render, searchFor, languagesHTML} from './list.js';
 
 const DISC_TTL = 3 * DAY;
 
@@ -333,6 +333,7 @@ function showResults(id) {
       <span class="acts"><button class="starbtn" data-star="${esc(c.x.full_name)}" title="Star on GitHub">☆ Star</button>
       <button class="x" data-dismiss="${esc(c.x.full_name.toLowerCase())}" title="Not interested: never suggest again">✕</button></span></div>
       <div class="muted">${esc(c.x.description || '')}</div>
+      ${languagesHTML(c.x)}
       <div class="chips">${c.reasons.slice(0, 5).map(r => `<span class="why">${esc(r)}</span>`).join('')}</div></li>`;
   const empty = !items.length && res.exhausted
     ? `<p>No more suggestions here: everything found is starred or dismissed. Try ↻ Refresh later, another theme, or a keyword.</p>` : '';
@@ -341,6 +342,24 @@ function showResults(id) {
     ${empty}<ul class="sugg">${items.slice(0, shown).map(li).join('')}</ul>
     ${items.length > shown ? `<button data-more>Show more (${items.length - shown} left)</button>` : ''}`;
   if (low) topUp(id);   // runs in the background and re-renders when done
+  else fillLanguages(id, items.slice(0, shown));
+}
+
+/** Fetches the language breakdown of the suggestions on screen that don't have it yet (one batched pass, with a
+ *  token), stores it in the cached result and re-renders. Repos whose lookup fails get [] and aren't retried. */
+let langBusy = false;
+async function fillLanguages(id, onScreen) {
+  const need = onScreen.filter(c => !c.x.langs);
+  if (!S.token || langBusy || !need.length) return;
+  langBusy = true;
+  const g = S.gen;
+  try {
+    const found = await repoLanguages(need.map(c => c.x.full_name));
+    if (g !== S.gen) return;
+    for (const c of need) c.x.langs = found.get(c.x.full_name.toLowerCase()) || [];
+    await saveDisc(g);
+  } finally { langBusy = false; }
+  if (current === id && !busy) showResults(id);
 }
 
 function overviewHTML() {

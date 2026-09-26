@@ -102,6 +102,29 @@ export async function repoMeta(fulls) {
   return out;
 }
 
+/** GraphQL fields for a repo's full language breakdown (every language, largest first). */
+export const LANG_FIELDS = 'languages(first:100,orderBy:{field:SIZE,direction:DESC}){totalSize edges{size node{name color}}}';
+
+/** GraphQL languages → [[name, percent, color], …], like GitHub's "Languages" sidebar. */
+export function languageShares(l) {
+  if (!l?.totalSize) return [];
+  return l.edges.map(e => [e.node.name, Math.round(e.size / l.totalSize * 1000) / 10, e.node.color || null]);
+}
+
+/** Language breakdowns for many "owner/name" (needs a token): 40 repos per GraphQL call, 4 calls in parallel.
+ *  Returns Map(lower-cased full name → shares). Repos that fail or don't exist get [] so they aren't retried. */
+export async function repoLanguages(fulls) {
+  const out = new Map();
+  if (!S.token) return out;
+  await pool(chunks(fulls, 40), 4, async batch => {
+    let data;
+    try { data = await gql('query{' + batch.map((f, j) => { const [o, n] = f.split('/'); return repoQ('r' + j, o, n, LANG_FIELDS); }).join(' ') + '}'); }
+    catch { return; }
+    batch.forEach((f, j) => out.set(f.toLowerCase(), languageShares(data['r' + j]?.languages)));
+  });
+  return out;
+}
+
 /** Git's blob hash, sha1("blob <bytes>\0" + content): verifies a cached README against GitHub without downloading it. */
 export async function gitSha(text) {
   if (!globalThis.crypto?.subtle) return null;
