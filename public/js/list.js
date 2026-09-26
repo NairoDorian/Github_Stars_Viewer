@@ -1,7 +1,8 @@
 // The main list: search, facet filters, sorting and rendering of repo cards.
 import {S, readmeText, readmeLower} from './state.js';
-import {$, esc, escRe, fmtN, ago, safeUrl, tally} from './util.js';
+import {$, esc, escRe, fmtN, ago, when, safeUrl, tally} from './util.js';
 import {activityNow, starGains, ACTIVITY_SPAN, ACTIVITY_BUCKETS} from './github.js';
+import {curveFor, curveGains, watchStarCharts} from './starhistory.js';
 
 const PAGE = 500;                                  // cards rendered per "page"; more via the Show more button
 const filters = {lang: null, topic: null, owner: null};
@@ -72,26 +73,47 @@ function sparkbars(counts, {end, unit, cls}) {
   return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="${unit}s per 2 weeks, last 12 months">${bars}</svg>`;
 }
 
-/** Commits row (from GitHub) + stars row (growth recorded by this app from daily star counts, see github.js). */
+/** Commits row (GitHub) + stars row. Stars come from star-history.com (full history, loaded lazily when the card
+ *  scrolls into view, see starhistory.js); if it has no data for a repo, the app's own daily star-count samples are used. */
+const shown = new Map();   // lower-cased full name → repo object, so a card can be redrawn when its star history arrives
 export function activityHTML(r) {
-  const commits = activityNow(r.activity), hist = r.starHist, gains = starGains(hist);
-  if (!commits && !hist?.length) return '';
+  const full = r.full || r.full_name;
+  if (full) shown.set(full.toLowerCase(), r);
+  const commits = activityNow(r.activity), curve = full ? curveFor(full) : null, hist = r.starHist;
   const rows = [];
   if (commits) {
     const total = commits.reduce((a, b) => a + b, 0);
     rows.push(`<span class="act-label">Commits</span>${sparkbars(commits, {end: Date.now(), unit: 'commit', cls: 'c'})}
       <span class="act-val" title="commits on the default branch in the last 12 months">${fmtN(total)}<small> / yr</small></span>`);
   }
-  if (gains) {
-    const since = hist[0][0], gained = hist.at(-1)[1] - hist[0][1];
+  const empty = Array(ACTIVITY_BUCKETS).fill(null);
+  if (curve?.pts) {
+    const gains = curveGains(curve.pts, ACTIVITY_BUCKETS, ACTIVITY_SPAN), total = gains.reduce((a, b) => a + b, 0);
     rows.push(`<span class="act-label">Stars</span>${sparkbars(gains, {end: Date.now(), unit: 'new star', cls: 's'})}
-      <span class="act-val" title="stars gained since ${day(since)} (tracked by this app)">${gained >= 0 ? '+' : ''}${fmtN(gained)}<small> since ${day(since)}</small></span>`);
-  } else if (hist?.length) {
-    // Only one day recorded so far: same chart frame, every period "not tracked yet", so it reads like the commits row.
-    rows.push(`<span class="act-label">Stars</span>${sparkbars(Array(ACTIVITY_BUCKETS).fill(null), {end: Date.now(), unit: 'new star', cls: 's'})}
-      <span class="act-val" title="GitHub no longer shares when people starred a repo, so this app records each repo's star count once a day (since ${day(hist[0][0])}); the bars fill in from there">${fmtN(hist.at(-1)[1])}<small> ★ · since ${day(hist[0][0])}</small></span>`);
+      <span class="act-val" title="new stars in the last 12 months (star history from star-history.com)">+${fmtN(total)}<small> / yr</small></span>`);
+  } else if (!curve && full) {   // not loaded yet: same frame, filled in when star-history.com answers
+    rows.push(`<span class="act-label">Stars</span>${sparkbars(empty, {end: Date.now(), unit: 'new star', cls: 's'})}
+      <span class="act-val muted"><small>loading…</small></span>`);
+  } else {
+    const gains = starGains(hist);   // fallback: this app's own daily samples
+    if (gains) {
+      const since = hist[0][0], gained = hist.at(-1)[1] - hist[0][1];
+      rows.push(`<span class="act-label">Stars</span>${sparkbars(gains, {end: Date.now(), unit: 'new star', cls: 's'})}
+        <span class="act-val" title="stars gained since ${day(since)} (recorded by this app)">${gained >= 0 ? '+' : ''}${fmtN(gained)}<small> since ${day(since)}</small></span>`);
+    } else if (hist?.length) {
+      rows.push(`<span class="act-label">Stars</span>${sparkbars(empty, {end: Date.now(), unit: 'new star', cls: 's'})}
+        <span class="act-val" title="no star history available; recording daily star counts since ${day(hist[0][0])}">${fmtN(hist.at(-1)[1])}<small> ★</small></span>`);
+    }
   }
-  return `<div class="activity" title="last 12 months, per 2 weeks">${rows.join('')}</div>`;
+  if (!rows.length) return '';
+  return `<div class="activity"${full ? ` data-sh="${esc(full)}"` : ''} title="last 12 months, per 2 weeks">${rows.join('')}</div>`;
+}
+
+/** Redraws every visible activity block of a repo (called when its star history arrives). */
+function refreshActivity(k) {
+  const r = shown.get(k);
+  if (!r) return;
+  for (const el of document.querySelectorAll('.activity[data-sh]')) if (el.dataset.sh.toLowerCase() === k) el.outerHTML = activityHTML(r);
 }
 
 export function languagesHTML(r) {
@@ -116,7 +138,7 @@ function card(r, snip, re) {
     <div class="chips">${r.topics.slice(0, 8).map(t => `<span class="chip" data-topic="${esc(t)}">${hl(t, re)}</span>`).join('')}</div>
     <div class="meta">
       <span>★ ${fmtN(r.stars)}</span><span>⑂ ${fmtN(r.forks)}</span>${r.lang ? `<span>● ${esc(r.lang)}</span>` : ''}${license}
-      <span title="${esc(r.commitAt || r.pushed)}">commit ${ago(r.commitAt || r.pushed)}</span>
+      <span class="lastcommit" title="Last commit: ${esc(when(r.commitAt || r.pushed))}${r.commitAt ? '' : ' (last push)'}">🕒 last commit ${ago(r.commitAt || r.pushed)}</span>
       ${r.release ? `<span title="${esc(r.releaseAt)}">🏷 ${esc(r.release)} · ${ago(r.releaseAt)}</span>` : ''}
       <span title="${esc(r.starred)}">starred ${ago(r.starred)}</span>
       ${home ? `<a href="${esc(home)}" target="_blank" rel="noopener">site ↗</a>` : ''}
@@ -149,6 +171,7 @@ export function render() {
   more.hidden = out.length <= limit;
   more.textContent = `Show more (${out.length - limit} left)`;
   renderFacets();
+  watchStarCharts($('#list'));
 }
 
 // Facet counts only change when the repo list or the active filters change.
@@ -173,6 +196,7 @@ export function searchFor(q) {
 }
 
 export function initList() {
+  window.addEventListener('star-curve', e => refreshActivity(e.detail));
   let timer;
   $('#q').oninput = () => { clearTimeout(timer); timer = setTimeout(() => { limit = PAGE; render(); }, 120); };
   $('#sort').onchange = () => { limit = PAGE; render(); };

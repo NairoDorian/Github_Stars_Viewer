@@ -7,6 +7,7 @@ export const S = {
   starPages: [],     // [{etag, ids}] per star-list page, for conditional (304) re-fetches
   readmes: {},       // {<repo id>: {t: text, sha, path, etag, at, pushed}}
   disc: {dismissed: [], results: {}},   // discovery cache (see discover.js)
+  starCurves: {},    // {<owner/name lower-cased>: {at, pts: [[time, stars], …] | null}} from star-history.com (shared by all users)
   gen: 0,            // bumped when the user changes: running jobs compare it and stop without saving
 };
 

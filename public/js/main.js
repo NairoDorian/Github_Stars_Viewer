@@ -9,6 +9,7 @@
 //   list.js      search, filters, sorting, repo cards
 //   discover.js  themes, suggestions, star buttons
 //   token.js     the 🔑 token panel
+//   starhistory.js  star history charts from star-history.com (lazy, cached)
 import {S, ukey} from './state.js';
 import {$, ago, status} from './util.js';
 import {get, saveConfig, initStore, setBrowserCache, CACHE_VERSION} from './store.js';
@@ -75,6 +76,7 @@ if (location.protocol !== 'file:') {   // ES modules can't run from file://; ind
   initList();
   initDiscover();
   const config = (await get('config')) || {};
+  S.starCurves = (await get('starcurves')) || {};
   initToken(config.token || '');
   $('#user').value = new URLSearchParams(location.search).get('user') || config.user || 'NairoDorian';
 

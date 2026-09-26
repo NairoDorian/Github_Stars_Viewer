@@ -45,6 +45,7 @@ aside h3,#insights h3{font-size:12px;text-transform:uppercase;color:var(--muted)
 .desc{margin:0;overflow-wrap:anywhere}
 .meta{display:flex;flex-wrap:wrap;gap:10px;color:var(--muted);font-size:12px}
 .meta a{font-weight:400;text-decoration:none}
+.lastcommit{color:var(--text);white-space:nowrap}
 .chips{display:flex;flex-wrap:wrap;gap:4px}
 .chip{background:var(--chip);color:var(--accent);border-radius:10px;padding:1px 8px;font-size:11px;cursor:pointer}
 .snip{font-size:12px;color:var(--muted);border-left:2px solid var(--star);padding-left:8px;overflow-wrap:anywhere}

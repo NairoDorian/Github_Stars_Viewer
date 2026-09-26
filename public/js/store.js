@@ -4,7 +4,7 @@
 //   'memory'  — online with the toggle off: kept in this tab only, gone on reload (nothing written anywhere)
 //
 // Keys:  config {token, user} · stars:<user> {v, at, repos, pages} · readmes:<user> {<id>: {…}}
-//        discover:<user> {dismissed, results}
+//        discover:<user> {dismissed, results} · starcurves {<owner/name>: {at, pts}} (star-history.com, all users)
 import {S, ukey} from './state.js';
 import {status} from './util.js';
 

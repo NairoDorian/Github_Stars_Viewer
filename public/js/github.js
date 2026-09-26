@@ -164,13 +164,13 @@ export function starGains(hist, now = Date.now()) {
 export async function repoCardDetails(fulls) {
   const out = new Map();
   if (!S.token) return out;
-  const end = Date.now(), fields = LANG_FIELDS + ' ' + activityFields(end);
+  const end = Date.now(), fields = LANG_FIELDS + ' ' + activityFields(end) + ' lastCommit:defaultBranchRef{target{...on Commit{committedDate}}}';
   await pool(chunks(fulls, 20), 6, async batch => {
     let data;
     try { data = await gql('query{' + batch.map((f, j) => { const [o, n] = f.split('/'); return repoQ('r' + j, o, n, fields); }).join(' ') + '}'); }
     catch { return; }
     batch.forEach((f, j) => out.set(f.toLowerCase(), {langs: languageShares(data['r' + j]?.languages),
-      activity: parseActivity(data['r' + j], end)}));
+      activity: parseActivity(data['r' + j], end), commitAt: data['r' + j]?.lastCommit?.target?.committedDate || null}));
   });
   return out;
 }

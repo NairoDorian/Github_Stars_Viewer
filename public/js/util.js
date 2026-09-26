@@ -20,6 +20,9 @@ export function ago(d) {
   return 'just now';
 }
 
+/** ISO date → full local date and time, for tooltips. */
+export const when = d => d ? new Date(d).toLocaleString(undefined, {dateStyle: 'medium', timeStyle: 'short'}) : '';
+
 /** Elapsed time since a performance.now() mark, e.g. "2.4s". */
 export const secs = t0 => ((performance.now() - t0) / 1000).toFixed(1) + 's';
 

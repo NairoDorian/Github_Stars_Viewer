@@ -10,10 +10,11 @@
      down, and a fork doesn't get credit for README text it inherited from its parent.
   Starred and dismissed (✕) repos are always excluded. Results are cached for 3 days in data/discover_<user>.json. */
 import {S, ukey, readmeText, readmeLower, starredSet, starredIds} from './state.js';
-import {$, DAY, esc, fmtN, ago, safeUrl, status, tally} from './util.js';
+import {$, DAY, esc, fmtN, ago, when, safeUrl, status, tally} from './util.js';
 import {gh, ghSearch, repoMeta, repoCardDetails, mapStar, whoAmI, setStar, needToken} from './github.js';
 import {saveDisc, saveStars} from './store.js';
 import {render, searchFor, languagesHTML, activityHTML} from './list.js';
+import {watchStarCharts} from './starhistory.js';
 
 const DISC_TTL = 3 * DAY;
 
@@ -329,7 +330,7 @@ function showResults(id) {
   const items = visible(res);
   const low = items.length < MIN_VISIBLE && !res.exhausted;
   const li = c => `<li><div><a href="${esc(safeUrl(c.x.html_url))}" target="_blank" rel="noopener">${esc(c.x.full_name)}</a>
-      <span class="muted">★ ${fmtN(c.x.stargazers_count)}${c.x.language ? ' · ' + esc(c.x.language) : ''}${c.x.pushed_at ? ' · pushed ' + ago(c.x.pushed_at) : ''}${c.x.fork ? ' · fork' : ''}${c.x.archived ? ' · archived' : ''}</span>
+      <span class="muted">★ ${fmtN(c.x.stargazers_count)}${c.x.language ? ' · ' + esc(c.x.language) : ''}${c.x.commitAt || c.x.pushed_at ? ` · <span class="lastcommit" title="Last commit: ${esc(when(c.x.commitAt || c.x.pushed_at))}${c.x.commitAt ? '' : ' (last push)'}">🕒 last commit ${ago(c.x.commitAt || c.x.pushed_at)}</span>` : ''}${c.x.fork ? ' · fork' : ''}${c.x.archived ? ' · archived' : ''}</span>
       <span class="acts"><button class="starbtn" data-star="${esc(c.x.full_name)}" title="Star on GitHub">☆ Star</button>
       <button class="x" data-dismiss="${esc(c.x.full_name.toLowerCase())}" title="Not interested: never suggest again">✕</button></span></div>
       <div class="muted">${esc(c.x.description || '')}</div>
@@ -341,6 +342,7 @@ function showResults(id) {
       ${low ? ' · ⏳ finding more…' : ''}${res.note?.length ? `<br>⚠ ${res.note.map(esc).join(' · ')}` : ''}</p>
     ${empty}<ul class="sugg">${items.slice(0, shown).map(li).join('')}</ul>
     ${items.length > shown ? `<button data-more>Show more (${items.length - shown} left)</button>` : ''}`;
+  watchStarCharts(el);   // star history of the suggestions loads as they scroll into view
   if (low) topUp(id);   // runs in the background and re-renders when done
   else fillLanguages(id, items.slice(0, shown));
 }
@@ -356,7 +358,7 @@ async function fillLanguages(id, onScreen) {
   try {
     const found = await repoCardDetails(need.map(c => c.x.full_name));
     if (g !== S.gen) return;
-    for (const c of need) Object.assign(c.x, {langs: [], activity: null}, found.get(c.x.full_name.toLowerCase()));
+    for (const c of need) Object.assign(c.x, {langs: [], activity: null, commitAt: null}, found.get(c.x.full_name.toLowerCase()));
     await saveDisc(g);
   } finally { langBusy = false; }
   if (current === id && !busy) showResults(id);

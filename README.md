@@ -10,14 +10,14 @@ No build step and no dependencies. The same code runs online (GitHub Pages) or l
 ## Features
 
 - **All stars at once.** Every page of the star list is fetched in parallel, then cached so reopening is instant.
-- **Rich cards.** About text, owner, stars, forks, license, **every language with its share** (GitHub-style colored bar), topics, homepage, last commit, latest release and when you starred it.
+- **Rich cards.** About text, owner, stars, forks, license, **every language with its share** (GitHub-style colored bar), topics, homepage, **🕒 last commit** (exact date and time on hover), latest release and when you starred it.
 - **Sort** by recently starred, most stars, last commit, last release, name or newest repo.
 - **Search** name, owner, description and topics, with highlighting. Press `/` to focus the search box.
 - **Search inside READMEs.** Click *Index READMEs* once, then tick *Search in READMEs*. Matches show a snippet.
 - **Filters** by language, topic and owner.
 - **Activity charts** on every card (last 12 months, per 2 weeks):
   - **Commits:** counted on GitHub, with the total per year.
-  - **Stars:** growth recorded by the app. GitHub no longer shares when people starred a repo, so each check saves every repo's star count once a day, and the chart fills in over time.
+  - **Stars:** full star history from [star-history.com](https://www.star-history.com), which keeps its own copy of star data now that GitHub no longer shares star dates. Charts load lazily as cards scroll into view and are cached for a week. If it has no data for a repo, the app's own daily star-count samples are used instead.
 
   Each bar has a tooltip with its dates and count.
 - **✨ Show suggestions** on any starred repo: related repos you haven't starred yet, based on that repo's name and topics, repos whose README mentions it, its most-starred forks and the links in its README.
