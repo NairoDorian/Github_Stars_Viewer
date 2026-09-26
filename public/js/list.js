@@ -2,7 +2,7 @@
 import {S, readmeText, readmeLower} from './state.js';
 import {$, esc, escRe, fmtN, ago, when, safeUrl, tally} from './util.js';
 import {activityNow, starGains, ACTIVITY_SPAN, ACTIVITY_BUCKETS} from './github.js';
-import {curveFor, starsAt, watchStarCharts} from './starhistory.js';
+import {drawableCurve, starsAt, watchStarCharts} from './starhistory.js';
 
 const PAGE = 200;   // cards rendered per step; more load automatically when you reach the end (or via Show more)
 const filters = {lang: null, topic: null, owner: null};
@@ -94,7 +94,7 @@ const shown = new Map();   // lower-cased full name → repo object, so a card c
 export function activityHTML(r) {
   const full = r.full || r.full_name;
   if (full) shown.set(full.toLowerCase(), r);
-  const commits = activityNow(r.activity), curve = full ? curveFor(full) : null, hist = r.starHist;
+  const commits = activityNow(r.activity), curve = full ? drawableCurve(full) : null, hist = r.starHist;
   const rows = [];
   if (commits) {
     const total = commits.reduce((a, b) => a + b, 0);

@@ -14,7 +14,12 @@ const TTL = 7 * 864e5, FAIL_TTL = 864e5, CONCURRENCY = 4;
 const key = full => full.toLowerCase();
 
 export const curveFor = full => S.starCurves[key(full)];
-const fresh = c => c && Date.now() - c.at < (c.pts ? TTL : FAIL_TTL);
+/** Curve to draw: any saved one with points (even from an older parser), so charts don't blink while refreshing. */
+export const drawableCurve = full => { const c = curveFor(full); return c?.pts ? c : c && fresh(c) ? c : null; };
+// Bump PARSER when parsing improves: entries saved by an older parser (e.g. "unavailable" because a label format
+// wasn't understood) are then fetched again instead of waiting for their TTL.
+const PARSER = 3;
+const fresh = c => c && c.v === PARSER && Date.now() - c.at < (c.pts ? TTL : FAIL_TTL);
 
 // ---------- SVG → points ----------
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
@@ -28,15 +33,45 @@ function tickValue(text) {
   return m ? Number(m[1]) * ({k: 1e3, m: 1e6}[m[2].toLowerCase()] || 1) : null;
 }
 
-/** X-axis labels ("2024", "July", "Sep 21") → dates. Years are explicit or inferred from neighbours / today. */
+/** X-axis labels → dates. star-history.com picks the label format from the repo's age (d3 time ticks):
+ *  "2024" (years) · "July" / "Sep 21" (months, weeks) · "Wed 09" (days: weekday + day of month, month implied).
+ *  Years and months are explicit or inferred from neighbouring labels and today; day-only labels take their month
+ *  from the nearest labelled tick. */
 function tickDates(ticks) {
-  const parsed = ticks.map(({x, text}) => {
+  const all = ticks.map(({x, text}) => {
     const t = text.trim();
     if (/^\d{4}$/.test(t)) return {x, year: +t, month: 0, day: 1};
     const m = t.match(/^([A-Za-z]{3,})\.?(?:\s+(\d{1,2}))?$/);
-    const mi = m ? MONTHS.indexOf(m[1].slice(0, 3).toLowerCase()) : -1;
-    return mi >= 0 ? {x, month: mi, day: m[2] ? +m[2] : 1} : null;
+    if (!m) return null;
+    const mi = MONTHS.indexOf(m[1].slice(0, 3).toLowerCase());
+    if (mi >= 0) return {x, month: mi, day: m[2] ? +m[2] : 1};
+    if (WEEKDAYS.includes(m[1].slice(0, 3).toLowerCase()) && m[2]) return {x, dayOnly: +m[2]};   // "Wed 09"
+    return null;
   }).filter(Boolean).sort((a, b) => a.x - b.x);
+  const parsed = all.filter(p => p.dayOnly == null), dayOnly = all.filter(p => p.dayOnly != null);
+  const resolved = resolveMonths(parsed);
+  // Day-only ticks: same month as the nearest resolved tick, stepping a month when the day number says so.
+  const out = [...resolved];
+  for (const p of dayOnly) {
+    const right = resolved.find(r => r.x > p.x), left = [...resolved].reverse().find(r => r.x < p.x);
+    let base = right || left, d;
+    if (!base) {   // only day labels (repo a few days old): the last one is the latest date ≤ today
+      const now = new Date(); base = {t: Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())};
+    }
+    const b = new Date(base.t);
+    d = Date.UTC(b.getUTCFullYear(), b.getUTCMonth(), p.dayOnly);
+    if (base === right && d > base.t) d = Date.UTC(b.getUTCFullYear(), b.getUTCMonth() - 1, p.dayOnly);
+    if (base === left && d < base.t) d = Date.UTC(b.getUTCFullYear(), b.getUTCMonth() + 1, p.dayOnly);
+    if (!right && !left && d > base.t) d = Date.UTC(b.getUTCFullYear(), b.getUTCMonth() - 1, p.dayOnly);
+    out.push({x: p.x, t: d});
+  }
+  return out.sort((a, b) => a.x - b.x);
+}
+const WEEKDAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+
+/** Year/month ticks → dates. */
+function resolveMonths(parsed) {
+  if (!parsed.length) return [];
   // Walk left→right: a month after a year label belongs to it; months before the first year label belong to year−1.
   const firstYear = parsed.find(p => p.year != null)?.year;
   let year = firstYear != null ? firstYear - 1 : null;
@@ -61,25 +96,31 @@ function fit(pairs) {
   return a => mb + k * (a - ma);
 }
 
-/** End points of every segment of an SVG path (absolute or relative M/L/H/V/C/S/Q/T/Z). */
+/** End points of every segment of an SVG path: all commands (M L H V C S Q T A Z), absolute or relative, including
+ *  minified forms like "a.4.4 0 01.108-.032" where arc flags are single digits glued to the next number. */
 function pathPoints(d) {
-  const tok = d.match(/[a-zA-Z]|[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?/g) || [];
-  const argc = {m: 2, l: 2, h: 1, v: 1, c: 6, s: 4, q: 4, t: 2, z: 0};
+  const argc = {m: 2, l: 2, h: 1, v: 1, c: 6, s: 4, q: 4, t: 2, a: 7, z: 0};
+  const num = /^\s*,?\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)/i, flag = /^\s*,?\s*([01])/;
   const pts = [];
-  let i = 0, cmd = '', x = 0, y = 0;
-  while (i < tok.length) {
-    if (/[a-zA-Z]/.test(tok[i])) cmd = tok[i++];
+  let i = 0, cmd = '', x = 0, y = 0, sx = 0, sy = 0;
+  while (i < d.length) {
+    const c = d.slice(i).match(/^\s*([a-zA-Z])/);
+    if (c) { cmd = c[1]; i += c[0].length; }
     const lc = cmd.toLowerCase(), rel = cmd === lc, n = argc[lc];
     if (n === undefined) break;
-    if (!n) continue;
-    const a = tok.slice(i, i + n).map(Number);
-    if (a.length < n || a.some(Number.isNaN)) break;
-    i += n;
-    if (lc === 'h') x = rel ? x + a[0] : a[0];
-    else if (lc === 'v') y = rel ? y + a[0] : a[0];
-    else { x = rel ? x + a[n - 2] : a[n - 2]; y = rel ? y + a[n - 1] : a[n - 1]; }
+    if (!n) { x = sx; y = sy; if (!c) break; continue; }   // Z: back to the subpath start
+    const args = [];
+    for (let k = 0; k < n; k++) {
+      const m = d.slice(i).match(lc === 'a' && (k === 3 || k === 4) ? flag : num);   // arc flags are one digit
+      if (!m) break;
+      args.push(Number(m[1])); i += m[0].length;
+    }
+    if (args.length < n) break;
+    if (lc === 'h') x = rel ? x + args[0] : args[0];
+    else if (lc === 'v') y = rel ? y + args[0] : args[0];
+    else { x = rel ? x + args[n - 2] : args[n - 2]; y = rel ? y + args[n - 1] : args[n - 1]; }
+    if (lc === 'm') { sx = x; sy = y; cmd = rel ? 'l' : 'L'; }   // extra pairs after M are line-tos
     pts.push([x, y]);
-    if (lc === 'm') cmd = rel ? 'l' : 'L';   // extra pairs after M are line-tos
   }
   return pts;
 }
@@ -129,8 +170,8 @@ async function load(full) {
   for (let attempt = 0; attempt < 4; attempt++) {
     let r = null;
     try { r = await fetch(url); } catch {}
-    if (r?.ok) { S.starCurves[k] = {at: Date.now(), pts: parseStarHistorySvg(await r.text())}; break; }
-    if (r?.status === 404) { S.starCurves[k] = {at: Date.now(), pts: null}; break; }
+    if (r?.ok) { S.starCurves[k] = {v: PARSER, at: Date.now(), pts: parseStarHistorySvg(await r.text())}; break; }
+    if (r?.status === 404) { S.starCurves[k] = {v: PARSER, at: Date.now(), pts: null}; break; }
     await new Promise(res => setTimeout(res, 1000 * 2 ** attempt));   // 403 / 429 / 5xx / network: wait and retry
   }
   if (!S.starCurves[k]) return;   // still failing: leave it unloaded, it's tried again next time it's on screen
