@@ -28,7 +28,9 @@ No build step and no dependencies. The same code runs online (GitHub Pages) or l
   - **Linked from your READMEs:** repos that several of your stars point to.
   - **Owners you like:** top repos from people you star often.
   - **Patterns:** top topics, what you starred recently, languages, stars per year.
-  - **☆ Star** a suggestion directly on GitHub, or **✕** to never see it again.
+  - **☆ Star** a suggestion directly on GitHub, or **✕** to never see it again. Either way the next suggestion takes its place.
+  - Suggestions never include repos you've starred (checked by name and by GitHub id, so renamed repos can't slip through) or dismissed.
+  - When fewer than 12 are left, the next page of every source is fetched automatically, so there's always something to suggest until GitHub runs out of results.
 - **Smart updates.** *Check for updates* does as little work as possible:
   - Star-list pages are fetched in parallel. Unchanged pages come back as tiny `304` answers (free with a token) and are rebuilt from the cache.
   - A repo whose `pushed_at` date hasn't changed is skipped: no request at all.

@@ -29,4 +29,17 @@ export function readmeLower(r) {
   return low;
 }
 
-export const starredSet = () => new Set(S.repos.map(r => r.full.toLowerCase()));
+// Starred names/ids as Sets, rebuilt only when S.repos is replaced (every change assigns a new array).
+let setsFor = null, names = new Set(), ids = new Set();
+function starredSets() {
+  if (setsFor !== S.repos) {
+    setsFor = S.repos;
+    names = new Set(S.repos.map(r => r.full.toLowerCase()));
+    ids = new Set(S.repos.map(r => r.id).filter(i => i != null));
+  }
+  return {names, ids};
+}
+/** Lower-cased "owner/name" of every starred repo. */
+export const starredSet = () => starredSets().names;
+/** GitHub ids of every starred repo (catches renamed/transferred repos a name check would miss). */
+export const starredIds = () => starredSets().ids;

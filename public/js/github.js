@@ -68,8 +68,10 @@ export const mapStar = ({starred_at, repo: x}) => ({
   archived: x.archived, fork: x.fork, created: x.created_at, pushed: x.pushed_at, starred: starred_at, branch: x.default_branch,
 });
 
-export async function ghSearch(q, perPage = 50) {
-  const r = await gh(`/search/repositories?q=${encodeURIComponent(q)}&sort=stars&order=desc&per_page=${perPage}`);
+/** Repository search, most-starred first. `page` goes deeper into the results (GitHub serves up to 1000). */
+export async function ghSearch(q, perPage = 50, page = 1) {
+  if (perPage * page > 1000) return [];
+  const r = await gh(`/search/repositories?q=${encodeURIComponent(q)}&sort=stars&order=desc&per_page=${perPage}&page=${page}`);
   return r.ok ? (await r.json()).items || [] : [];
 }
 
@@ -85,14 +87,14 @@ export async function repoMeta(fulls) {
     }
     return out;
   }
-  const fields = 'nameWithOwner description stargazerCount pushedAt isArchived isFork url primaryLanguage{name} repositoryTopics(first:8){nodes{topic{name}}}';
+  const fields = 'databaseId nameWithOwner description stargazerCount pushedAt isArchived isFork url primaryLanguage{name} repositoryTopics(first:8){nodes{topic{name}}}';
   await pool(chunks(fulls, 40), 4, async batch => {
     let data;
     try { data = await gql('query{' + batch.map((f, j) => { const [o, n] = f.split('/'); return repoQ('r' + j, o, n, fields); }).join(' ') + '}'); }
     catch { return; }   // best effort: suggestions just have fewer candidates
     batch.forEach((f, j) => {
       const d = data['r' + j]; if (!d) return;
-      out.set(f.toLowerCase(), {full_name: d.nameWithOwner, description: d.description, stargazers_count: d.stargazerCount,
+      out.set(f.toLowerCase(), {id: d.databaseId, full_name: d.nameWithOwner, description: d.description, stargazers_count: d.stargazerCount,
         pushed_at: d.pushedAt, archived: d.isArchived, fork: d.isFork, html_url: d.url, language: d.primaryLanguage?.name,
         topics: d.repositoryTopics.nodes.map(x => x.topic.name)});
     });

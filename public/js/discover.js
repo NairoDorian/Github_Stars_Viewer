@@ -9,7 +9,7 @@
   3. Ranking = relevance to the theme + number of signals + popularity − staleness. Curated "awesome" lists are pushed
      down, and a fork doesn't get credit for README text it inherited from its parent.
   Starred and dismissed (✕) repos are always excluded. Results are cached for 3 days in data/discover_<user>.json. */
-import {S, ukey, readmeText, readmeLower, starredSet} from './state.js';
+import {S, ukey, readmeText, readmeLower, starredSet, starredIds} from './state.js';
 import {$, DAY, esc, fmtN, ago, safeUrl, status, tally} from './util.js';
 import {gh, ghSearch, repoMeta, mapStar, whoAmI, setStar, needToken} from './github.js';
 import {saveDisc, saveStars} from './store.js';
@@ -92,13 +92,18 @@ function readmeLinks(r) {
 const isCuratedList = x => /awesome|curated|(^|[-_])list([-_]|$)|free-lunch|great-open/i.test(x.full_name) ||
   /curated list|collection of|list of (awesome|the best|useful)/i.test(x.description || '');
 
+/** True if a candidate must never be shown: already starred (by id or name, so renames can't slip through) or dismissed. */
+function excluded(x) {
+  const name = x.full_name.toLowerCase();
+  return starredSet().has(name) || (x.id != null && starredIds().has(x.id)) || S.disc.dismissed.includes(name);
+}
+
 /** Collects candidates from all signals, then scores them against the theme keywords. */
 function collector(keys) {
-  const have = starredSet(), cands = new Map();
+  const cands = new Map();
   const add = (x, reason, pts) => {
-    if (!x?.full_name) return;
+    if (!x?.full_name || excluded(x)) return;
     const k = x.full_name.toLowerCase();
-    if (have.has(k)) return;
     let c = cands.get(k);
     if (!c) cands.set(k, c = {x, reasons: [], sig: 0});
     if (x.stargazers_count != null && c.x.stargazers_count == null) c.x = x;
@@ -118,71 +123,104 @@ function collector(keys) {
     // A fork inherits its parent's README, so "README mentions …" isn't independent evidence for it.
     const sig = c.sig - (c.reasons.some(r => r.startsWith('fork of')) ? c.reasons.filter(r => r.startsWith('README mentions')).length * 2 : 0);
     const score = rel * 1.5 + sig * 2 + Math.log10((x.stargazers_count || 0) + 1) * 1.5 - (stale ? 2 : 0) - (x.archived ? 3 : 0) - (list ? 8 : 0);
-    return {x: {full_name: x.full_name, html_url: x.html_url || 'https://github.com/' + x.full_name, description: x.description,
+    return {x: {id: x.id, full_name: x.full_name, html_url: x.html_url || 'https://github.com/' + x.full_name, description: x.description,
       stargazers_count: x.stargazers_count, pushed_at: x.pushed_at, archived: x.archived, fork: x.fork, language: x.language,
       topics: tp.slice(0, 6)}, reasons, score: +score.toFixed(1)};
-  }).filter(c => c.score > 2).sort((a, b) => b.score - a.score).slice(0, 150);
+  }).filter(c => c.score > 0).sort((a, b) => b.score - a.score);
   return {add, finish};
 }
 
-// ---------------- explorers ----------------
+/* ---------------- explorers ----------------
+  Every explorer takes a `depth`: 0 = first run, 1, 2… = "fetch the next page of every source". When fewer than
+  MIN_VISIBLE suggestions are left (after starring or dismissing), the next depth runs automatically and its finds are
+  merged in, so there's always something to suggest. When a deeper run adds nothing new, the result is marked
+  `exhausted` and no more requests are made for it (↻ Refresh starts over). */
+const MIN_VISIBLE = 12, MAX_DEPTH = 5;
 let busy = false;
 const fresh = id => { const r = S.disc.results[id]; return r && Date.now() - r.at < DISC_TTL; };
 const progress = text => { const el = $('#dres'); if (el) el.innerHTML = `<p class="muted">⏳ ${esc(text)}</p>`; };
+const visible = res => res.items.filter(c => !excluded(c.x));
 
-/** Runs an explorer unless one is running; saves its result (only if the user didn't change meanwhile) and shows it. */
-async function explore(id, force, run) {
-  if (!force && fresh(id)) return showResults(id);
+/** Runs an explorer (depth 0 replaces the result, deeper runs merge into it), saves it and shows it. */
+async function explore(id, {force = false, depth = 0}, run) {
+  if (!force && !depth && fresh(id)) return showResults(id);
   if (busy) return status('⏳ Discovery already running, please wait');
   busy = true;
   const g = S.gen;
   try {
-    const result = await run(g);
+    const result = await run(g, depth);
     if (g !== S.gen || !result) return;
-    S.disc.results[id] = {at: Date.now(), ...result};
+    const old = depth ? S.disc.results[id] : null;
+    let items = result.items;
+    if (old) {   // merge: keep the best score and all reasons for repos found again
+      const byName = new Map(old.items.map(c => [c.x.full_name.toLowerCase(), c]));
+      for (const c of result.items) {
+        const k = c.x.full_name.toLowerCase(), prev = byName.get(k);
+        byName.set(k, prev ? {...prev, score: Math.max(prev.score, c.score), reasons: [...new Set([...prev.reasons, ...c.reasons])]} : c);
+      }
+      items = [...byName.values()].sort((a, b) => b.score - a.score);
+    }
+    const added = old ? items.length - old.items.length : items.length;
+    S.disc.results[id] = {...(old || {}), ...result, items, at: old?.at || Date.now(), depth,
+      exhausted: depth >= MAX_DEPTH || (depth > 0 && added === 0)};
     await saveDisc(g);
     showResults(id);
   } catch (e) { progress('⚠ ' + e.message); }
   finally { busy = false; }
 }
 
-function exploreTheme(id, keys, members, force) {
-  return explore(id, force, async g => {
+/** Fetches the next depth for a result (used when it runs low). */
+function topUp(id) {
+  const res = S.disc.results[id];
+  if (!res || res.exhausted || busy) return;
+  const depth = (res.depth || 0) + 1;
+  if (id === 'mentions') return exploreMentions({depth});
+  if (id === 'owners') return exploreOwners({depth});
+  exploreTheme(id, res.keys, membersOf(res), {depth});
+}
+const membersOf = res => {
+  const byId = new Map(S.repos.map(r => [r.id, r]));
+  return res.memberIds?.map(i => byId.get(i)).filter(Boolean) ?? keywordMembers(res.keys);
+};
+
+function exploreTheme(id, keys, members, opts = {}) {
+  return explore(id, opts, async (g, depth) => {
     const {add, finish} = collector(keys), note = [];
+    const page = depth + 1;
     const step = async (label, fn) => {
       if (g !== S.gen) return;
-      progress(label);
+      progress(depth ? `Finding more suggestions (round ${page})… ${label}` : label);
       try { await fn(); } catch (e) { note.push(`${label.replace(/…$/, '')}: ${e.message}`); }
     };
     const n = S.token ? 3 : 1;   // search API allows 30/min with a token, 10/min without
     // 1. keyword searches, forks included (a fork is often exactly what you're after)
     for (const k of keys.slice(0, n)) await step(`Searching “${k}”…`, async () => {
-      for (const x of await ghSearch(`${k} in:name,description,readme fork:true`, 60)) add(x, `matches “${k}”`, 1);
+      for (const x of await ghSearch(`${k} in:name,description,readme fork:true`, 60, page)) add(x, `matches “${k}”`, 1);
     });
     if (keys.length > 1) await step('Searching keyword combination…', async () => {
-      for (const x of await ghSearch(`${keys[0]} ${keys[1]} fork:true`, 40)) add(x, `matches “${keys[0]} + ${keys[1]}”`, 1.5);
+      for (const x of await ghSearch(`${keys[0]} ${keys[1]} fork:true`, 40, page)) add(x, `matches “${keys[0]} + ${keys[1]}”`, 1.5);
     });
     // 2. topic search, for keys that are real topics among your stars
     for (const k of keys.filter(k => members.some(r => r.topics.includes(k))).slice(0, n)) await step(`Topic ${k}…`, async () => {
-      for (const x of await ghSearch(`topic:${k}`, 40)) add(x, `topic: ${k}`, 1.5);
+      for (const x of await ghSearch(`topic:${k}`, 40, page)) add(x, `topic: ${k}`, 1.5);
     });
     // 3. repos whose README mentions one of the theme's projects (GUIs, wrappers, add-ons, alternatives)
     for (const name of members.map(r => r.name).filter(x => x.length >= 5 && !STOP.has(x.toLowerCase())).slice(0, n)) {
       await step(`Repos mentioning ${name}…`, async () => {
-        for (const x of await ghSearch(`"${name}" in:readme fork:true`, 40)) add(x, `README mentions ${name}`, 2);
+        for (const x of await ghSearch(`"${name}" in:readme fork:true`, 40, page)) add(x, `README mentions ${name}`, 2);
       });
     }
     // 4. most-starred forks of the theme's top repos
     for (const r of members.filter(r => !r.fork).slice(0, n)) await step(`Forks of ${r.full}…`, async () => {
-      const res = await gh(`/repos/${r.full}/forks?sort=stargazers&per_page=100`);
-      if (res.ok) for (const x of await res.json()) if (x.stargazers_count >= 2) add(x, `fork of ${r.full}`, 2);
+      const res = await gh(`/repos/${r.full}/forks?sort=stargazers&per_page=100&page=${page}`);
+      if (res.ok) for (const x of await res.json()) if (x.stargazers_count >= 1) add(x, `fork of ${r.full}`, 2);
     });
-    // 5. links inside the theme's cached READMEs
-    await step('Reading links in your starred READMEs…', async () => {
-      const links = new Map(), have = starredSet();
+    // 5. links inside the theme's cached READMEs (all found on the first run)
+    if (!depth) await step('Reading links in your starred READMEs…', async () => {
+      const links = new Map();
       for (const r of members) for (const f of readmeLinks(r)) {
         const k = f.toLowerCase();
-        if (have.has(k)) continue;
+        if (starredSet().has(k)) continue;
         if (!links.has(k)) links.set(k, {f, from: []});
         links.get(k).from.push(r.name);
       }
@@ -197,41 +235,44 @@ function exploreTheme(id, keys, members, force) {
   });
 }
 
-/** Repos linked from 2+ of your starred READMEs (no search API needed). */
-function exploreMentions(force) {
+/** Repos linked from your starred READMEs: 2+ different stars first; deeper rounds also take single links. */
+function exploreMentions(opts = {}) {
   if (!Object.keys(S.readmes).length) {
     $('#dres').innerHTML = '<p class="muted">Click <b>Index READMEs</b> first: this view reads the links inside your starred repos\' READMEs.</p>';
     return;
   }
-  return explore('mentions', force, async () => {
-    progress('Reading links in all your READMEs…');
-    const links = new Map(), have = starredSet();
+  return explore('mentions', opts, async (g, depth) => {
+    progress(depth ? 'Finding more linked repos…' : 'Reading links in all your READMEs…');
+    const links = new Map();
     for (const r of S.repos) for (const f of readmeLinks(r)) {
       const k = f.toLowerCase();
-      if (have.has(k)) continue;
-      if (!links.has(k)) links.set(k, {f, from: []});
-      links.get(k).from.push(r.name);
+      if (starredSet().has(k)) continue;
+      if (!links.has(k)) links.set(k, {f, from: new Set()});
+      links.get(k).from.add(r.name);
     }
-    // Only links from 2+ different starred repos: a README linking its own org's repos isn't a signal.
-    const top = [...links.values()].filter(c => c.from.length >= 2).sort((a, b) => b.from.length - a.from.length).slice(0, 160);
+    // A README linking its own org's repos isn't much of a signal, so links from 2+ different stars come first.
+    const ranked = [...links.values()].sort((a, b) => b.from.size - a.from.size);
+    const top = ranked.slice(depth * 160, (depth + 1) * 160).filter(c => depth > 0 || c.from.size >= 2);
     const meta = await repoMeta(top.map(c => c.f)), {add, finish} = collector([]);
     for (const c of top) {
-      const x = meta.get(c.f.toLowerCase());
-      if (x) add(x, `linked from ${c.from.length} of your stars: ${c.from.slice(0, 4).join(', ')}${c.from.length > 4 ? '…' : ''}`, 2 * c.from.length);
+      const x = meta.get(c.f.toLowerCase()), from = [...c.from];
+      if (x) add(x, `linked from ${from.length} of your stars: ${from.slice(0, 4).join(', ')}${from.length > 4 ? '…' : ''}`, 2 * from.length);
     }
     return {items: finish(), note: S.token ? [] : ['Without a token only the top 12 links get details.']};
   });
 }
 
-/** Top repos of owners you star often. */
-function exploreOwners(force) {
-  return explore('owners', force, async g => {
-    const owners = tally(S.repos, r => r.owner).filter(([o, n]) => n >= 2 && o.toLowerCase() !== ukey()).slice(0, S.token ? 10 : 3);
+/** Top repos of owners you star often; deeper rounds go to the next page of each owner and to more owners. */
+function exploreOwners(opts = {}) {
+  return explore('owners', opts, async (g, depth) => {
+    const per = S.token ? 10 : 3;
+    const owners = tally(S.repos, r => r.owner).filter(([o, n]) => n >= 2 && o.toLowerCase() !== ukey()).slice(0, per * (depth + 1));
     const {add, finish} = collector([]), note = [];
-    for (const [o, n] of owners) {
+    for (const [i, [o, n]] of owners.entries()) {
       if (g !== S.gen) return null;
-      progress(`Top repos of ${o}…`);
-      try { for (const x of await ghSearch(`user:${o}`, 15)) add(x, `by ${o}: you starred ${n} of their repos`, n); }
+      const page = i >= per * depth ? 1 : depth + 1;   // owners new in this round start at page 1
+      progress(`${depth ? 'Finding more… ' : ''}Top repos of ${o}…`);
+      try { for (const x of await ghSearch(`user:${o}`, 15, page)) add(x, `by ${o}: you starred ${n} of their repos`, n); }
       catch (e) { note.push(e.message); break; }
     }
     return {items: finish(), note};
@@ -276,21 +317,30 @@ const keywordMembers = keys => S.repos
 // ---------------- UI ----------------
 let tab = 'themes', themes = [];
 
+const PAGE = 40;
+let current = null, shown = PAGE;   // result on screen, and how many of its cards are shown
+
+/** Renders a result, always without starred/dismissed repos. Cards removed by ☆/✕ are refilled from the pool, and the
+ *  pool refills itself from GitHub (next depth) when it runs low. */
 function showResults(id) {
   const res = S.disc.results[id], el = $('#dres');
   if (!res || !el) return;
-  const gone = new Set(S.disc.dismissed), have = starredSet();
-  const items = res.items.filter(c => !gone.has(c.x.full_name.toLowerCase()) && !have.has(c.x.full_name.toLowerCase()));
+  if (id !== current) { current = id; shown = PAGE; }
+  const items = visible(res);
+  const low = items.length < MIN_VISIBLE && !res.exhausted;
   const li = c => `<li><div><a href="${esc(safeUrl(c.x.html_url))}" target="_blank" rel="noopener">${esc(c.x.full_name)}</a>
       <span class="muted">★ ${fmtN(c.x.stargazers_count)}${c.x.language ? ' · ' + esc(c.x.language) : ''}${c.x.pushed_at ? ' · pushed ' + ago(c.x.pushed_at) : ''}${c.x.fork ? ' · fork' : ''}${c.x.archived ? ' · archived' : ''}</span>
       <span class="acts"><button class="starbtn" data-star="${esc(c.x.full_name)}" title="Star on GitHub">☆ Star</button>
       <button class="x" data-dismiss="${esc(c.x.full_name.toLowerCase())}" title="Not interested: never suggest again">✕</button></span></div>
       <div class="muted">${esc(c.x.description || '')}</div>
       <div class="chips">${c.reasons.slice(0, 5).map(r => `<span class="why">${esc(r)}</span>`).join('')}</div></li>`;
+  const empty = !items.length && res.exhausted
+    ? `<p>No more suggestions here: everything found is starred or dismissed. Try ↻ Refresh later, another theme, or a keyword.</p>` : '';
   el.innerHTML = `<p class="muted">${items.length} suggestions · found ${ago(res.at)} · <button data-refresh="${esc(id)}">↻ Refresh</button>
-      ${res.note?.length ? `<br>⚠ ${res.note.map(esc).join(' · ')}` : ''}</p>
-    <ul class="sugg">${items.slice(0, 40).map(li).join('')}</ul>
-    ${items.length > 40 ? `<details><summary>Show ${items.length - 40} more</summary><ul class="sugg">${items.slice(40).map(li).join('')}</ul></details>` : ''}`;
+      ${low ? ' · ⏳ finding more…' : ''}${res.note?.length ? `<br>⚠ ${res.note.map(esc).join(' · ')}` : ''}</p>
+    ${empty}<ul class="sugg">${items.slice(0, shown).map(li).join('')}</ul>
+    ${items.length > shown ? `<button data-more>Show more (${items.length - shown} left)</button>` : ''}`;
+  if (low) topUp(id);   // runs in the background and re-renders when done
 }
 
 function overviewHTML() {
@@ -341,32 +391,31 @@ function show(newTab) {
 }
 export const closeDiscover = () => $('#insights').classList.remove('show');
 
-/* Star / unstar on GitHub. Needs a token allowed to star: classic token with "public_repo", or fine-grained with
-   "Starring: read and write". Only for your own list: a star always goes to the token owner's account. */
-async function toggleStar(full, btn) {
+/* Stars a suggestion on GitHub; it then joins your stars and its card is replaced by the next suggestion.
+   Needs a token allowed to star: classic token with "public_repo", or fine-grained with "Starring: read and write".
+   Only for your own list: a star always goes to the token owner's account. */
+async function starSuggestion(full, btn) {
   if (!S.token) { needToken(); return status('⚠ Starring needs a token. See the 🔑 panel.'); }
-  const wasStarred = btn.classList.contains('on');
   btn.disabled = true;
-  btn.textContent = wasStarred ? 'Unstarring…' : 'Starring…';
+  btn.textContent = 'Starring…';
   try {
     const me = await whoAmI();
     if (me.toLowerCase() !== ukey()) throw new Error(`You're viewing ${S.user}'s stars. Starring only works on your own list (${me}).`);
-    const code = await setStar(full, !wasStarred);
+    const code = await setStar(full, true);
     if (code === 403 || code === 404) { needToken(); throw new Error('Your token can read but not star. Create one with the "public_repo" scope (the 🔑 panel explains how).'); }
     if (code >= 300) throw new Error('GitHub ' + code);
-    if (wasStarred) S.repos = S.repos.filter(r => r.full.toLowerCase() !== full.toLowerCase());
-    else {   // add it locally right away (1 request) instead of re-syncing everything
-      const x = await (await gh('/repos/' + full)).json();
-      S.repos = [mapStar({starred_at: new Date().toISOString(), repo: x}), ...S.repos];
-    }
+    // Add it to your stars locally right away (1 request) instead of re-syncing everything.
+    const x = await (await gh('/repos/' + full)).json();
+    S.repos = [mapStar({starred_at: new Date().toISOString(), repo: x}), ...S.repos];
     S.starPages = [];   // page ETags are outdated now; the next check refetches the list
     await saveStars(); render();
-    btn.classList.toggle('on', !wasStarred);
-    btn.closest('li').classList.toggle('starred', !wasStarred);
-    status(`${wasStarred ? 'Unstarred' : '★ Starred'} ${full} on GitHub`);
-  } catch (e) { status('⚠ ' + e.message); }
-  btn.textContent = btn.classList.contains('on') ? '★ Starred' : '☆ Star';
-  btn.disabled = false;
+    status(`★ Starred ${full} on GitHub (unstar it from github.com if that was a mistake)`);
+    showResults(current);   // the starred card disappears and the next suggestion takes its place
+  } catch (e) {
+    status('⚠ ' + e.message);
+    btn.disabled = false;
+    btn.textContent = '☆ Star';
+  }
 }
 
 export function initDiscover() {
@@ -376,10 +425,11 @@ export function initDiscover() {
     if (repo) exploreRepo(repo);
   });
   $('#insights').addEventListener('click', async e => {
-    const t = e.target.closest('[data-dtab],[data-theme],[data-dismiss],[data-refresh],[data-filterq],[data-star]');
+    const t = e.target.closest('[data-dtab],[data-theme],[data-dismiss],[data-refresh],[data-filterq],[data-star],[data-more]');
     if (!t) return;
     const d = t.dataset;
-    if (d.star) toggleStar(d.star, t);
+    if (d.star) starSuggestion(d.star, t);
+    else if (d.more !== undefined) { shown += PAGE; showResults(current); }
     else if (d.dtab) show(d.dtab);
     else if (d.theme) {
       const th = themes[+d.theme];
@@ -387,18 +437,14 @@ export function initDiscover() {
       t.classList.add('on');
       exploreTheme(th.id, th.keys, th.members);
     } else if (d.dismiss) {
-      S.disc.dismissed.push(d.dismiss);
-      t.closest('li').remove();
+      if (!S.disc.dismissed.includes(d.dismiss)) S.disc.dismissed.push(d.dismiss);
+      showResults(current);   // the next suggestion takes its place
       await saveDisc();
-    } else if (d.refresh) {
+    } else if (d.refresh) {   // start over from depth 0 (works from any tab: members come from stored ids)
       const id = d.refresh, res = S.disc.results[id];
-      if (id === 'mentions') exploreMentions(true);
-      else if (id === 'owners') exploreOwners(true);
-      else if (res) {   // theme or keyword: members come from the stored ids, so this works from any tab
-        const byId = new Map(S.repos.map(r => [r.id, r]));
-        const members = res.memberIds?.map(i => byId.get(i)).filter(Boolean) ?? keywordMembers(res.keys);
-        exploreTheme(id, res.keys, members, true);
-      }
+      if (id === 'mentions') exploreMentions({force: true});
+      else if (id === 'owners') exploreOwners({force: true});
+      else if (res) exploreTheme(id, res.keys, membersOf(res), {force: true});
     } else if (d.filterq) { e.preventDefault(); searchFor(d.filterq); }
   });
 }
