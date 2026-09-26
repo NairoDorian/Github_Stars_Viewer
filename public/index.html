@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stars Viewer</title>
+<link rel="stylesheet" href="app.css">
+<script type="module" src="js/main.js"></script>
+</head>
+<body>
+<header>
+  <h1>★ Stars Viewer</h1>
+  <input id="user" placeholder="GitHub username or profile URL" size="28" aria-label="GitHub user">
+  <button class="primary" id="load">Load stars</button>
+  <input id="q" type="search" placeholder="Search name, owner, about, topics…  (press / to focus)" aria-label="Search">
+  <select id="sort" aria-label="Sort">
+    <option value="starred">Recently starred</option>
+    <option value="stars">Most stars</option>
+    <option value="pushed">Last commit</option>
+    <option value="release">Last release</option>
+    <option value="name">Name</option>
+    <option value="created">Newest repo</option>
+  </select>
+</header>
+
+<!-- Shown only when the page is opened as a file (browsers don't run JS modules from file://). -->
+<div id="fileWarning" class="banner" hidden>
+  <b>This page can't run as a file.</b> Use it online at
+  <a href="https://nairodorian.github.io/Github_Stars_Viewer/">nairodorian.github.io/Github_Stars_Viewer</a>,
+  or locally: double-click <code>start.bat</code> (or run <code>node server.js</code>) and open
+  <a href="http://localhost:8787">http://localhost:8787</a>.
+</div>
+<script>if (location.protocol === 'file:') document.getElementById('fileWarning').hidden = false;</script>
+
+<div class="bar">
+  <label><input type="checkbox" id="inReadme"> Search in READMEs</label>
+  <label id="cacheToggle" hidden title="Online only. On: stars, READMEs, suggestions and your token are stored in this browser (IndexedDB), so reloads are instant. Off: nothing is stored, data lives in this tab only."><input type="checkbox" id="browserCache"> 💾 Keep cache in this browser</label>
+  <button id="indexReadme">Index READMEs</button>
+  <button id="enrich">Fetch releases &amp; commits</button>
+  <button id="toggleInsights">🧭 Discover &amp; suggestions</button>
+  <button id="refresh">Check for updates</button>
+  <button id="tokenBtn">🔑 Token</button>
+  <span id="status" role="status"></span>
+</div>
+
+<section id="tokenPanel">
+  <div class="tp-head" id="tpToggle" role="button" tabindex="0" aria-expanded="false" aria-controls="tpBody">
+    <span class="tp-arrow">▸</span> <b>🔑 GitHub token</b> <span id="tpSummary" class="muted"></span>
+    <span class="muted tp-hint">click to show / hide</span>
+  </div>
+  <div class="tp-body" id="tpBody">
+    <p class="muted">Without a token GitHub allows only <b>60 requests/hour</b>, which isn't enough to index READMEs or fetch releases. With a token you get <b>5,000/hour</b>.</p>
+    <ol class="muted">
+      <li>Open <a href="https://github.com/settings/tokens/new?description=Stars%20Viewer" target="_blank" rel="noopener">github.com/settings/tokens/new</a> (classic token).</li>
+      <li>Set an expiration and pick the scopes (see below), then click <i>Generate token</i>.</li>
+      <li>Paste it below and click <b>Save &amp; check</b>. Where it's kept: running locally, in <code>data/config.json</code> next to the app;
+        online, in this browser only if <b>💾 Keep cache in this browser</b> is on (otherwise it's forgotten when you close the tab).
+        It's only ever sent to api.github.com.</li>
+    </ol>
+    <div class="tp-note">
+      <b>Which scopes?</b><br>
+      • <b>Browse, search, READMEs, releases, suggestions:</b> no scope needed, leave everything unchecked.<br>
+      • <b>☆ Star buttons in suggestions</b> (star/unstar on GitHub from this page): tick only <b>public_repo</b>.
+      GitHub has no star-only scope, so <b>public_repo</b> is the smallest that allows starring. It also allows writing to
+      your public repos, but this app only uses it to star and unstar.
+      The check below shows <b>“★ can star”</b> when your token allows it.
+    </div>
+    <div class="tp-row">
+      <input id="token" type="password" placeholder="ghp_…" autocomplete="off" aria-label="GitHub token">
+      <button class="primary" id="saveToken">Save &amp; check</button>
+      <button id="clearToken">Remove</button>
+    </div>
+    <p id="limit" class="muted"></p>
+  </div>
+</section>
+
+<section id="insights"></section>
+
+<main>
+  <aside id="facets"></aside>
+  <div><div id="count" class="muted"></div><div id="list"></div><button id="more" hidden></button></div>
+</main>
+</body>
+</html>

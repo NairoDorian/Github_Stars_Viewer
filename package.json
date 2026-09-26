@@ -1,0 +1,11 @@
+{
+  "name": "stars-viewer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browse, search and get suggestions from any GitHub user's starred repos. Local cache, no dependencies.",
+  "scripts": {
+    "start": "node server.js --open",
+    "check": "node --check server.js && for f in public/js/*.js; do node --check \"$f\" || exit 1; done"
+  },
+  "engines": { "node": ">=18" }
+}
