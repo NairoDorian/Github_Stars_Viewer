@@ -1,5 +1,5 @@
 // The main list: search, facet filters, sorting and rendering of repo cards.
-import {S, readmeText, readmeLower} from './state.js';
+import {S, readmeEntry, readmeText, readmeLower} from './state.js';
 import {$, esc, escRe, fmtN, ago, when, safeUrl, tally} from './util.js';
 import {activityNow, starGains, ACTIVITY_SPAN, ACTIVITY_BUCKETS} from './github.js';
 import {drawableCurve, starsAt, watchStarCharts} from './starhistory.js';
@@ -17,10 +17,49 @@ function hay(r) {
   return h;
 }
 
-/** Every term must match name/owner/about/topics/language, or the README when enabled. Returns {snip} or null. */
-function match(r, terms, inReadme) {
+/** Parses search text into {inc, exc, quals, hasQuery}: supports "exact phrases", -negation, and key:value qualifiers. */
+export function parseQuery(raw) {
+  const inc = [], exc = [], quals = [], QK = /^(lang|language|owner|user|topic|tag|is|stars)$/;
+  for (const m of (raw || '').toLowerCase().matchAll(/(-?)(?:([a-z]+):)?"([^"]+)"|(\S+)/g)) {
+    if (m[3] !== undefined) {
+      const neg = m[1] === '-', k = m[2], v = m[3].trim();
+      if (!v) continue;
+      if (k && QK.test(k)) quals.push({k, v, neg});
+      else (neg ? exc : inc).push(k ? `${k}:${v}` : v);
+      continue;
+    }
+    const tok = m[4], neg = tok.startsWith('-'), body = neg ? tok.slice(1) : tok;
+    if (!body) continue;
+    const colon = body.indexOf(':');
+    if (colon > 0) {
+      const k = body.slice(0, colon), v = body.slice(colon + 1);
+      if (v && QK.test(k)) { quals.push({k, v, neg}); continue; }
+    }
+    (neg ? exc : inc).push(body);
+  }
+  return {inc, exc, quals, hasQuery: inc.length > 0 || exc.length > 0 || quals.length > 0};
+}
+
+function checkQual(r, {k, v}) {
+  if (k === 'lang' || k === 'language') return (r.lang || '').toLowerCase() === v || (r.langs || []).some(([n]) => n.toLowerCase() === v);
+  if (k === 'owner' || k === 'user') return (r.owner || '').toLowerCase() === v;
+  if (k === 'topic' || k === 'tag') return (r.topics || []).some(t => t.toLowerCase() === v);
+  if (k === 'is') return v === 'archived' ? !!r.archived : v === 'active' ? !r.archived : v === 'fork' ? !!r.fork : true;
+  if (k === 'stars') {
+    const m = v.match(/^(>=|<=|>|<|=)?(\d+)$/);
+    if (!m) return true;
+    const op = m[1] || '=', n = Number(m[2]), s = r.stars ?? 0;
+    return op === '>' ? s > n : op === '>=' ? s >= n : op === '<' ? s < n : op === '<=' ? s <= n : s === n;
+  }
+  return true;
+}
+
+/** Every positive term must match name/owner/about/topics/language (or README when enabled), with no excluded term matching. */
+export function match(r, q, inReadme) {
+  for (const qual of q.quals) if (checkQual(r, qual) === qual.neg) return null;
+  for (const t of q.exc) if (hay(r).includes(t) || (inReadme && readmeLower(r).includes(t))) return null;
   let snip = null;
-  for (const t of terms) {
+  for (const t of q.inc) {
     if (hay(r).includes(t)) continue;
     if (!inReadme) return null;
     const i = readmeLower(r).indexOf(t);
@@ -137,7 +176,7 @@ export function languagesHTML(r) {
 function viewerLinks(r) {
   const full = r.full.split('/').map(encodeURIComponent).join('/');
   const branch = encodeURIComponent(r.branch || 'HEAD');
-  const path = (S.readmes[String(r.id)]?.path || 'README.md').split('/').map(encodeURIComponent).join('/');
+  const path = (readmeEntry(r)?.path || 'README.md').split('/').map(encodeURIComponent).join('/');
   const links = [
     ['Diagram', `https://gitdiagram.com/${full}`, 'GitDiagram: repository architecture diagram'],
     ['Wiki', `https://deepwiki.com/${full}`, 'DeepWiki: generated repository documentation'],
@@ -156,14 +195,20 @@ export function card(r, {snip = null, re = null, suggestion = false, reasons = [
   const home = safeUrl(r.homepage);
   const license = r.license && r.license !== 'NOASSERTION' ? `<span>${esc(r.license)}</span>` : '';
   const tag = suggestion ? 'li' : 'div';
+  const topics = r.topics || [];
+  const shownTopics = topics.length <= 8 ? topics : [...topics].sort((a, b) => {
+    const ma = a === filters.topic || (re && new RegExp(re.source, 'i').test(a)) ? 1 : 0;
+    const mb = b === filters.topic || (re && new RegExp(re.source, 'i').test(b)) ? 1 : 0;
+    return mb - ma;
+  }).slice(0, 8);
   return `<${tag} class="card${suggestion ? ' suggestion-card' : ''}">
-    <div class="owner">${avatar ? `<img src="${esc(avatar)}" loading="lazy" alt="">` : ''}<span class="chip" tabindex="0" role="button" data-owner="${esc(r.owner)}">${esc(r.owner)}</span>${r.archived ? ' · archived' : ''}${r.fork ? ' · fork' : ''}</div>
+    <div class="owner">${avatar ? `<img src="${esc(avatar)}" loading="lazy" alt="">` : ''}<span class="chip" tabindex="0" role="button" data-owner="${esc(r.owner)}">${hl(r.owner, re)}</span>${r.archived ? ' · archived' : ''}${r.fork ? ' · fork' : ''}</div>
     <a href="${esc(safeUrl(r.url))}" target="_blank" rel="noopener">${hl(r.name, re)}</a>
     <p class="desc">${r.about ? hl(r.about, re) : '<span class="muted">No description</span>'}</p>
     ${snip ? `<div class="snip">README: …${hl(snip, re)}…</div>` : ''}
-    <div class="chips">${(r.topics || []).slice(0, 8).map(t => `<span class="chip" tabindex="0" role="button" data-topic="${esc(t)}">${hl(t, re)}</span>`).join('')}</div>
+    <div class="chips">${shownTopics.map(t => `<span class="chip" tabindex="0" role="button" data-topic="${esc(t)}">${hl(t, re)}</span>`).join('')}</div>
     <div class="meta">
-      <span>★ ${fmtN(r.stars)}</span>${r.forks != null ? `<span>⑂ ${fmtN(r.forks)}</span>` : ''}${r.issues != null ? `<span title="Open issues">◉ ${fmtN(r.issues)} issues</span>` : ''}${r.lang ? `<span>● ${esc(r.lang)}</span>` : ''}${license}
+      <span>★ ${fmtN(r.stars)}</span>${r.forks != null ? `<span>⑂ ${fmtN(r.forks)}</span>` : ''}${r.issues != null ? `<span title="Open issues">◉ ${fmtN(r.issues)} issues</span>` : ''}${r.lang ? `<span class="chip" tabindex="0" role="button" data-lang="${esc(r.lang)}">● ${esc(r.lang)}</span>` : ''}${license}
       ${(r.commitAt || r.pushed) ? `<span class="lastcommit" title="Last commit: ${esc(when(r.commitAt || r.pushed))}${r.commitAt ? '' : ' (last push)'}">🕒 last commit ${ago(r.commitAt || r.pushed)}</span>` : ''}
       ${r.release ? `<span title="${esc(r.releaseAt)}">🏷 ${esc(r.release)} · ${ago(r.releaseAt)}</span>` : ''}
       ${r.created ? `<span title="Created ${esc(when(r.created))}">created ${ago(r.created)}</span>` : ''}
@@ -185,9 +230,12 @@ export function resetFilters() {
   shown.clear();
 }
 
+let currentMatches = [];
+
 export function render() {
-  const terms = $('#q').value.toLowerCase().split(/\s+/).filter(Boolean);
-  const re = terms.length ? new RegExp(terms.map(escRe).join('|'), 'gi') : null;
+  const rawQ = $('#q').value;
+  const q = parseQuery(rawQ);
+  const re = q.inc.length ? new RegExp(q.inc.map(escRe).join('|'), 'gi') : null;
   const inReadme = $('#inReadme').checked;
 
   const out = [], forLang = [], forTopic = [], forOwner = [];
@@ -197,7 +245,7 @@ export function render() {
     const okTopic = !filters.topic || r.topics.includes(filters.topic);
     const okOwner = !filters.owner || r.owner === filters.owner;
     if (okLang + okTopic + okOwner < 2) continue;
-    const m = match(r, terms, inReadme);
+    const m = match(r, q, inReadme);
     if (!m) continue;
     if (okTopic && okOwner) forLang.push(r);
     if (okLang && okOwner) forTopic.push(r);
@@ -205,18 +253,20 @@ export function render() {
     if (okLang && okTopic && okOwner) out.push({r, snip: m.snip});
   }
   sortRepos(out, $('#sort').value, 'name');
+  currentMatches = out.map(x => x.r);
 
   const pills = [['lang', 'Language'], ['topic', 'Topic'], ['owner', 'Owner']]
     .filter(([k]) => filters[k])
     .map(([k, label]) => `<button class="chip filter-pill" data-${k}="${esc(filters[k])}" title="Remove ${label.toLowerCase()} filter">${label}: ${esc(filters[k])} ✕</button>`);
-  const filtered = S.hideForks || pills.length > 0 || terms.length > 0;
+  const filtered = S.hideForks || pills.length > 0 || q.hasQuery;
+  const exportBtns = out.length ? `<span class="export-actions"><button class="clear-filters" data-export="md" title="Export shown repos as Markdown">⬇ .md</button><button class="clear-filters" data-export="json" title="Export shown repos as JSON">⬇ .json</button></span>` : '';
   $('#count').innerHTML = `<span>${out.length} of ${S.repos.length} repos${filtered ? ' (filtered)' : ''}</span>` +
-    (pills.length ? ` <span class="active-filters">${pills.join('')}<button class="clear-filters" data-clear-filters title="Clear active filters">Clear</button></span>` : '');
+    (pills.length ? ` <span class="active-filters">${pills.join('')}<button class="clear-filters" data-clear-filters title="Clear active filters">Clear</button></span>` : '') + exportBtns;
   $('#list').innerHTML = out.slice(0, limit).map(x => card(x.r, {snip: x.snip, re})).join('');
   const left = out.length - limit, more = $('#more');
   more.hidden = left <= 0;   // everything shown: no button at all
   if (left > 0) more.textContent = `Show more (${left} left)`;
-  renderFacets({forLang, forTopic, forOwner}, `${terms.join(' ')}\0${inReadme ? 1 : 0}`);
+  renderFacets({forLang, forTopic, forOwner}, `${rawQ.trim().toLowerCase()}\0${inReadme ? 1 : 0}`);
   watchStarCharts($('#list'));
 }
 
@@ -226,18 +276,35 @@ function renderFacets({forLang, forTopic, forOwner}, queryKey) {
   const k = [S.repos, S.hideForks, filters.lang, filters.topic, filters.owner, queryKey];
   if (facetsKey && k.every((v, i) => v === facetsKey[i])) return;
   facetsKey = k;
+  const row = (kind, active, [v, c]) =>
+    `<div class="facet ${active === v ? 'on' : ''}" tabindex="0" role="button" data-${kind}="${esc(v)}"><span title="${esc(v)}">${esc(v)}</span><span class="muted">${c}</span></div>`;
   const block = (title, kind, list, n) => {
-    const top = list.slice(0, n), active = filters[kind];
+    const top = list.slice(0, n), rest = list.slice(n), active = filters[kind];
     if (active && !top.some(([v]) => v === active)) {
       const hit = list.find(([v]) => v === active);
       top.unshift([active, hit ? hit[1] : 0]);
     }
-    return `<h3>${title}</h3>` + top.map(([v, c]) =>
-      `<div class="facet ${active === v ? 'on' : ''}" tabindex="0" role="button" data-${kind}="${esc(v)}"><span title="${esc(v)}">${esc(v)}</span><span class="muted">${c}</span></div>`).join('');
+    const more = rest.filter(([v]) => v !== active);
+    return `<h3>${title}</h3>` + top.map(x => row(kind, active, x)).join('') +
+      (more.length ? `<details><summary class="small">Show ${more.length} more</summary>${more.map(x => row(kind, active, x)).join('')}</details>` : '');
   };
   $('#facets').innerHTML = block('Languages', 'lang', tally(forLang, r => r.lang), 15) +
     block('Topics', 'topic', tally(forTopic, r => r.topics), 30) +
     block('Owners', 'owner', tally(forOwner, r => r.owner).filter(([v, c]) => c > 1 || v === filters.owner), 15);
+}
+
+/** Downloads the currently shown (filtered and sorted) repositories as Markdown or JSON. */
+function exportMatches(fmt) {
+  if (!currentMatches.length) return;
+  const user = S.user || 'github';
+  const body = fmt === 'json'
+    ? JSON.stringify(currentMatches, null, 2)
+    : `# ★ ${user}'s Starred Repositories (${currentMatches.length})\n\n` +
+      currentMatches.map(r => `- **[${r.full}](${r.url})** (★ ${fmtN(r.stars)}${r.lang ? ` · ${r.lang}` : ''})${r.about ? ` — ${r.about}` : ''}`).join('\n') + '\n';
+  const url = URL.createObjectURL(new Blob([body], {type: fmt === 'json' ? 'application/json' : 'text/markdown;charset=utf-8'}));
+  const a = Object.assign(document.createElement('a'), {href: url, download: `stars-${user.toLowerCase()}.${fmt}`});
+  document.body.append(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
 }
 
 /** Puts a query in the search box (with README search on) and shows the matches. */
@@ -301,14 +368,16 @@ export function initList() {
     const b = e.target.closest('[data-similar]');
     if (b) window.dispatchEvent(new CustomEvent('suggest-for', {detail: Number(b.dataset.similar)}));
   });
-  // Facet and chip clicks (sidebar, filter bar and cards) toggle the matching filter.
+  // Facet, chip and export clicks (sidebar, filter bar and cards).
   document.addEventListener('click', e => {
+    const exp = e.target.closest('[data-export]');
+    if (exp) { exportMatches(exp.dataset.export); return; }
     if (e.target.closest('[data-clear-filters]')) {
       filters.lang = filters.topic = filters.owner = null;
       limit = PAGE; render();
       return;
     }
-    const el = e.target.closest('#facets [data-lang], #facets [data-topic], #facets [data-owner], #count [data-lang], #count [data-topic], #count [data-owner], #list [data-topic], #list [data-owner]');
+    const el = e.target.closest('#facets [data-lang], #facets [data-topic], #facets [data-owner], #count [data-lang], #count [data-topic], #count [data-owner], #list [data-lang], #list [data-topic], #list [data-owner]');
     if (!el) return;
     for (const k of ['lang', 'topic', 'owner']) if (el.dataset[k] !== undefined) filters[k] = filters[k] === el.dataset[k] ? null : el.dataset[k];
     limit = PAGE; render();

@@ -5,8 +5,8 @@
       against the rate limit) and is rebuilt from the cache.
    2. `pushed_at` is a cheap change hint: an unchanged value skips most detail requests. A periodic max-age check
       catches changes such as release metadata that need not move `pushed_at`.
-   3. Repos that did change: one GraphQL call per 20 repos (8 in parallel) returns latest release + last commit +
-      README hash together.
+   3. Repos that did change: one GraphQL call per 10 repos (6 in parallel) returns latest release + last commit +
+      languages + 12-month commit activity + README hash together.
    4. README hash equal to the cached one (or to the hash of the cached text) → no download. Only READMEs that really
       changed are downloaded, 10 per GraphQL call. Unusual README names/locations fall back to REST with ETags.
    A safety-net max age (spread per repo so they don't all expire the same day) re-checks things occasionally.

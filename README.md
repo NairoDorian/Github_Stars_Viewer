@@ -13,9 +13,9 @@ No build step and no dependencies. The same code runs online (GitHub Pages) or l
 - **Rich cards everywhere.** Starred repos and Discover suggestions share the same layout: About text, owner, stars, forks, open issues, license, **every language with its share**, topics, homepage, creation date, **🕒 last commit**, latest release and activity charts. Starred cards also show when you starred them; suggestion cards show why they were recommended.
 - **More ways to view every repo.** Compact links on every card open GitDiagram, DeepWiki, GitIngest, UIthub, github.dev, and GitHistory. GitHistory animates a file rather than a whole repository; its link opens the cached README path when known, otherwise `README.md`.
 - **Sort** your stars by recently starred, most or fewest stars, last commit, last release, name, owner or newest repo. Every Discover result also has sorting, with **Best match** as its default. Exact release and commit sorting across suggestions needs a token.
-- **Search** name, owner, description and topics, with highlighting. Press `/` to focus the search box.
+- **Search** name, owner, description and topics, with highlighting, exact phrases (`"screen copy"`), exclusions (`-flutter`), and qualifiers (`lang:rust`, `owner:foo`, `topic:cli`, `is:active`, `is:archived`, `is:fork`, `stars:>1000`). Press `/` to focus the search box.
 - **Search inside READMEs.** Click *Index READMEs* once, then tick *Search in READMEs*. Matches show a snippet.
-- **Filters** by language, topic and owner.
+- **Filters & export** by language, topic and owner with live cross-filtered counts, expandable lists, removable active-filter pills, and one-click `.md` / `.json` export of your current matches.
 - **Hide forks** in both your starred repos and Discover suggestions with one persistent toolbar toggle. Existing cached suggestions are filtered immediately; when too few non-forks remain, Discover searches for more and skips fork-specific sources. The toggle uses GitHub's fork designation.
 - **Activity charts** on every card:
   - **Commits:** last 12 months per 2 weeks, counted on GitHub, with the total per year.
@@ -35,7 +35,7 @@ No build step and no dependencies. The same code runs online (GitHub Pages) or l
   - **Linked from your READMEs:** repos that several of your stars point to.
   - **Owners you like:** top repos from people you star often.
   - **Patterns:** top topics, what you starred recently, languages, stars per year. Click a topic or language to find related repos and sort them.
-  - **☆ Star** a suggestion directly on GitHub, or **✕** to never see it again. Either way the next suggestion takes its place.
+  - **☆ Star** a suggestion directly on GitHub (with a one-click **↩ Unstar** undo), or **✕** to never see it again. Either way the next suggestion takes its place.
   - Suggestions never include repos you've starred (checked by name and by GitHub id, so renamed repos can't slip through) or dismissed.
   - When fewer than 12 are left, the next page of every source is fetched automatically, so there's always something to suggest until GitHub runs out of results.
 - **Smart updates.** *Check for updates* does as little work as possible:
@@ -79,7 +79,7 @@ Opening `public/index.html` directly as a file doesn't work, because browsers do
 
 The local server listens on `127.0.0.1` only. It refuses requests from other websites, including DNS-rebinding tricks, so no web page can read your cached token. It writes cache files atomically, so they can't be corrupted.
 
-Run `npm run check` to syntax-check the server and all browser modules on Windows, macOS or Linux.
+Run `npm run check` to syntax-check and run unit tests for the server and all browser modules on Windows, macOS or Linux.
 
 ## Project layout
 
@@ -89,14 +89,19 @@ public/            the app (this folder is what GitHub Pages publishes)
   app.css          styles (dark/light follows your OS)
   js/
     main.js        boot, loading a user, toolbar wiring
-    state.js       shared state
+    state.js       shared state & cancellation generation
     store.js       cache backends: ./data via server.js · IndexedDB · memory
-    github.js      GitHub REST/GraphQL client (retries, rate limits)
+    github.js      GitHub REST/GraphQL client (retries, rate limits, cancellation)
     sync.js        keeping the cache in sync with GitHub, cheaply
-    list.js        search, filters, sorting, repo cards
-    discover.js    themes, suggestions, star buttons
+    list.js        search, qualifiers, cross-filtered facets, export, repo cards
+    sort.js        shared repository sorting comparators
+    starhistory.js lazy star-history.com chart loader & SVG curve parser
+    discover.js    themes, suggestions, star/unstar buttons
     token.js       the 🔑 token panel
     util.js        helpers
+scripts/
+  check.cjs        cross-platform syntax + unit test runner
+  test.mjs         Node built-in unit test suite
 server.js          local server: serves public/ and stores the cache in data/
 start.bat          Windows launcher
 data/              local cache (git-ignored: contains your token)

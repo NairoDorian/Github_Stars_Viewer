@@ -43,6 +43,7 @@ aside h3,#insights h3{font-size:12px;text-transform:uppercase;color:var(--muted)
 .active-filters{display:inline-flex;flex-wrap:wrap;align-items:center;gap:6px}
 .filter-pill{border:1px solid var(--accent);padding:1px 8px;font-size:11px}
 .clear-filters{padding:1px 8px;font-size:11px;color:var(--muted)}
+.export-actions{margin-left:auto;display:inline-flex;gap:6px}
 #list{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
 @media (max-width:420px){#list,.sugg{grid-template-columns:1fr!important}}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:6px;min-width:0}
@@ -50,7 +51,7 @@ aside h3,#insights h3{font-size:12px;text-transform:uppercase;color:var(--muted)
 .owner{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}
 .owner img{width:18px;height:18px;border-radius:50%}
 .desc{margin:0;overflow-wrap:anywhere}
-.meta{display:flex;flex-wrap:wrap;gap:10px;color:var(--muted);font-size:12px}
+.meta{display:flex;flex-wrap:wrap;align-items:center;gap:10px;color:var(--muted);font-size:12px}
 .meta a{font-weight:400;text-decoration:none}
 .lastcommit{color:var(--text);white-space:nowrap}
 .chips{display:flex;flex-wrap:wrap;gap:4px}
@@ -63,7 +64,6 @@ mark{background:var(--star);color:#000;border-radius:2px}
 .act-label{font-size:11px;color:var(--muted);width:52px}
 .act-val{font-size:12px;font-weight:600;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
 .act-val small{font-weight:400;color:var(--muted)}
-.act-note{font-size:11px;color:var(--muted);line-height:1.3}
 .spark{width:100%;height:24px;display:block}
 .spark rect.c{fill:var(--accent)}.spark rect.s{fill:var(--star)}
 .spark rect.zero{fill:var(--muted);opacity:.45}

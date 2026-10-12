@@ -15,7 +15,10 @@ const {languageShares, activityNow, recordStars, starGains, gitSha, ACTIVITY_BUC
 const {curveFor, drawableCurve, starsAt, curveGains, parseStarHistorySvg} = await import('../public/js/starhistory.js');
 const {detectThemes, keywordMembers, collector} = await import('../public/js/discover.js');
 const {migrateReadmes, needsEnrich, needsReadme} = await import('../public/js/sync.js');
-const {card, languagesHTML, activityHTML} = await import('../public/js/list.js');
+const {card, languagesHTML, activityHTML, parseQuery, match} = await import('../public/js/list.js');
+import {spawn} from 'node:child_process';
+import {rmSync} from 'node:fs';
+import {join} from 'node:path';
 
 test('util: esc, safeUrl, fmtN, ago, tally, chunks, pool, sleep', async () => {
   assert.equal(esc('<a href="x">&\'</a>'), '&lt;a href=&quot;x&quot;&gt;&amp;&#39;&lt;/a&gt;');
@@ -196,12 +199,12 @@ test('sync & list: migrateReadmes, needsEnrich, card rendering, and activityHTML
     starHist: [[now - 14 * DAY, 100], [now, 120]],
   };
   S.repos = [repo];
-  S.readmes = {'owner/demo': 'Legacy plain string README'};
+  S.readmes = {'owner/demo': {t: 'Custom README text', path: 'docs/README.md', at: now, pushed: '2026-10-01T00:00:00Z'}};
   migrateReadmes();
-  assert.equal(S.readmes['42']?.t, 'Legacy plain string README');
+  assert.equal(S.readmes['42']?.t, 'Custom README text');
   assert.equal(S.readmes['owner/demo'], undefined);
   assert.equal(needsEnrich(repo), false);
-  assert.equal(needsReadme(repo), true);   // migrated plain string has at: 0 so it verifies hash on next sync
+  assert.equal(needsReadme(repo), false);
 
   // Sanitize invalid language color and escape HTML in card
   const langHtml = languagesHTML(repo);
@@ -216,6 +219,67 @@ test('sync & list: migrateReadmes, needsEnrich, card rendering, and activityHTML
 
   const cardHtml = card(repo);
   assert.ok(cardHtml.includes('Demo &lt;script&gt; repo'));
+  assert.ok(cardHtml.includes('docs/README.md'), 'viewerLinks should use cached README path via rkey(r)');
   assert.ok(cardHtml.includes('role="button"'));
+});
+
+test('list: parseQuery and match support exact phrases, negation, and qualifiers', () => {
+  const r = {
+    id: 7, full: 'Genymobile/scrcpy', name: 'scrcpy', owner: 'Genymobile',
+    about: 'Display and control your Android device', topics: ['android', 'adb'],
+    lang: 'C', langs: [['C', 92, '#555555'], ['Meson', 8, null]],
+    stars: 115000, archived: false, fork: false,
+  };
+  const q1 = parseQuery('"control your android" -flutter lang:meson stars:>10000 is:active -is:fork');
+  assert.deepEqual(q1.inc, ['control your android']);
+  assert.deepEqual(q1.exc, ['flutter']);
+  assert.equal(q1.quals.length, 4);
+  assert.ok(match(r, q1, false));
+
+  assert.equal(match(r, parseQuery('"android control"'), false), null);   // exact phrase order matters
+  assert.equal(match(r, parseQuery('android -adb'), false), null);          // excluded topic
+  assert.equal(match(r, parseQuery('lang:rust'), false), null);             // wrong language
+  assert.equal(match(r, parseQuery('stars:<500'), false), null);            // star threshold not met
+  assert.equal(match(r, parseQuery('is:archived'), false), null);           // not archived
+});
+
+test('server.js: static serving, HEAD, cache PUT/GET, and DNS-rebinding / cross-origin protection', async () => {
+  const port = 18780 + Math.floor(Math.random() * 1000);
+  const testKey = '__test_suite_tmp__';
+  const testFile = join(process.cwd(), 'data', `${testKey}.json`);
+  const proc = spawn(process.execPath, ['server.js'], {env: {...process.env, PORT: String(port)}, stdio: ['ignore', 'pipe', 'pipe']});
+  try {
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('server startup timeout')), 3000);
+      proc.stdout.on('data', d => { if (String(d).includes('Stars Viewer running')) { clearTimeout(t); resolve(); } });
+      proc.on('exit', code => { clearTimeout(t); reject(new Error(`server exited (${code})`)); });
+    });
+    const base = `http://localhost:${port}`;
+
+    // Static GET & HEAD
+    const headRes = await fetch(`${base}/`, {method: 'HEAD'});
+    assert.equal(headRes.status, 200);
+    assert.equal(await headRes.text(), '');
+
+    // Cache PUT & GET
+    const putRes = await fetch(`${base}/cache/${testKey}`, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({hello: 'world', count: 42}),
+    });
+    assert.equal(putRes.status, 204);
+    const getRes = await fetch(`${base}/cache/${testKey}`);
+    assert.equal(getRes.status, 200);
+    assert.deepEqual(await getRes.json(), {hello: 'world', count: 42});
+
+    // Cross-site Origin / Sec-Fetch-Site must be rejected with 403
+    const evilOrigin = await fetch(`${base}/cache/${testKey}`, {headers: {Origin: 'https://evil.example'}});
+    assert.equal(evilOrigin.status, 403);
+    const evilFetchSite = await fetch(`${base}/cache/${testKey}`, {headers: {'Sec-Fetch-Site': 'cross-site'}});
+    assert.equal(evilFetchSite.status, 403);
+  } finally {
+    proc.kill();
+    rmSync(testFile, {force: true});
+  }
 });
 

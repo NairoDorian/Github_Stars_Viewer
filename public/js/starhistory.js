@@ -15,7 +15,8 @@ const key = full => full.toLowerCase();
 
 // Older SVG curves sometimes contain two counts at the same timestamp. Normalize once per cached object;
 // this repairs existing local data in memory without forcing a download of every saved chart.
-const normalized = new WeakSet(), failed = new Set();
+const normalized = new WeakSet(), failedAt = new Map();
+const recentlyFailed = k => Date.now() - (failedAt.get(k) || 0) < 5 * 60e3;
 export function curveFor(full) {
   const c = S.starCurves[key(full)];
   if (!c?.pts || normalized.has(c)) return c;
@@ -33,7 +34,7 @@ export function curveFor(full) {
 /** Curve to draw: any saved one with points (even from an older parser), so charts don't blink while refreshing. */
 export const drawableCurve = full => {
   const k = key(full), c = curveFor(full);
-  return c?.pts ? c : (c && fresh(c)) || failed.has(k) ? (c || {pts: null}) : null;
+  return c?.pts ? c : (c && fresh(c)) || recentlyFailed(k) ? (c || {pts: null}) : null;
 };
 // Bump PARSER when parsing improves: entries saved by an older parser (e.g. "unavailable" because a label format
 // wasn't understood) are then fetched again instead of waiting for their TTL.
@@ -197,12 +198,12 @@ async function load(full) {
   for (let attempt = 0; attempt < 4; attempt++) {
     let r = null;
     try { r = await fetch(url); } catch {}
-    if (r?.ok) { failed.delete(k); S.starCurves[k] = {v: PARSER, at: Date.now(), pts: parseStarHistorySvg(await r.text())}; break; }
-    if (r?.status === 404) { failed.delete(k); S.starCurves[k] = {v: PARSER, at: Date.now(), pts: null}; break; }
+    if (r?.ok) { failedAt.delete(k); S.starCurves[k] = {v: PARSER, at: Date.now(), pts: parseStarHistorySvg(await r.text())}; break; }
+    if (r?.status === 404) { failedAt.delete(k); S.starCurves[k] = {v: PARSER, at: Date.now(), pts: null}; break; }
     await new Promise(res => setTimeout(res, 1000 * 2 ** attempt));   // 403 / 429 / 5xx / network: wait and retry
   }
-  if (!S.starCurves[k]) {   // still failing: fall back to local star history for now, retry on next render
-    failed.add(k);
+  if (!S.starCurves[k]) {   // still failing: fall back to local star history for 5 min before retrying
+    failedAt.set(k, Date.now());
     window.dispatchEvent(new CustomEvent('star-curve', {detail: k}));
     return;
   }
@@ -243,7 +244,7 @@ const observer = typeof IntersectionObserver !== 'undefined' && new Intersection
     if (!e.isIntersecting) continue;
     observer.unobserve(e.target);
     const full = e.target.dataset.sh, k = key(full);
-    if (fresh(curveFor(full)) || pending.has(k)) continue;
+    if (fresh(curveFor(full)) || recentlyFailed(k) || pending.has(k)) continue;
     pending.add(k); queue.push(full); pump();
   }
 }, {rootMargin: '300px'});
@@ -251,5 +252,8 @@ const observer = typeof IntersectionObserver !== 'undefined' && new Intersection
 /** Starts watching every activity block under `root`; their star history loads when they come into view. */
 export function watchStarCharts(root) {
   if (!observer || !root) return;
-  for (const el of root.querySelectorAll('.activity[data-sh]')) if (!fresh(curveFor(el.dataset.sh))) observer.observe(el);
+  for (const el of root.querySelectorAll('.activity[data-sh]')) {
+    const full = el.dataset.sh;
+    if (!fresh(curveFor(full)) && !recentlyFailed(key(full))) observer.observe(el);
+  }
 }

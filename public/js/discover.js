@@ -187,7 +187,7 @@ async function explore(id, {force = false, depth = 0}, run) {
     }
     S.disc.results[id] = {...(old || {}), ...result, items, at: old?.at || Date.now(), depth, forkPolicy,
       sortDatesAt: depth ? null : undefined,   // a deeper page adds candidates that need dates too
-      exhausted: depth >= MAX_DEPTH || !!result.note?.some(n => /rate limited|token rejected/i.test(n))};
+      exhausted: depth >= MAX_DEPTH || !result.items.length || !!result.note?.some(n => /rate limited|token rejected/i.test(n))};
     await saveDisc(g);
     updated = true;
   } catch (e) { if (rid === runId && e?.name !== 'AbortError') progress('⚠ ' + e.message); }
@@ -416,6 +416,8 @@ async function fillSortDates(id, res) {
   if (current === id) showResults(id);
 }
 
+let lastStarred = null;
+
 /** Renders a result, always without starred/dismissed repos. Cards removed by ☆/✕ are refilled from the pool, and the
  *  pool refills itself from GitHub (next depth) when it runs low. */
 function showResults(id) {
@@ -432,6 +434,7 @@ function showResults(id) {
   el.innerHTML = `<div class="discovery-controls"><span class="muted">${items.length} suggestions · found ${ago(res.at)}</span>
       <label>Sort <select id="discoverySort" aria-label="Sort suggestions">${SORT_OPTIONS.filter(([key]) => key !== 'starred')
         .map(([key, label]) => `<option value="${key}"${discoverySort === key ? ' selected' : ''}>${label}</option>`).join('')}</select></label>
+      ${lastStarred ? `<button data-unstar="${esc(lastStarred)}" title="Unstar ${esc(lastStarred)} on GitHub">↩ Unstar ${esc(lastStarred.split('/')[1] || lastStarred)}</button>` : ''}
       ${dismissedCount ? `<button data-undismiss title="Restore the last dismissed suggestion (${esc(S.disc.dismissed.at(-1))})">↩ Undo dismiss (${dismissedCount})</button>` : ''}
       <button data-refresh="${esc(id)}">↻ Refresh</button></div>
     <p class="muted discovery-note">${(discoverySort === 'release' || discoverySort === 'commit') ?
@@ -470,25 +473,32 @@ async function fillCardDetails(id, onScreen) {
   if ((updated || refreshWaiting) && current && !busy && g === S.gen) showResults(current);
 }
 
-function overviewHTML() {
-  const bars = (list, explore = false) => { const max = list[0]?.[1] || 1; return list.slice(0, 10).map(([k, c]) =>
-    `<div class="barline"><span title="${esc(k)}">${explore ? `<button class="pattern-link" data-pattern="${esc(k)}" title="Find related repositories">${esc(k)}</button>` : esc(k)}</span><i style="width:${c / max * 120}px"></i><span class="muted">${c}</span></div>`).join(''); };
+export function overviewHTML() {
+  const repos = S.hideForks ? S.repos.filter(r => !r.fork) : S.repos;
+  const bars = (list, explore = false) => {
+    const top = list.slice(0, 10), max = Math.max(1, ...top.map(([, c]) => c));
+    return top.map(([k, c]) => `<div class="barline"><span title="${esc(k)}">${explore ? `<button class="pattern-link" data-pattern="${esc(k)}" title="Find related repositories">${esc(k)}</button>` : esc(k)}</span><i style="width:${Math.round(c / max * 120)}px"></i><span class="muted">${c}</span></div>`).join('');
+  };
   const since = Date.now() - 90 * DAY;
-  const stale = S.repos.filter(r => r.archived || Date.now() - Date.parse(r.commitAt || r.pushed) > 2 * 365 * DAY).length;
+  const stale = repos.filter(r => r.archived || Date.now() - Date.parse(r.commitAt || r.pushed) > 2 * 365 * DAY).length;
   return `<div class="row">
-    <div><h3>Top topics</h3>${bars(tally(S.repos, r => r.topics), true)}</div>
-    <div><h3>Trending for you (last 90 days)</h3>${bars(tally(S.repos, r => Date.parse(r.starred) > since ? r.topics : []), true) || '<p class="muted">No recent stars.</p>'}</div>
-    <div><h3>Languages</h3>${bars(tally(S.repos, r => r.lang), true)}</div>
-    <div><h3>Stars per year</h3>${bars(tally(S.repos, r => r.starred?.slice(0, 4)).sort((a, b) => b[0] - a[0]))}
-      <p class="muted">${stale} look stale (archived or no commit in 2y) · ${S.repos.filter(r => r.stars < 500).length} hidden gems (&lt;500★) · ${S.repos.filter(r => r.fork).length} forks</p></div></div>
+    <div><h3>Top topics</h3>${bars(tally(repos, r => r.topics), true)}</div>
+    <div><h3>Trending for you (last 90 days)</h3>${bars(tally(repos, r => Date.parse(r.starred) > since ? r.topics : []), true) || '<p class="muted">No recent stars.</p>'}</div>
+    <div><h3>Languages</h3>${bars(tally(repos, r => r.lang), true)}</div>
+    <div><h3>Stars per year</h3>${bars(tally(repos, r => r.starred?.slice(0, 4)).sort((a, b) => b[0] - a[0]))}
+      <p class="muted">${stale} look stale (archived or no commit in 2y) · ${repos.filter(r => r.stars < 500).length} hidden gems (&lt;500★) · ${S.repos.filter(r => r.fork).length} forks</p></div></div>
     <p class="muted">Click a topic or language to find related repos. You can sort the results in Discover.</p>`;
 }
 
 function themesHTML() {
   themes = detectThemes();
-  const group = (title, pick) => `<h3>${title}</h3><div class="themes">${themes.map((t, i) => !pick(t) ? '' : `<div class="theme" tabindex="0" role="button" data-theme="${i}">
+  if (!themes.length) return `<p class="muted">Not enough shared keywords across your ${S.repos.length} stars to form clusters yet. Try the keyword box above, <b>Owners you like</b>, or <b>Patterns</b>.</p>`;
+  const group = (title, pick) => {
+    const cards = themes.map((t, i) => !pick(t) ? '' : `<div class="theme" tabindex="0" role="button" data-theme="${i}">
       <b>${esc(t.keys.slice(0, 3).join(' · '))}</b> <span class="muted">${t.members.length} repos${t.recent ? ` · 🔥 ${t.recent} recent` : ''}${S.disc.results[t.id] ? ' · ✓ explored' : ''}</span>
-      <div class="muted small">${t.members.slice(0, 5).map(r => esc(r.name)).join(', ')}${t.members.length > 5 ? '…' : ''}</div></div>`).join('')}</div>`;
+      <div class="muted small">${t.members.slice(0, 5).map(r => esc(r.name)).join(', ')}${t.members.length > 5 ? '…' : ''}</div></div>`).join('');
+    return cards ? `<h3>${title}</h3><div class="themes">${cards}</div>` : '';
+  };
   return `<p class="muted">Clusters detected in your ${S.repos.length} stars. Pick one to hunt for related repos you haven't starred yet
     (searches, forks, READMEs that mention them, links in your READMEs).</p>` +
     group('Niches', t => t.members.length <= 25) + group('Broad interests', t => t.members.length > 25);
@@ -519,7 +529,7 @@ function show(newTab) {
   else if (tab === 'owners') exploreOwners();
   else $('#dbody').innerHTML = overviewHTML();
 }
-export const closeDiscover = () => { runId++; busy = false; $('#insights').classList.remove('show'); };
+export const closeDiscover = () => { runId++; busy = false; lastStarred = null; $('#insights').classList.remove('show'); };
 
 /* Stars a suggestion on GitHub; it then joins your stars and its card is replaced by the next suggestion.
    Needs a token allowed to star: classic token with "public_repo", or fine-grained with "Starring: read and write".
@@ -539,6 +549,7 @@ async function starSuggestion(full, btn) {
     if (code === 403 || code === 404) { needToken(); throw new Error('Your token can read but not star. Grant "Starring: Read and write" (fine-grained) or "public_repo" (classic) in the 🔑 panel.'); }
     if (code >= 300) throw new Error('GitHub ' + code);
     starred = true;
+    lastStarred = full;
     if (g !== S.gen || user !== ukey()) return status(`★ Starred ${full} on GitHub. Reload ${user}'s stars to see it here.`);
     // Prefer fresh REST metadata, but keep the successful star visible even if that follow-up request fails.
     let x;
@@ -569,10 +580,35 @@ async function starSuggestion(full, btn) {
   }
 }
 
+/** Unstars the most recently starred suggestion on GitHub and puts it back into the suggestion pool. */
+async function unstarSuggestion(full, btn) {
+  if (!S.token) return;
+  const g = S.gen;
+  btn.disabled = true;
+  try {
+    const code = await setStar(full, false);
+    if (code >= 300 && code !== 404) throw new Error('GitHub ' + code);
+    if (lastStarred === full) lastStarred = null;
+    if (g !== S.gen) return;
+    S.repos = S.repos.filter(r => r.full.toLowerCase() !== full.toLowerCase());
+    S.starPages = [];
+    await saveStars(g);
+    if (g !== S.gen) return;
+    render();
+    status(`↩ Unstarred ${full} on GitHub`);
+    if (current) showResults(current);
+  } catch (e) {
+    btn.disabled = false;
+    status('⚠ Could not unstar: ' + e.message);
+  }
+}
+
 export function initDiscover() {
   $('#toggleInsights').onclick = () => show();
   window.addEventListener('fork-filter-change', () => {
-    if ($('#insights').classList.contains('show') && current) showResults(current);
+    if (!$('#insights').classList.contains('show')) return;
+    if (current) showResults(current);
+    else if (tab === 'overview') $('#dbody').innerHTML = overviewHTML();
   });
   $('#insights').addEventListener('change', e => {
     if (e.target.id !== 'discoverySort') return;
@@ -586,10 +622,11 @@ export function initDiscover() {
     if (repo) exploreRepo(repo);
   });
   $('#insights').addEventListener('click', async e => {
-    const t = e.target.closest('[data-dtab],[data-theme],[data-dismiss],[data-undismiss],[data-refresh],[data-filterq],[data-pattern],[data-star],[data-more],[data-topic],[data-owner]');
+    const t = e.target.closest('[data-dtab],[data-theme],[data-dismiss],[data-undismiss],[data-unstar],[data-refresh],[data-filterq],[data-pattern],[data-star],[data-more],[data-topic],[data-owner]');
     if (!t) return;
     const d = t.dataset;
     if (d.star) starSuggestion(d.star, t);
+    else if (d.unstar) unstarSuggestion(d.unstar, t);
     else if (d.more !== undefined) { shown += PAGE; showResults(current); }
     else if (d.dtab) show(d.dtab);
     else if (d.pattern || d.topic || d.owner) exploreKeyword(d.pattern || d.topic || d.owner);
