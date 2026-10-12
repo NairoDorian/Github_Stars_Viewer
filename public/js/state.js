@@ -12,6 +12,24 @@ export const S = {
   gen: 0,            // bumped when the user changes: running jobs compare it and stop without saving
 };
 
+let genCtrl = new AbortController(), ctrlGen = 0;
+/** Bumps S.gen and aborts any in-flight requests from the previous generation. */
+export function nextGen() {
+  genCtrl.abort();
+  genCtrl = new AbortController();
+  ctrlGen = ++S.gen;
+  return S.gen;
+}
+/** AbortSignal for the current generation (also reacts if S.gen was bumped directly). */
+export function genSignal() {
+  if (ctrlGen !== S.gen) {
+    genCtrl.abort();
+    genCtrl = new AbortController();
+    ctrlGen = S.gen;
+  }
+  return genCtrl.signal;
+}
+
 export const ukey = () => S.user.toLowerCase();
 
 /** Cache key of a repo: GitHub's numeric id (survives renames/transfers). Old caches without id fall back to "owner/name". */

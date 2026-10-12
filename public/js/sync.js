@@ -32,15 +32,17 @@ export const needsReadme = r => {
 const readmeRecord = (r, fields) => ({t: '', sha: null, etag: null, path: null, ...fields, at: Date.now(), pushed: r.pushed});
 
 // ---- one network job at a time ----
-let running = null;
-/** Runs job(gen) unless another job is running. Errors end up in the status line. */
+let running = null, runningGen = 0;
+/** Runs job(gen) unless another job is running for the current profile. Errors end up in the status line. */
 export function task(job) {
-  if (running) { status('⏳ Busy with another task, please wait'); return running; }
+  if (running && runningGen === S.gen) { status('⏳ Busy with another task, please wait'); return running; }
   const g = S.gen;
-  running = job(g).catch(e => { if (g === S.gen) status('⚠ ' + e.message); }).finally(() => { running = null; });
-  return running;
+  runningGen = g;
+  const p = job(g).catch(e => { if (g === S.gen && e?.name !== 'AbortError') status('⚠ ' + e.message); })
+    .finally(() => { if (running === p) running = null; });
+  return (running = p);
 }
-export const waitIdle = () => running || Promise.resolve();
+export const waitIdle = () => (running && runningGen === S.gen) ? running : Promise.resolve();
 
 /** Older caches keyed READMEs by "owner/name" and stored plain strings: convert in place, no re-download. */
 export function migrateReadmes() {
@@ -150,7 +152,7 @@ async function refreshDetails(g, {wantReadmes, wantEnrich}) {
   const download = [], viaRest = [];
   let checked = 0, same = 0, skipped = 0, fatal = null;
 
-  await pool(chunks(todo, 10), 10, async batch => {
+  await pool(chunks(todo, 10), 6, async batch => {
     if (fatal || g !== S.gen) return;
     let data;
     try { data = await gql('query{' + batch.map((r, j) => repoQ('r' + j, r.owner, r.name, fields)).join(' ') + '}'); }
@@ -176,7 +178,7 @@ async function refreshDetails(g, {wantReadmes, wantEnrich}) {
       } else download.push({r, ...hit});
     }
     checked += batch.length;
-    status(`Checked ${checked}/${todo.length} changed repos…`);
+    if (g === S.gen) status(`Checked ${checked}/${todo.length} changed repos…`);
   });
   if (g !== S.gen) return {summary: ''};
   await saveStars(g);
@@ -186,7 +188,10 @@ async function refreshDetails(g, {wantReadmes, wantEnrich}) {
     if (fatal || g !== S.gen) return;
     let data;
     try { data = await gql('query{' + batch.map((x, j) => repoQ('r' + j, x.r.owner, x.r.name, `object(expression:${JSON.stringify('HEAD:' + x.path)}){...on Blob{text}}`)).join(' ') + '}'); }
-    catch (e) { fatal = e; return; }
+    catch (e) {
+      if (/Token|rate limit/i.test(e.message)) fatal = e; else for (const x of batch) viaRest.push(x.r);
+      return;
+    }
     if (g !== S.gen) return;
     batch.forEach((x, j) => {
       const text = data['r' + j]?.object?.text;
@@ -194,7 +199,7 @@ async function refreshDetails(g, {wantReadmes, wantEnrich}) {
       S.readmes[rkey(x.r)] = readmeRecord(x.r, {t: text.slice(0, README_MAX_CHARS), sha: x.oid, path: x.path});
       got++;
     });
-    status(`Downloading changed READMEs ${got}/${download.length}…`);
+    if (g === S.gen) status(`Downloading changed READMEs ${got}/${download.length}…`);
   });
 
   const rest = viaRest.length && !fatal ? await restReadmes(g, viaRest, true) : null;
@@ -226,7 +231,7 @@ async function restReadmes(g, todo, quiet = false) {
         S.readmes[k] = readmeRecord(r, {t: text.slice(0, README_MAX_CHARS), etag: res.headers.get('ETag')}); got++;
       }
     } catch (e) { if (/Rate limited|Token/.test(e.message)) fatal = e; else failed++; }   // transient: retried next time
-    if (!quiet && ++done % 25 === 0) status(`READMEs ${done}/${todo.length}…`);
+    if (!quiet && g === S.gen && ++done % 25 === 0) status(`READMEs ${done}/${todo.length}…`);
   });
   if (!quiet && g === S.gen) { await saveReadmes(g); if (g === S.gen) render(); }
   return {got, same, summary: `READMEs: ${same} unchanged, ${got} downloaded${failed ? `, ${failed} failed (retried next time)` : ''}` +

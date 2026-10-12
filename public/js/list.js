@@ -157,11 +157,11 @@ export function card(r, {snip = null, re = null, suggestion = false, reasons = [
   const license = r.license && r.license !== 'NOASSERTION' ? `<span>${esc(r.license)}</span>` : '';
   const tag = suggestion ? 'li' : 'div';
   return `<${tag} class="card${suggestion ? ' suggestion-card' : ''}">
-    <div class="owner">${avatar ? `<img src="${esc(avatar)}" loading="lazy" alt="">` : ''}<span class="chip" data-owner="${esc(r.owner)}">${esc(r.owner)}</span>${r.archived ? ' · archived' : ''}${r.fork ? ' · fork' : ''}</div>
+    <div class="owner">${avatar ? `<img src="${esc(avatar)}" loading="lazy" alt="">` : ''}<span class="chip" tabindex="0" role="button" data-owner="${esc(r.owner)}">${esc(r.owner)}</span>${r.archived ? ' · archived' : ''}${r.fork ? ' · fork' : ''}</div>
     <a href="${esc(safeUrl(r.url))}" target="_blank" rel="noopener">${hl(r.name, re)}</a>
     <p class="desc">${r.about ? hl(r.about, re) : '<span class="muted">No description</span>'}</p>
     ${snip ? `<div class="snip">README: …${hl(snip, re)}…</div>` : ''}
-    <div class="chips">${(r.topics || []).slice(0, 8).map(t => `<span class="chip" data-topic="${esc(t)}">${hl(t, re)}</span>`).join('')}</div>
+    <div class="chips">${(r.topics || []).slice(0, 8).map(t => `<span class="chip" tabindex="0" role="button" data-topic="${esc(t)}">${hl(t, re)}</span>`).join('')}</div>
     <div class="meta">
       <span>★ ${fmtN(r.stars)}</span>${r.forks != null ? `<span>⑂ ${fmtN(r.forks)}</span>` : ''}${r.issues != null ? `<span title="Open issues">◉ ${fmtN(r.issues)} issues</span>` : ''}${r.lang ? `<span>● ${esc(r.lang)}</span>` : ''}${license}
       ${(r.commitAt || r.pushed) ? `<span class="lastcommit" title="Last commit: ${esc(when(r.commitAt || r.pushed))}${r.commitAt ? '' : ' (last push)'}">🕒 last commit ${ago(r.commitAt || r.pushed)}</span>` : ''}
@@ -178,44 +178,66 @@ export function card(r, {snip = null, re = null, suggestion = false, reasons = [
   </${tag}>`;
 }
 
+/** Resets active facet filters and pagination when switching GitHub users. */
+export function resetFilters() {
+  filters.lang = filters.topic = filters.owner = null;
+  limit = PAGE;
+  shown.clear();
+}
+
 export function render() {
   const terms = $('#q').value.toLowerCase().split(/\s+/).filter(Boolean);
   const re = terms.length ? new RegExp(terms.map(escRe).join('|'), 'gi') : null;
   const inReadme = $('#inReadme').checked;
 
-  const out = [];
+  const out = [], forLang = [], forTopic = [], forOwner = [];
   for (const r of S.repos) {
     if (S.hideForks && r.fork) continue;
-    if (filters.lang && r.lang !== filters.lang) continue;
-    if (filters.topic && !r.topics.includes(filters.topic)) continue;
-    if (filters.owner && r.owner !== filters.owner) continue;
+    const okLang = !filters.lang || r.lang === filters.lang;
+    const okTopic = !filters.topic || r.topics.includes(filters.topic);
+    const okOwner = !filters.owner || r.owner === filters.owner;
+    if (okLang + okTopic + okOwner < 2) continue;
     const m = match(r, terms, inReadme);
-    if (m) out.push({r, snip: m.snip});
+    if (!m) continue;
+    if (okTopic && okOwner) forLang.push(r);
+    if (okLang && okOwner) forTopic.push(r);
+    if (okLang && okTopic) forOwner.push(r);
+    if (okLang && okTopic && okOwner) out.push({r, snip: m.snip});
   }
   sortRepos(out, $('#sort').value, 'name');
 
-  const filtered = S.hideForks || Object.values(filters).some(Boolean);
-  $('#count').textContent = `${out.length} of ${S.repos.length} repos` + (filtered ? ' (filtered)' : '');
+  const pills = [['lang', 'Language'], ['topic', 'Topic'], ['owner', 'Owner']]
+    .filter(([k]) => filters[k])
+    .map(([k, label]) => `<button class="chip filter-pill" data-${k}="${esc(filters[k])}" title="Remove ${label.toLowerCase()} filter">${label}: ${esc(filters[k])} ✕</button>`);
+  const filtered = S.hideForks || pills.length > 0 || terms.length > 0;
+  $('#count').innerHTML = `<span>${out.length} of ${S.repos.length} repos${filtered ? ' (filtered)' : ''}</span>` +
+    (pills.length ? ` <span class="active-filters">${pills.join('')}<button class="clear-filters" data-clear-filters title="Clear active filters">Clear</button></span>` : '');
   $('#list').innerHTML = out.slice(0, limit).map(x => card(x.r, {snip: x.snip, re})).join('');
   const left = out.length - limit, more = $('#more');
   more.hidden = left <= 0;   // everything shown: no button at all
   if (left > 0) more.textContent = `Show more (${left} left)`;
-  renderFacets();
+  renderFacets({forLang, forTopic, forOwner}, `${terms.join(' ')}\0${inReadme ? 1 : 0}`);
   watchStarCharts($('#list'));
 }
 
-// Facet counts only change when the repo list or the active filters change.
+// Each facet group is cross-filtered by the active search and the other two facets, so counts reflect real matches.
 let facetsKey = null;
-function renderFacets() {
-  const k = [S.repos, S.hideForks, filters.lang, filters.topic, filters.owner];
+function renderFacets({forLang, forTopic, forOwner}, queryKey) {
+  const k = [S.repos, S.hideForks, filters.lang, filters.topic, filters.owner, queryKey];
   if (facetsKey && k.every((v, i) => v === facetsKey[i])) return;
   facetsKey = k;
-  const block = (title, kind, list, n) => `<h3>${title}</h3>` + list.slice(0, n).map(([v, c]) =>
-    `<div class="facet ${filters[kind] === v ? 'on' : ''}" data-${kind}="${esc(v)}"><span title="${esc(v)}">${esc(v)}</span><span class="muted">${c}</span></div>`).join('');
-  const source = S.hideForks ? S.repos.filter(r => !r.fork) : S.repos;
-  $('#facets').innerHTML = block('Languages', 'lang', tally(source, r => r.lang), 15) +
-    block('Topics', 'topic', tally(source, r => r.topics), 30) +
-    block('Owners', 'owner', tally(source, r => r.owner).filter(x => x[1] > 1), 15);
+  const block = (title, kind, list, n) => {
+    const top = list.slice(0, n), active = filters[kind];
+    if (active && !top.some(([v]) => v === active)) {
+      const hit = list.find(([v]) => v === active);
+      top.unshift([active, hit ? hit[1] : 0]);
+    }
+    return `<h3>${title}</h3>` + top.map(([v, c]) =>
+      `<div class="facet ${active === v ? 'on' : ''}" tabindex="0" role="button" data-${kind}="${esc(v)}"><span title="${esc(v)}">${esc(v)}</span><span class="muted">${c}</span></div>`).join('');
+  };
+  $('#facets').innerHTML = block('Languages', 'lang', tally(forLang, r => r.lang), 15) +
+    block('Topics', 'topic', tally(forTopic, r => r.topics), 30) +
+    block('Owners', 'owner', tally(forOwner, r => r.owner).filter(([v, c]) => c > 1 || v === filters.owner), 15);
 }
 
 /** Puts a query in the search box (with README search on) and shows the matches. */
@@ -227,6 +249,7 @@ export function searchFor(q) {
 }
 
 const FACETS_PREF = 'starsViewer.hideFacets';   // localStorage: sidebar hidden?
+const SORT_PREF = 'starsViewer.sort';
 function setFacetsHidden(hide) {
   document.querySelector('main').classList.toggle('nofacets', hide);
   const b = $('#toggleFacets');
@@ -245,6 +268,10 @@ export function initList() {
     render();
     window.dispatchEvent(new CustomEvent('fork-filter-change'));
   };
+  try {
+    const savedSort = localStorage.getItem(SORT_PREF);
+    if (savedSort && [...$('#sort').options].some(o => o.value === savedSort)) $('#sort').value = savedSort;
+  } catch {}
   let hidden = false;
   try { hidden = localStorage.getItem(FACETS_PREF) === '1'; } catch {}
   setFacetsHidden(hidden);
@@ -252,7 +279,17 @@ export function initList() {
   window.addEventListener('star-curve', e => refreshActivity(e.detail));
   let timer;
   $('#q').oninput = () => { clearTimeout(timer); timer = setTimeout(() => { limit = PAGE; render(); }, 120); };
-  $('#sort').onchange = () => { limit = PAGE; render(); };
+  $('#q').onkeydown = e => {
+    if (e.key === 'Escape') {
+      if ($('#q').value) { clearTimeout(timer); $('#q').value = ''; limit = PAGE; render(); }
+      else $('#q').blur();
+    }
+  };
+  $('#sort').onchange = () => {
+    try { localStorage.setItem(SORT_PREF, $('#sort').value); } catch {}
+    limit = PAGE;
+    render();
+  };
   $('#inReadme').onchange = () => render();
   const showMore = () => { if (!$('#more').hidden) { limit += PAGE; render(); } };
   $('#more').onclick = showMore;
@@ -264,15 +301,24 @@ export function initList() {
     const b = e.target.closest('[data-similar]');
     if (b) window.dispatchEvent(new CustomEvent('suggest-for', {detail: Number(b.dataset.similar)}));
   });
-  // Facet and chip clicks (sidebar and cards) toggle the matching filter.
+  // Facet and chip clicks (sidebar, filter bar and cards) toggle the matching filter.
   document.addEventListener('click', e => {
-    const el = e.target.closest('#facets [data-lang], #facets [data-topic], #facets [data-owner], #list [data-topic], #list [data-owner]');
+    if (e.target.closest('[data-clear-filters]')) {
+      filters.lang = filters.topic = filters.owner = null;
+      limit = PAGE; render();
+      return;
+    }
+    const el = e.target.closest('#facets [data-lang], #facets [data-topic], #facets [data-owner], #count [data-lang], #count [data-topic], #count [data-owner], #list [data-topic], #list [data-owner]');
     if (!el) return;
     for (const k of ['lang', 'topic', 'owner']) if (el.dataset[k] !== undefined) filters[k] = filters[k] === el.dataset[k] ? null : el.dataset[k];
     limit = PAGE; render();
   });
-  // "/" focuses the search box (unless typing in a field).
+  // "/" focuses the search box (unless typing in a field); Enter/Space activates role="button" elements.
   document.addEventListener('keydown', e => {
-    if (e.key === '/' && !/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement?.tagName)) { e.preventDefault(); $('#q').focus(); }
+    if (e.key === '/' && !/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement?.tagName)) { e.preventDefault(); $('#q').focus(); return; }
+    if ((e.key === 'Enter' || e.key === ' ') && e.target?.getAttribute?.('role') === 'button' && e.target.id !== 'tpToggle') {
+      e.preventDefault();
+      e.target.click();
+    }
   });
 }

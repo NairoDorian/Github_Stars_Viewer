@@ -1,5 +1,5 @@
 // GitHub API access: REST + GraphQL, with retries, rate-limit handling and data mapping.
-import {S} from './state.js';
+import {S, genSignal} from './state.js';
 import {sleep, pool, chunks} from './util.js';
 
 const API = 'https://api.github.com';
@@ -19,16 +19,24 @@ export const needToken = () => window.dispatchEvent(new CustomEvent('need-token'
  * (403/429 with Retry-After ≤ 60s). Returns the Response; callers decide what other statuses mean.
  */
 export async function ghFetch(url, init = {}, tries = 3) {
+  const sig = init.signal === undefined ? genSignal() : init.signal;
   for (let i = 0; ; i++) {
     let r;
-    try { r = await fetch(url.startsWith('http') ? url : API + url, init); }
+    try { r = await fetch(url.startsWith('http') ? url : API + url, sig ? {...init, signal: sig} : init); }
     catch (e) {
+      if (sig?.aborted) throw e;
       if (i >= tries - 1) throw new Error('Network error: are you online?');
-      await sleep(500 * 2 ** i); continue;
+      await sleep(500 * 2 ** i, sig);
+      if (sig?.aborted) throw new DOMException('Aborted', 'AbortError');
+      continue;
     }
     const retryAfter = Number(r.headers.get('retry-after')) || 0;
     const transient = r.status >= 500 || ((r.status === 403 || r.status === 429) && retryAfter > 0 && retryAfter <= 60);
-    if (transient && i < tries - 1) { await sleep(retryAfter ? retryAfter * 1000 : 500 * 2 ** i); continue; }
+    if (transient && i < tries - 1) {
+      await sleep(retryAfter ? retryAfter * 1000 : 500 * 2 ** i, sig);
+      if (sig?.aborted) throw new DOMException('Aborted', 'AbortError');
+      continue;
+    }
     return r;
   }
 }
@@ -153,7 +161,7 @@ export function starGains(hist, now = Date.now()) {
   for (let i = 1; i < hist.length; i++) {   // spread each gain over its days, then add to buckets
     const [t0, c0] = hist[i - 1], [t1, c1] = hist[i], days = Math.max(1, Math.round((t1 - t0) / DAY_MS)), per = (c1 - c0) / days;
     for (let d = 0; d < days; d++) {
-      const t = t0 + (d + 1) * DAY_MS, k = Math.floor((t - start) / ACTIVITY_SPAN);
+      const t = t0 + (d + 0.5) * DAY_MS, k = Math.floor((t - start) / ACTIVITY_SPAN);
       if (k >= 0 && k < ACTIVITY_BUCKETS) counts[k] = (counts[k] ?? 0) + per;
     }
   }
@@ -225,6 +233,6 @@ export const forgetMe = () => { me = null; meToken = null; };
 
 /** Stars (on=true) or unstars a repo for the token's owner. Returns the HTTP status (204 = done). */
 export async function setStar(full, on) {
-  const r = await ghFetch('/user/starred/' + full, {method: on ? 'PUT' : 'DELETE', headers: headers()});
+  const r = await ghFetch('/user/starred/' + full, {method: on ? 'PUT' : 'DELETE', headers: headers(), signal: null});
   return r.status;
 }

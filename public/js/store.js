@@ -66,7 +66,11 @@ export async function setBrowserCache(on) {
 export async function get(key) {
   try {
     if (mode === 'memory') return mem.get(key) ?? null;
-    if (mode === 'browser') return (await idb('readonly', s => s.get(key))) ?? null;
+    if (mode === 'browser') {
+      const v = (await idb('readonly', s => s.get(key))) ?? null;
+      if (v !== null) mem.set(key, v);
+      return v;
+    }
     const r = await fetch('/cache/' + encodeURIComponent(key), {cache: 'no-store'});
     return r.ok ? await r.json() : null;
   } catch (e) { console.warn('cache read failed', key, e); return null; }
@@ -74,7 +78,7 @@ export async function get(key) {
 
 export async function put(key, value) {
   try {
-    mem.set(key, value);   // always kept for this tab (also lets the browser cache be switched on later)
+    if (mode !== 'server') mem.set(key, value);   // kept for online tabs (also lets the browser cache be switched on/off later)
     if (mode === 'browser') await idb('readwrite', s => s.put(value, key));
     else if (mode === 'server') {
       const r = await fetch('/cache/' + encodeURIComponent(key), {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(value)});

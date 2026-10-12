@@ -36,7 +36,11 @@ export const secs = t0 => ((performance.now() - t0) / 1000).toFixed(1) + 's';
 /** Status line under the toolbar. */
 export const status = text => { $('#status').textContent = text; };
 
-export const sleep = ms => new Promise(r => setTimeout(r, ms));
+export const sleep = (ms, signal) => new Promise(r => {
+  if (signal?.aborted) return r();
+  const t = setTimeout(r, ms);
+  signal?.addEventListener('abort', () => { clearTimeout(t); r(); }, {once: true});
+});
 
 /** Runs fn over every item with at most n calls in flight. */
 export async function pool(items, n, fn) {

@@ -47,12 +47,12 @@ No build step and no dependencies. The same code runs online (GitHub Pages) or l
 ## GitHub token (recommended)
 
 Without a token GitHub allows **60 requests/hour**, enough to list stars but not to index READMEs or fetch releases.
-Create a classic token at <https://github.com/settings/tokens/new> and paste it into the **🔑 GitHub token** panel.
+Create a [fine-grained token](https://github.com/settings/personal-access-tokens/new) or [classic token](https://github.com/settings/tokens/new) and paste it into the **🔑 GitHub token** panel.
 
-| You want to… | Scopes to tick |
-|---|---|
-| Browse, search, READMEs, releases, suggestions | **none** |
-| Also use the **☆ Star** buttons | **`public_repo`** (GitHub has no star-only scope) |
+| You want to… | Fine-grained token (recommended) | Classic token |
+|---|---|---|
+| Browse, search, READMEs, releases, suggestions | **Public Repositories (read-only)** | **none** |
+| Also use the **☆ Star** buttons | Account permissions → **Starring: Read and write** | **`public_repo`** |
 
 The token is only ever sent to `api.github.com`. Where it's stored depends on how you run the app (see below).
 

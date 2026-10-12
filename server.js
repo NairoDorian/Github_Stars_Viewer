@@ -17,29 +17,39 @@ const KEY = /^[\w.:-]{1,120}$/;
 const dataFile = key => path.join(DATA, key.replace(/[^\w.-]/g, '_') + '.json');
 
 // Only this app may talk to the server. The Host check blocks "DNS rebinding" (a web page re-pointing its own domain
-// to 127.0.0.1 to read your token); the Origin check blocks other sites from writing to the cache.
+// to 127.0.0.1 to read your token); Origin and Sec-Fetch-Site block other sites from reading or writing the cache.
 const ALLOWED_HOSTS = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`, `[::1]:${PORT}`]);
 const ALLOWED_ORIGINS = new Set([...ALLOWED_HOSTS].map(h => 'http://' + h));
-const trusted = req => ALLOWED_HOSTS.has(req.headers.host) && (!req.headers.origin || ALLOWED_ORIGINS.has(req.headers.origin));
+const ALLOWED_SITES = new Set(['same-origin', 'none']);
+const trusted = req => ALLOWED_HOSTS.has(req.headers.host) &&
+  (!req.headers.origin || ALLOWED_ORIGINS.has(req.headers.origin)) &&
+  (!req.headers['sec-fetch-site'] || ALLOWED_SITES.has(req.headers['sec-fetch-site']));
 
-// Writes to the same file are queued; each goes to a temp file that is then renamed over the old one,
+// Writes to the same file are queued and coalesced; each goes to a temp file that is then renamed over the old one,
 // so a crash or overlapping saves never leave a half-written or corrupted cache file.
-const queues = new Map();
+const queues = new Map(), pendingBuf = new Map();
 function save(file, buf) {
+  JSON.parse(buf);   // refuse to store invalid JSON
+  const hadPending = pendingBuf.has(file);
+  pendingBuf.set(file, buf);
+  if (hadPending) return queues.get(file);
   const next = (queues.get(file) || Promise.resolve()).catch(() => {}).then(async () => {
-    JSON.parse(buf);   // refuse to store invalid JSON
-    const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-    await fsp.writeFile(tmp, buf);
-    for (let i = 0; ; i++) {   // Windows may briefly lock a file that's being read (EPERM/EBUSY): retry
-      try { return await fsp.rename(tmp, file); }
-      catch (e) {
-        if (i >= 10) { await fsp.rm(tmp, {force: true}); throw e; }
-        await new Promise(r => setTimeout(r, 50 * (i + 1)));
+    while (pendingBuf.has(file)) {
+      const data = pendingBuf.get(file);
+      pendingBuf.delete(file);
+      const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+      await fsp.writeFile(tmp, data);
+      for (let i = 0; ; i++) {   // Windows may briefly lock a file that's being read (EPERM/EBUSY): retry
+        try { await fsp.rename(tmp, file); break; }
+        catch (e) {
+          if (i >= 10) { await fsp.rm(tmp, {force: true}); throw e; }
+          await new Promise(r => setTimeout(r, 50 * (i + 1)));
+        }
       }
     }
   });
   queues.set(file, next);
-  next.finally(() => { if (queues.get(file) === next) queues.delete(file); }).catch(() => {});
+  next.finally(() => { if (queues.get(file) === next && !pendingBuf.has(file)) queues.delete(file); }).catch(() => {});
   return next;
 }
 
@@ -81,7 +91,7 @@ async function handle(req, res) {
   if (!file.startsWith(PUBLIC + path.sep)) return send(res, 404, 'not found');
   const d = await fsp.readFile(file).catch(() => null);
   if (!d) return send(res, 404, 'not found');
-  send(res, 200, d, TYPES[path.extname(file).toLowerCase()] || 'application/octet-stream');
+  send(res, 200, req.method === 'HEAD' ? '' : d, TYPES[path.extname(file).toLowerCase()] || 'application/octet-stream');
 }
 
 const openBrowser = () => exec(process.platform === 'win32' ? `start "" "${URL_}"` : process.platform === 'darwin' ? `open ${URL_}` : `xdg-open ${URL_}`);

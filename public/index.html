@@ -55,19 +55,16 @@
   <div class="tp-body" id="tpBody">
     <p class="muted">Without a token GitHub allows only <b>60 requests/hour</b>, which isn't enough to index READMEs or fetch releases. With a token you get <b>5,000/hour</b>.</p>
     <ol class="muted">
-      <li>Open <a href="https://github.com/settings/tokens/new?description=Stars%20Viewer" target="_blank" rel="noopener">github.com/settings/tokens/new</a> (classic token).</li>
-      <li>Set an expiration and pick the scopes (see below), then click <i>Generate token</i>.</li>
+      <li>Open <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a> (fine-grained) or <a href="https://github.com/settings/tokens/new?description=Stars%20Viewer" target="_blank" rel="noopener">tokens/new</a> (classic).</li>
+      <li>Set an expiration and pick the permissions/scopes (see below), then generate the token.</li>
       <li>Paste it below and click <b>Save &amp; check</b>. Where it's kept: running locally, in <code>data/config.json</code> next to the app;
         online, in this browser only if <b>💾 Keep cache in this browser</b> is on (otherwise it's forgotten when you close the tab).
         It's only ever sent to api.github.com.</li>
     </ol>
     <div class="tp-note">
-      <b>Which scopes?</b><br>
-      • <b>Browse, search, READMEs, releases, suggestions:</b> no scope needed, leave everything unchecked.<br>
-      • <b>☆ Star buttons in suggestions</b> (star/unstar on GitHub from this page): tick only <b>public_repo</b>.
-      GitHub has no star-only scope, so <b>public_repo</b> is the smallest that allows starring. It also allows writing to
-      your public repos, but this app only uses it to star and unstar.
-      The check below shows <b>“★ can star”</b> when your token allows it.
+      <b>Which permissions or scopes?</b><br>
+      • <b>Browse, search, READMEs, releases, suggestions:</b> no permissions or scopes needed (public repositories only).<br>
+      • <b>☆ Star buttons in suggestions</b> (star on GitHub from this page): with a <b>fine-grained token</b>, set <b>Account permissions → Starring: Read and write</b> (no repo write access needed); with a <b>classic token</b>, tick <b>public_repo</b>.
     </div>
     <div class="tp-row">
       <input id="token" type="password" placeholder="ghp_…" autocomplete="off" aria-label="GitHub token">

@@ -18,4 +18,8 @@ for (const [label, args, input] of files) {
     process.exitCode = 1;
   }
 }
-if (!process.exitCode) console.log(`Syntax OK: ${files.length} files`);
+if (!process.exitCode) {
+  console.log(`Syntax OK: ${files.length} files`);
+  const testRun = spawnSync(process.execPath, ['--test', join(__dirname, 'test.mjs')], {stdio: 'inherit'});
+  if (testRun.status !== 0) process.exitCode = testRun.status || 1;
+}

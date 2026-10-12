@@ -38,7 +38,11 @@ aside h3,#insights h3{font-size:12px;text-transform:uppercase;color:var(--muted)
 .facet{display:flex;justify-content:space-between;gap:8px;cursor:pointer;padding:2px 6px;border-radius:4px}
 .facet span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .facet:hover,.facet.on{background:var(--chip)}.facet.on{color:var(--accent);font-weight:600}
-#count{margin-bottom:8px}
+[role="button"]:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+#count{margin-bottom:8px;display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.active-filters{display:inline-flex;flex-wrap:wrap;align-items:center;gap:6px}
+.filter-pill{border:1px solid var(--accent);padding:1px 8px;font-size:11px}
+.clear-filters{padding:1px 8px;font-size:11px;color:var(--muted)}
 #list{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
 @media (max-width:420px){#list,.sugg{grid-template-columns:1fr!important}}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:6px;min-width:0}

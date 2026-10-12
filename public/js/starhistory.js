@@ -15,7 +15,7 @@ const key = full => full.toLowerCase();
 
 // Older SVG curves sometimes contain two counts at the same timestamp. Normalize once per cached object;
 // this repairs existing local data in memory without forcing a download of every saved chart.
-const normalized = new WeakSet();
+const normalized = new WeakSet(), failed = new Set();
 export function curveFor(full) {
   const c = S.starCurves[key(full)];
   if (!c?.pts || normalized.has(c)) return c;
@@ -31,7 +31,10 @@ export function curveFor(full) {
   return c;
 }
 /** Curve to draw: any saved one with points (even from an older parser), so charts don't blink while refreshing. */
-export const drawableCurve = full => { const c = curveFor(full); return c?.pts ? c : c && fresh(c) ? c : null; };
+export const drawableCurve = full => {
+  const k = key(full), c = curveFor(full);
+  return c?.pts ? c : (c && fresh(c)) || failed.has(k) ? (c || {pts: null}) : null;
+};
 // Bump PARSER when parsing improves: entries saved by an older parser (e.g. "unavailable" because a label format
 // wasn't understood) are then fetched again instead of waiting for their TTL.
 const PARSER = 3;
@@ -93,7 +96,7 @@ function resolveMonths(parsed) {
   let year = firstYear != null ? firstYear - 1 : null;
   if (year == null) {   // no year label at all: the last tick is the latest date ≤ today
     const now = new Date(), last = parsed.at(-1);
-    year = last && last.month > now.getMonth() ? now.getFullYear() - 1 : now.getFullYear();
+    year = last && last.month > now.getUTCMonth() ? now.getUTCFullYear() - 1 : now.getUTCFullYear();
     for (let i = parsed.length - 2; i >= 0; i--) if (parsed[i].month > parsed[i + 1].month) year--;
   }
   let prevMonth = -1;
@@ -194,19 +197,41 @@ async function load(full) {
   for (let attempt = 0; attempt < 4; attempt++) {
     let r = null;
     try { r = await fetch(url); } catch {}
-    if (r?.ok) { S.starCurves[k] = {v: PARSER, at: Date.now(), pts: parseStarHistorySvg(await r.text())}; break; }
-    if (r?.status === 404) { S.starCurves[k] = {v: PARSER, at: Date.now(), pts: null}; break; }
+    if (r?.ok) { failed.delete(k); S.starCurves[k] = {v: PARSER, at: Date.now(), pts: parseStarHistorySvg(await r.text())}; break; }
+    if (r?.status === 404) { failed.delete(k); S.starCurves[k] = {v: PARSER, at: Date.now(), pts: null}; break; }
     await new Promise(res => setTimeout(res, 1000 * 2 ** attempt));   // 403 / 429 / 5xx / network: wait and retry
   }
-  if (!S.starCurves[k]) return;   // still failing: leave it unloaded, it's tried again next time it's on screen
+  if (!S.starCurves[k]) {   // still failing: fall back to local star history for now, retry on next render
+    failed.add(k);
+    window.dispatchEvent(new CustomEvent('star-curve', {detail: k}));
+    return;
+  }
   window.dispatchEvent(new CustomEvent('star-curve', {detail: k}));
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => put('starcurves', S.starCurves), 3000);   // batch cache writes
+  saveTimer ??= setTimeout(() => { saveTimer = null; put('starcurves', S.starCurves); }, 2500);   // batch cache writes
+}
+
+/** Drops queued items no longer in the DOM and picks a currently visible card first. */
+function nextFromQueue() {
+  if (typeof document === 'undefined') return queue.shift();
+  const vh = window.innerHeight || 800, byKey = new Map();
+  for (const el of document.querySelectorAll('.activity[data-sh]')) {
+    const k = key(el.dataset.sh), r = el.getBoundingClientRect();
+    const vis = r.bottom >= -300 && r.top <= vh + 300;
+    if (!byKey.has(k) || vis) byKey.set(k, vis);
+  }
+  for (let i = queue.length - 1; i >= 0; i--) {
+    const k = key(queue[i]);
+    if (!byKey.has(k)) { queue.splice(i, 1); pending.delete(k); }
+  }
+  if (!queue.length) return null;
+  const vi = queue.findIndex(f => byKey.get(key(f)));
+  return queue.splice(vi >= 0 ? vi : 0, 1)[0];
 }
 
 function pump() {
   while (active < CONCURRENCY && queue.length) {
-    const full = queue.shift();
+    const full = nextFromQueue();
+    if (!full) break;
     active++;
     load(full).catch(() => { /* malformed or unavailable chart: leave it uncached for a later render */ })
       .finally(() => { active--; pending.delete(key(full)); pump(); });

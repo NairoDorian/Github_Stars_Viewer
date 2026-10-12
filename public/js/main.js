@@ -10,11 +10,11 @@
 //   discover.js  themes, suggestions, star buttons
 //   token.js     the 🔑 token panel
 //   starhistory.js  star history charts from star-history.com (lazy, cached)
-import {S, ukey} from './state.js';
+import {S, ukey, nextGen} from './state.js';
 import {$, ago, status} from './util.js';
 import {get, saveConfig, initStore, setBrowserCache, CACHE_VERSION} from './store.js';
 import {task, waitIdle, sync, enrich, indexReadmes, migrateReadmes} from './sync.js';
-import {render, initList} from './list.js';
+import {render, initList, resetFilters} from './list.js';
 import {initDiscover, closeDiscover} from './discover.js';
 import {initToken} from './token.js';
 
@@ -30,7 +30,8 @@ function parseUser(v) {
 async function load() {
   const u = parseUser($('#user').value);
   if (!u) return status('⚠ Enter a GitHub username or profile URL.');
-  const g = ++S.gen;          // running jobs see the new generation and stop without saving
+  const prevUser = S.user.toLowerCase();
+  const g = nextGen();          // running jobs see the new generation and abort without saving
   S.user = u;
   $('#user').value = u;
   history.replaceState(null, '', '?user=' + encodeURIComponent(u));
@@ -39,6 +40,7 @@ async function load() {
   const [stars, disc] = await Promise.all([get('stars:' + ukey()), get('discover:' + ukey())]);
   if (g !== S.gen) return;
   if (stars && stars.v > CACHE_VERSION) status('⚠ This cache was written by a newer version of the app.');
+  if (prevUser && prevUser !== u.toLowerCase()) resetFilters();
   S.repos = stars?.repos || [];
   S.starPages = stars?.pages || [];
   S.readmes = {};
