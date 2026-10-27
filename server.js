@@ -1,13 +1,24 @@
 // Stars Viewer local server (no dependencies).
 //   • serves the app from ./public
-//   • stores the cache as JSON files in ./data   (GET/PUT /cache/<key>)
-// Run:  node server.js [--open]      then open http://localhost:8787   (PORT env var to change the port)
-const http = require('http'), fs = require('fs'), fsp = fs.promises, path = require('path'), {exec} = require('child_process');
+//   • stores the cache as JSON files in ./data   (GET/PUT /cache/<key>; big files gzip-compressed, writes are atomic)
+//   • only answers this app: Host / Origin / Sec-Fetch-Site checks keep other web pages from reading your cached token
+// Run:  node server.js [--open]      then open http://localhost:8787   (PORT env var to change the port, STARS_DATA the data folder)
+const http = require('http'), fs = require('fs'), fsp = fs.promises, path = require('path'), zlib = require('zlib'), {exec} = require('child_process');
+const {promisify} = require('util'), gzip = promisify(zlib.gzip), gunzip = promisify(zlib.gunzip);
+
+// Cache files of 64 KB or more are stored gzip-compressed (JSON text shrinks ~3-4x). The file keeps its .json name; a
+// read checks for the gzip signature, so plain files written by older versions still load.
+const GZIP_MIN = 64 * 1024;
+const readCache = async file => {
+  const d = await fsp.readFile(file);
+  return d[0] === 0x1f && d[1] === 0x8b ? gunzip(d) : d;
+};
 
 const PORT = Number(process.env.PORT) || 8787;
-const ROOT = __dirname, PUBLIC = path.join(ROOT, 'public'), DATA = path.join(ROOT, 'data');
+const ROOT = __dirname, PUBLIC = path.join(ROOT, 'public');
+const DATA = process.env.STARS_DATA ? path.resolve(process.env.STARS_DATA) : path.join(ROOT, 'data');   // STARS_DATA: tests use a temp folder
 const URL_ = `http://localhost:${PORT}`;
-const MAX_BODY = 200 * 1024 * 1024;   // largest cache file accepted (the README cache is ~10-20 MB)
+const MAX_BODY = 1024 * 1024 * 1024;   // largest cache file accepted (READMEs ~10-20 MB; commit messages and release notes can reach a few hundred MB)
 const TYPES = {'.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
   '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon'};
 fs.mkdirSync(DATA, {recursive: true});
@@ -38,7 +49,7 @@ function save(file, buf) {
       const data = pendingBuf.get(file);
       pendingBuf.delete(file);
       const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-      await fsp.writeFile(tmp, data);
+      await fsp.writeFile(tmp, data.length >= GZIP_MIN ? await gzip(data) : data);
       for (let i = 0; ; i++) {   // Windows may briefly lock a file that's being read (EPERM/EBUSY): retry
         try { await fsp.rename(tmp, file); break; }
         catch (e) {
@@ -52,6 +63,9 @@ function save(file, buf) {
   next.finally(() => { if (queues.get(file) === next && !pendingBuf.has(file)) queues.delete(file); }).catch(() => {});
   return next;
 }
+
+/** Resolves when every queued cache write has finished, so a delete can't be undone by a write still in flight. */
+const settled = () => Promise.all([...queues.values()].map(p => p.catch(() => {})));
 
 async function readBody(req) {
   const chunks = []; let size = 0;
@@ -71,22 +85,36 @@ async function handle(req, res) {
   if (!trusted(req)) return send(res, 403, 'Forbidden');
   const url = new URL(req.url, URL_);
 
+  // DELETE /cache: forget everything (every cache file in ./data), for the app's "Clear cache" button.
+  if (url.pathname === '/cache' || url.pathname === '/cache/') {
+    if (req.method !== 'DELETE') return send(res, 405, 'method not allowed', undefined, {Allow: 'DELETE'});
+    await settled();
+    let deleted = 0;
+    for (const f of await fsp.readdir(DATA)) {
+      if (/\.json(\.\d+\.\d+\.tmp)?$/.test(f)) { await fsp.rm(path.join(DATA, f), {force: true}); deleted++; }
+    }
+    return send(res, 200, JSON.stringify({deleted}), 'application/json');
+  }
+
   if (url.pathname.startsWith('/cache/')) {
-    const key = decodeURIComponent(url.pathname.slice(7));
+    let key;
+    try { key = decodeURIComponent(url.pathname.slice(7)); } catch { return send(res, 400, 'bad key'); }
     if (!KEY.test(key)) return send(res, 400, 'bad key');
     const file = dataFile(key);
     if (req.method === 'GET') {
       await queues.get(file)?.catch(() => {});   // never read while a write is pending
-      const d = await fsp.readFile(file).catch(() => null);
-      return d ? send(res, 200, d, 'application/json') : send(res, 404, 'null', 'application/json');
+      const d = await readCache(file).catch(() => null);
+      return send(res, 200, d || 'null', 'application/json');   // a missing key is "no data yet", not an error (a cold load reads ~260 keys)
     }
     if (req.method === 'PUT') { await save(file, await readBody(req)); return send(res, 204); }
-    return send(res, 405, 'method not allowed', undefined, {Allow: 'GET, PUT'});
+    if (req.method === 'DELETE') { await settled(); await fsp.rm(file, {force: true}); return send(res, 204); }
+    return send(res, 405, 'method not allowed', undefined, {Allow: 'GET, PUT, DELETE'});
   }
 
   if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, 'method not allowed');
   // Static files from ./public (path traversal outside it is impossible: resolved path must stay inside PUBLIC).
-  const rel = url.pathname === '/' ? 'index.html' : decodeURIComponent(url.pathname).replace(/^\/+/, '');
+  let rel;
+  try { rel = url.pathname === '/' ? 'index.html' : decodeURIComponent(url.pathname).replace(/^\/+/, ''); } catch { return send(res, 400, 'bad path'); }
   const file = path.resolve(PUBLIC, rel);
   if (!file.startsWith(PUBLIC + path.sep)) return send(res, 404, 'not found');
   const d = await fsp.readFile(file).catch(() => null);

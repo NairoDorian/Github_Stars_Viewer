@@ -20,6 +20,6 @@ for (const [label, args, input] of files) {
 }
 if (!process.exitCode) {
   console.log(`Syntax OK: ${files.length} files`);
-  const testRun = spawnSync(process.execPath, ['--test', join(__dirname, 'test.mjs')], {stdio: 'inherit'});
+  const testRun = spawnSync(process.execPath, ['--test', ...readdirSync(__dirname).filter(f => /^test.*\.mjs$/.test(f)).map(f => join(__dirname, f))], {stdio: 'inherit'});
   if (testRun.status !== 0) process.exitCode = testRun.status || 1;
 }

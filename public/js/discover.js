@@ -10,7 +10,7 @@
      down, and a fork doesn't get credit for README text it inherited from its parent.
   Starred and dismissed (✕) repos are always excluded. The optional fork filter excludes GitHub-marked forks
   from cached results and new searches. Results are cached for 3 days in data/discover_<user>.json. */
-import {S, ukey, readmeText, readmeLower, starredSet, starredIds} from './state.js';
+import {S, ukey, rkey, readmeText, readmeLower, starredSet, starredIds} from './state.js';
 import {$, DAY, esc, escRe, ago, status, tally} from './util.js';
 import {gh, ghSearch, repoMeta, repoCardDetails, repoSortDetails, mapStar, whoAmI, setStar, needToken} from './github.js';
 import {saveDisc, saveStars} from './store.js';
@@ -384,7 +384,7 @@ function suggestionRepo(x) {
     stars: x.stargazers_count, forks: x.forks_count, issues: x.open_issues_count, lang: x.language,
     topics: x.topics || [], license: typeof x.license === 'string' ? x.license : x.license?.spdx_id,
     archived: x.archived, fork: x.fork, branch: x.branch || x.default_branch, created: x.created_at, pushed: x.pushed_at,
-    release: x.release, releaseAt: x.releaseAt, commitAt: x.commitAt, activity: x.activity, langs: x.langs};
+    release: x.release, releaseAt: x.releaseAt, releasePre: x.releasePre, releaseLatest: x.releaseLatest, commitAt: x.commitAt, activity: x.activity, langs: x.langs};
 }
 
 // Exact dates for the whole result pool are only needed for these two choices.
@@ -451,7 +451,7 @@ function showResults(id) {
 /** Hydrate only the cards on screen, then persist those details with the discovery result. */
 let cardBusy = false, activeCardId = null, waitingCardId = null;
 async function fillCardDetails(id, onScreen) {
-  const need = onScreen.filter(c => c.x.cardDetailsVersion !== 2);
+  const need = onScreen.filter(c => c.x.cardDetailsVersion !== 3);
   if (!S.token || !need.length) return;
   if (cardBusy) { if (id !== activeCardId) waitingCardId = id; return; }
   cardBusy = true;
@@ -463,7 +463,7 @@ async function fillCardDetails(id, onScreen) {
     if (g !== S.gen) return;
     for (const c of need) {
       const d = found.get(c.x.full_name.toLowerCase());
-      if (d) { Object.assign(c.x, d, {cardDetailsVersion: 2}); updated = true; }
+      if (d) { Object.assign(c.x, d, {cardDetailsVersion: 3}); updated = true; }
     }
     if (updated) await saveDisc(g);
   } catch (e) { if (g === S.gen && current === id) status('⚠ Could not load suggestion card details: ' + e.message); }
@@ -473,7 +473,7 @@ async function fillCardDetails(id, onScreen) {
   if ((updated || refreshWaiting) && current && !busy && g === S.gen) showResults(current);
 }
 
-export function overviewHTML() {
+function overviewHTML() {
   const repos = S.hideForks ? S.repos.filter(r => !r.fork) : S.repos;
   const bars = (list, explore = false) => {
     const top = list.slice(0, 10), max = Math.max(1, ...top.map(([, c]) => c));
@@ -618,7 +618,7 @@ export function initDiscover() {
     if (current) showResults(current);
   });
   window.addEventListener('suggest-for', e => {   // "✨ Show suggestions" on a repo card (list.js)
-    const repo = S.repos.find(r => r.id === e.detail);
+    const repo = S.repos.find(r => rkey(r) === e.detail);
     if (repo) exploreRepo(repo);
   });
   $('#insights').addEventListener('click', async e => {

@@ -249,6 +249,15 @@ const observer = typeof IntersectionObserver !== 'undefined' && new Intersection
   }
 }, {rootMargin: '300px'});
 
+/** Drops queued chart loads and the pending cache write (after "Clear cache": nothing may be written afterwards). */
+export function forgetStarCharts() {
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  queue.length = 0;
+  pending.clear();
+  failedAt.clear();
+}
+
 /** Starts watching every activity block under `root`; their star history loads when they come into view. */
 export function watchStarCharts(root) {
   if (!observer || !root) return;

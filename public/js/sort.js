@@ -1,5 +1,7 @@
 // One set of ordering rules for starred repos and discovery results.
-// Missing dates and counts sort after known values, with a stable name tie-breaker.
+// Missing dates and counts sort after known values, with a stable name tie-breaker. "Last commit" uses the commit date
+// and falls back to the last push only while that date isn't fetched (the card then says "last push"); "Last release"
+// is the newest release by date, pre-releases included, like the card's tile.
 export const SORT_OPTIONS = [
   ['relevance', 'Best match'],
   ['starred', 'Recently starred'],

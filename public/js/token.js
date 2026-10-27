@@ -29,7 +29,7 @@ async function checkToken() {
 }
 
 /** Opens or closes the panel. `remember` saves the choice; panels opened automatically aren't remembered. */
-export function openTokenPanel(open, remember = false) {
+function openTokenPanel(open, remember = false) {
   const p = $('#tokenPanel');
   p.classList.toggle('show', open);
   $('#tpToggle').setAttribute('aria-expanded', String(open));
@@ -37,12 +37,14 @@ export function openTokenPanel(open, remember = false) {
   if (open) { checkToken(); p.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
 }
 
-function setToken(value) {
+/** Sets (or, with '', removes) the token everywhere: state, input, button, saved config (unless `save` is false, as when
+ *  everything was just erased), rate-limit summary. */
+export function setToken(value, {save = true} = {}) {
   S.token = value.trim();
   $('#token').value = S.token;
   $('#tokenBtn').textContent = S.token ? '🔑 Token' : '🔑 Add token';
   forgetMe();
-  saveConfig();
+  if (save) saveConfig();
   checkToken();
 }
 

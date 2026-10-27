@@ -1,6 +1,6 @@
 // GitHub API access: REST + GraphQL, with retries, rate-limit handling and data mapping.
 import {S, genSignal} from './state.js';
-import {sleep, pool, chunks} from './util.js';
+import {DAY, sleep, pool, chunks} from './util.js';
 
 const API = 'https://api.github.com';
 
@@ -25,7 +25,7 @@ export async function ghFetch(url, init = {}, tries = 3) {
     try { r = await fetch(url.startsWith('http') ? url : API + url, sig ? {...init, signal: sig} : init); }
     catch (e) {
       if (sig?.aborted) throw e;
-      if (i >= tries - 1) throw new Error('Network error: are you online?');
+      if (i >= tries - 1) throw new Error('Network error (offline, or GitHub timed out or cut the answer)');
       await sleep(500 * 2 ** i, sig);
       if (sig?.aborted) throw new DOMException('Aborted', 'AbortError');
       continue;
@@ -41,14 +41,16 @@ export async function ghFetch(url, init = {}, tries = 3) {
   }
 }
 
+/** " (resets 14:05)" from a rate-limited response, when GitHub says when. */
+const resetNote = r => { const t = r.headers.get('x-ratelimit-reset'); return t ? ` (resets ${new Date(t * 1000).toLocaleTimeString()})` : ''; };
+
 /** REST GET. Throws on auth / rate-limit / unexpected errors; returns the response for 2xx, 304 and 404. */
 export async function gh(path, extraHeaders) {
   const r = await ghFetch(path, {headers: headers(extraHeaders)});
   if (r.status === 401) { needToken(); throw new Error('Token rejected by GitHub. Update it in the 🔑 panel.'); }
   if (r.status === 429 || (r.status === 403 && r.headers.get('x-ratelimit-remaining') === '0')) {
     if (!S.token) needToken();
-    const reset = r.headers.get('x-ratelimit-reset');
-    throw new Error('Rate limited' + (S.token ? '' : ', add a token') + (reset ? ` (resets ${new Date(reset * 1000).toLocaleTimeString()})` : ''));
+    throw new Error('Rate limited' + (S.token ? '' : ', add a token') + resetNote(r));
   }
   if (!r.ok && r.status !== 404 && r.status !== 304) throw new Error('GitHub ' + r.status);
   return r;
@@ -58,7 +60,12 @@ export async function gh(path, extraHeaders) {
 export async function gql(query) {
   const r = await ghFetch('/graphql', {method: 'POST', headers: headers(), body: JSON.stringify({query})});
   if (r.status === 401) { needToken(); throw new Error('Token rejected by GitHub. Update it in the 🔑 panel.'); }
-  if (!r.ok) throw new Error('GraphQL ' + r.status + (r.status === 403 ? ' (rate limited)' : ''));
+  if (r.status === 403 || r.status === 429) {
+    if (r.headers.get('x-ratelimit-remaining') === '0') throw new Error('GraphQL rate limit reached' + resetNote(r));   // used up: ends the run
+    // Still has budget: GitHub's secondary limit ("slow down", too many requests at once). Callers may wait and retry.
+    throw Object.assign(new Error('GitHub asked to slow down (secondary limit)'), {secondary: true});
+  }
+  if (!r.ok) throw new Error('GraphQL ' + r.status);
   const body = await r.json();
   if (!body.data) throw new Error('GraphQL: ' + (body.errors?.[0]?.message || 'no data'));
   return body.data;
@@ -67,6 +74,20 @@ export async function gql(query) {
 /** One aliased `repository(...)` block for batched GraphQL queries. */
 export const repoQ = (alias, owner, name, fields) =>
   `${alias}:repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){${fields}}`;
+
+/**
+ * One GraphQL call about many repositories. Repository j of `items` comes back as `data['r' + j]` (null when GitHub
+ * omits it: private, deleted, timed out). `fields` is a selection string, or a function (item, j) → selection;
+ * `nameOf(item)` → [owner, name] (default: items are {owner, name} objects).
+ */
+export const gqlRepos = (items, fields, nameOf = r => [r.owner, r.name]) =>
+  gql('query{' + items.map((it, j) => repoQ('r' + j, ...nameOf(it), typeof fields === 'function' ? fields(it, j) : fields)).join(' ') + '}');
+
+/** "owner/name" → [owner, name], for gqlRepos over lists of full names. */
+export const splitFull = full => full.split('/');
+
+/** An error that makes every further request pointless (bad token, rate limit): jobs stop instead of retrying. */
+export const isFatalError = e => /token|rate limit/i.test(e?.message || '');
 
 /** REST "starred" item (star+json media type) → the compact repo shape stored in the cache. */
 export const mapStar = ({starred_at, repo: x}) => ({
@@ -98,7 +119,7 @@ export async function repoMeta(fulls) {
   const fields = 'databaseId nameWithOwner description stargazerCount forkCount createdAt pushedAt isArchived isFork url homepageUrl owner{login avatarUrl} licenseInfo{spdxId} primaryLanguage{name} repositoryTopics(first:12){nodes{topic{name}}}';
   await pool(chunks(fulls, 40), 4, async batch => {
     let data;
-    try { data = await gql('query{' + batch.map((f, j) => { const [o, n] = f.split('/'); return repoQ('r' + j, o, n, fields); }).join(' ') + '}'); }
+    try { data = await gqlRepos(batch, fields, splitFull); }
     catch { return; }   // best effort: suggestions just have fewer candidates
     batch.forEach((f, j) => {
       const d = data['r' + j]; if (!d) return;
@@ -145,9 +166,9 @@ export function activityNow(a) {
 /* Star activity fallback when the external whole-life chart is unavailable: every check already downloads each repo's
    current star count, and one sample per day is kept in `r.starHist` = [[dayTimestamp, count], …] (≤ 400 days).
    The fallback shows gains between local samples; it fills in as the app is used. */
-const DAY_MS = 864e5, MAX_SAMPLES = 400;
+const MAX_SAMPLES = 400;
 export function recordStars(hist, count, now = Date.now()) {
-  const day = Math.floor(now / DAY_MS) * DAY_MS, h = hist ? [...hist] : [];
+  const day = Math.floor(now / DAY) * DAY, h = hist ? [...hist] : [];
   if (h.length && h.at(-1)[0] === day) h[h.length - 1] = [day, count]; else h.push([day, count]);
   return h.length > MAX_SAMPLES ? h.slice(-MAX_SAMPLES) : h;
 }
@@ -159,32 +180,49 @@ export function starGains(hist, now = Date.now()) {
   const first = hist[0][0];
   for (let i = 0; i < ACTIVITY_BUCKETS; i++) if (start + (i + 1) * ACTIVITY_SPAN > first) counts[i] = 0;
   for (let i = 1; i < hist.length; i++) {   // spread each gain over its days, then add to buckets
-    const [t0, c0] = hist[i - 1], [t1, c1] = hist[i], days = Math.max(1, Math.round((t1 - t0) / DAY_MS)), per = (c1 - c0) / days;
+    const [t0, c0] = hist[i - 1], [t1, c1] = hist[i], days = Math.max(1, Math.round((t1 - t0) / DAY)), per = (c1 - c0) / days;
     for (let d = 0; d < days; d++) {
-      const t = t0 + (d + 0.5) * DAY_MS, k = Math.floor((t - start) / ACTIVITY_SPAN);
+      const t = t0 + (d + 0.5) * DAY, k = Math.floor((t - start) / ACTIVITY_SPAN);
       if (k >= 0 && k < ACTIVITY_BUCKETS) counts[k] = (counts[k] ?? 0) + per;
     }
   }
   return counts.map(v => v == null ? null : Math.round(v));
 }
 
+/* "Last commit" and "last release" shown on every tile.
+   Commit: the committer date of the default branch's head. Release: the NEWEST release by publish date, pre-releases
+   included, drafts skipped (GitHub's `latestRelease` is only its "Latest" badge: it can be an older version, e.g. a
+   backport line, and ignores pre-release-only repos). The 5 most recently created releases are compared by publish date.
+   `release` is null when the repo has none and undefined while not fetched yet. */
+export const LAST_FIELDS = 'lastCommit:defaultBranchRef{target{...on Commit{committedDate}}} ' +
+  'releases(first:5,orderBy:{field:CREATED_AT,direction:DESC}){nodes{tagName publishedAt createdAt isPrerelease isDraft}} latestRelease{tagName}';
+export function parseLast(d) {
+  let best = null, bestT = -Infinity;
+  for (const n of d?.releases?.nodes || []) {
+    const t = Date.parse(n.publishedAt || n.createdAt);
+    if (!n.isDraft && t > bestT) { bestT = t; best = n; }
+  }
+  const latest = d?.latestRelease?.tagName || null;
+  return {commitAt: d?.lastCommit?.target?.committedDate || null,
+    release: best ? best.tagName : null, releaseAt: best ? best.publishedAt || best.createdAt : null, releasePre: !!best?.isPrerelease,
+    releaseLatest: best && latest && latest !== best.tagName ? latest : null};   // GitHub's "Latest" when it differs
+}
+
 /** Full card details for visible suggestions. Details are saved with the discovery result. */
 export async function repoCardDetails(fulls) {
   const out = new Map();
   if (!S.token) return out;
-  const end = Date.now(), fields = LANG_FIELDS + ' ' + activityFields(end) +
-    ' lastCommit:defaultBranchRef{target{...on Commit{committedDate}}} latestRelease{tagName publishedAt}' +
+  const end = Date.now(), fields = LANG_FIELDS + ' ' + activityFields(end) + ' ' + LAST_FIELDS +
     ' forkCount createdAt pushedAt homepageUrl licenseInfo{spdxId} owner{login avatarUrl} issues(states:OPEN){totalCount}';
   await pool(chunks(fulls, 10), 6, async batch => {
     let data;
-    try { data = await gql('query{' + batch.map((f, j) => { const [o, n] = f.split('/'); return repoQ('r' + j, o, n, fields); }).join(' ') + '}'); }
+    try { data = await gqlRepos(batch, fields, splitFull); }
     catch { return; }
     batch.forEach((f, j) => {
       const d = data['r' + j];
       if (!d) return;
-      out.set(f.toLowerCase(), {langs: languageShares(d.languages), activity: parseActivity(d, end),
-        commitAt: d.lastCommit?.target?.committedDate || null, release: d.latestRelease?.tagName || null,
-        releaseAt: d.latestRelease?.publishedAt || null, forks_count: d.forkCount, created_at: d.createdAt,
+      out.set(f.toLowerCase(), {langs: languageShares(d.languages), activity: parseActivity(d, end), ...parseLast(d),
+        forks_count: d.forkCount, created_at: d.createdAt,
         pushed_at: d.pushedAt, homepage: d.homepageUrl, license: d.licenseInfo?.spdxId || null,
         open_issues_count: d.issues?.totalCount, owner: d.owner ? {login: d.owner.login, avatar_url: d.owner.avatarUrl} : null});
     });
@@ -196,15 +234,12 @@ export async function repoCardDetails(fulls) {
 export async function repoSortDetails(fulls) {
   const out = new Map();
   if (!S.token) return out;
-  const fields = 'lastCommit:defaultBranchRef{target{...on Commit{committedDate}}} latestRelease{tagName publishedAt}';
+  const fields = LAST_FIELDS;
   await pool(chunks(fulls, 40), 6, async batch => {
     let data;
-    try { data = await gql('query{' + batch.map((f, j) => { const [o, n] = f.split('/'); return repoQ('r' + j, o, n, fields); }).join(' ') + '}'); }
+    try { data = await gqlRepos(batch, fields, splitFull); }
     catch { return; }
-    batch.forEach((f, j) => { const d = data['r' + j]; if (d) out.set(f.toLowerCase(), {
-      commitAt: d.lastCommit?.target?.committedDate || null,
-      release: d.latestRelease?.tagName || null, releaseAt: d.latestRelease?.publishedAt || null,
-    }); });
+    batch.forEach((f, j) => { const d = data['r' + j]; if (d) out.set(f.toLowerCase(), parseLast(d)); });
   });
   return out;
 }

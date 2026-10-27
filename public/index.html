@@ -35,17 +35,58 @@
 <script>if (location.protocol === 'file:') document.getElementById('fileWarning').hidden = false;</script>
 
 <div class="bar">
-  <label><input type="checkbox" id="inReadme"> Search in READMEs</label>
-  <label title="Hide repositories that GitHub marks as forks in your stars and Discover suggestions"><input type="checkbox" id="hideForks"> Hide forks</label>
-  <label id="cacheToggle" hidden title="Online only. On: stars, READMEs, suggestions and your token are stored in this browser (IndexedDB), so reloads are instant. Off: nothing is stored, data lives in this tab only."><input type="checkbox" id="browserCache"> 💾 Keep cache in this browser</label>
-  <button id="indexReadme">Index READMEs</button>
-  <button id="enrich">Fetch releases &amp; commits</button>
-  <button id="toggleInsights">🧭 Discover &amp; suggestions</button>
-  <button id="refresh">Check for updates</button>
-  <button id="tokenBtn">🔑 Token</button>
-  <button id="toggleFacets" aria-controls="facets" title="Hide or show the Languages / Topics / Owners filters">◧ Hide filters</button>
-  <span id="status" role="status"></span>
+  <div class="grp" role="group" aria-label="Search in">
+    <span class="grp-label">Search in</span>
+    <label title="Also search the text of every indexed README"><input type="checkbox" id="inReadme"> READMEs <span class="muted" id="cntReadme"></span></label>
+    <label title="Also search every commit message and release note. Click &quot;Index commits &amp; releases&quot; first."><input type="checkbox" id="inHistory"> Commits &amp; releases <span class="muted" id="cntHistory"></span></label>
+  </div>
+  <div class="grp" role="group" aria-label="Index">
+    <span class="grp-label">Index</span>
+    <button id="indexReadme" title="Downloads the README of every starred repo so the search can look inside them">Index READMEs</button>
+    <span class="split">
+      <button id="indexHistory" title="Downloads every commit message and release note of every starred repo (needs a token), so the search can look inside them. Later checks only fetch what is new.">Index commits &amp; releases</button>
+      <button id="histOptsToggle" class="caret" aria-expanded="false" aria-controls="histOpts" title="Options for the commit &amp; release index" aria-label="Commit and release index options">▾</button>
+    </span>
+    <span id="histOptsSummary" class="muted small"></span>
+    <button id="enrich" title="Last commit and last release of every repo (shown on the cards and used by the Last commit / Last release sorting). Kept up to date automatically when you have a token.">Refresh latest tiles</button>
+  </div>
+  <div class="grp" role="group" aria-label="View">
+    <span class="grp-label">View</span>
+    <label title="Hide repositories that GitHub marks as forks in your stars and Discover suggestions"><input type="checkbox" id="hideForks"> Hide forks</label>
+    <button id="toggleInsights">🧭 Discover &amp; suggestions</button>
+    <button id="toggleFacets" aria-controls="facets" title="Hide or show the Languages / Topics / Owners filters">◧ Hide filters</button>
+  </div>
+  <div class="grp" role="group" aria-label="Data">
+    <span class="grp-label">Data</span>
+    <button id="refresh">Check for updates</button>
+    <button id="tokenBtn">🔑 Token</button>
+    <label id="cacheToggle"><input type="checkbox" id="browserCache"> <span id="cacheLabel">💾 Keep cache</span></label>
+    <button id="clearCache" title="Deletes ALL stored data: stars, READMEs, commits &amp; releases, suggestions, star charts, preferences and your token, from the local server's data folder, this browser's storage and this tab.">🗑 Clear cache</button>
+  </div>
+  <div class="statusrow">
+    <button id="cancelTask" hidden title="Stop after the current batch; what was fetched so far is kept and the next run continues from there">■ Cancel</button>
+    <span id="status" role="status"></span>
+  </div>
 </div>
+
+<div id="lanes" hidden role="group" aria-label="Progress of the running task"></div>
+
+<section id="histOpts" hidden aria-label="Commit and release index options">
+  <h3>Commit &amp; release index options</h3>
+  <div class="opt-grid">
+    <label title="Removes @username mentions from release notes (credits, “by @user”, contributor lists). Code, e-mail addresses and scoped packages like @types/node are left alone. Applied to stored notes at once."><input type="checkbox" id="optMentions"> Strip @mentions from release notes</label>
+    <label title="Removes links from release notes (markdown links keep their text). Leave off to keep links searchable: after compression they cost little."><input type="checkbox" id="optLinks"> Strip links from release notes</label>
+    <label>Release notes length
+      <select id="optNotes" aria-label="Release notes length"><option value="3000">3,000 characters</option><option value="6000">6,000 characters</option><option value="12000">12,000 characters</option><option value="0">Entire notes (no limit)</option></select></label>
+    <label>Commits per repo
+      <select id="optCommits" aria-label="Commits per repo"><option value="2000">2,000 newest</option><option value="10000">10,000 newest</option><option value="25000">25,000 newest</option><option value="0">ALL commits (no limit)</option></select></label>
+  </div>
+  <p id="optNote" class="muted small"></p>
+  <p id="optStats" class="muted small"></p>
+  <div class="opt-actions">
+    <button id="optClear" title="Deletes the stored commit messages and release notes of this profile (the next index downloads them again)">Clear commit &amp; release index</button>
+  </div>
+</section>
 
 <section id="tokenPanel">
   <div class="tp-head" id="tpToggle" role="button" tabindex="0" aria-expanded="false" aria-controls="tpBody">
@@ -53,17 +94,17 @@
     <span class="muted tp-hint">click to show / hide</span>
   </div>
   <div class="tp-body" id="tpBody">
-    <p class="muted">Without a token GitHub allows only <b>60 requests/hour</b>, which isn't enough to index READMEs or fetch releases. With a token you get <b>5,000/hour</b>.</p>
+    <p class="muted">Without a token GitHub allows only <b>60 requests/hour</b>, which isn't enough to index READMEs, commits or releases. With a token you get <b>5,000/hour</b>.</p>
     <ol class="muted">
       <li>Open <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a> (fine-grained) or <a href="https://github.com/settings/tokens/new?description=Stars%20Viewer" target="_blank" rel="noopener">tokens/new</a> (classic).</li>
       <li>Set an expiration and pick the permissions/scopes (see below), then generate the token.</li>
-      <li>Paste it below and click <b>Save &amp; check</b>. Where it's kept: running locally, in <code>data/config.json</code> next to the app;
-        online, in this browser only if <b>💾 Keep cache in this browser</b> is on (otherwise it's forgotten when you close the tab).
+      <li>Paste it below and click <b>Save &amp; check</b>. Where it's kept: only in this tab, unless <b>💾 Keep cache</b> is on; then in <code>data/config.json</code> next to the app when running locally,
+        or in this browser online. Without it the token is forgotten when you close the tab.
         It's only ever sent to api.github.com.</li>
     </ol>
     <div class="tp-note">
       <b>Which permissions or scopes?</b><br>
-      • <b>Browse, search, READMEs, releases, suggestions:</b> no permissions or scopes needed (public repositories only).<br>
+      • <b>Browse, search, READMEs, commits, releases, suggestions:</b> no permissions or scopes needed (public repositories only).<br>
       • <b>☆ Star buttons in suggestions</b> (star on GitHub from this page): with a <b>fine-grained token</b>, set <b>Account permissions → Starring: Read and write</b> (no repo write access needed); with a <b>classic token</b>, tick <b>public_repo</b>.
     </div>
     <div class="tp-row">

@@ -17,7 +17,8 @@ const {detectThemes, keywordMembers, collector} = await import('../public/js/dis
 const {migrateReadmes, needsEnrich, needsReadme} = await import('../public/js/sync.js');
 const {card, languagesHTML, activityHTML, parseQuery, match} = await import('../public/js/list.js');
 import {spawn} from 'node:child_process';
-import {rmSync} from 'node:fs';
+import {rmSync, readFileSync, writeFileSync, mkdtempSync, readdirSync} from 'node:fs';
+import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 
 test('util: esc, safeUrl, fmtN, ago, tally, chunks, pool, sleep', async () => {
@@ -193,7 +194,7 @@ test('sync & list: migrateReadmes, needsEnrich, card rendering, and activityHTML
   const repo = {
     id: 42, full: 'owner/demo', name: 'demo', owner: 'owner', url: 'https://github.com/owner/demo',
     about: 'Demo <script> repo', topics: ['cli'], stars: 120, forks: 5, issues: 2, lang: 'Go',
-    pushed: '2026-10-01T00:00:00Z', enrichedPushed: '2026-10-01T00:00:00Z', enrichedAt: now,
+    pushed: '2026-10-01T00:00:00Z', enrichedPushed: '2026-10-01T00:00:00Z', enrichedAt: now, release: null, releasePre: false,
     langs: [['Go', 99.2, '#00ADD8'], ['Shell', 0.05, 'javascript:bad']],
     activity: {end: now, counts: Array(26).fill(1)},
     starHist: [[now - 14 * DAY, 100], [now, 120]],
@@ -204,6 +205,7 @@ test('sync & list: migrateReadmes, needsEnrich, card rendering, and activityHTML
   assert.equal(S.readmes['42']?.t, 'Custom README text');
   assert.equal(S.readmes['owner/demo'], undefined);
   assert.equal(needsEnrich(repo), false);
+  assert.equal(needsEnrich({...repo, releasePre: undefined}), true, 'details fetched before releases were taken by date are refreshed once');
   assert.equal(needsReadme(repo), false);
 
   // Sanitize invalid language color and escape HTML in card
@@ -241,13 +243,26 @@ test('list: parseQuery and match support exact phrases, negation, and qualifiers
   assert.equal(match(r, parseQuery('lang:rust'), false), null);             // wrong language
   assert.equal(match(r, parseQuery('stars:<500'), false), null);            // star threshold not met
   assert.equal(match(r, parseQuery('is:archived'), false), null);           // not archived
+
+  // A quote still being typed is ignored instead of making the search match nothing.
+  assert.deepEqual(parseQuery('"android').inc, ['android']);
+  assert.deepEqual(parseQuery('-"flutter').exc, ['flutter']);
+  assert.deepEqual(parseQuery('"').inc, []);
+  assert.ok(match(r, parseQuery('"android'), false));
+
+  // Languages arrive after the first render (details check): the cached search text must pick them up.
+  const late = {id: 8, full: 'a/late', name: 'late', owner: 'a', about: 'x', topics: [], lang: 'Go'};
+  assert.equal(match(late, parseQuery('zig'), false), null);
+  late.langs = [['Go', 90, null], ['Zig', 10, null]];
+  assert.ok(match(late, parseQuery('zig'), false), 'language names from the breakdown become searchable without a new sync');
 });
 
 test('server.js: static serving, HEAD, cache PUT/GET, and DNS-rebinding / cross-origin protection', async () => {
   const port = 18780 + Math.floor(Math.random() * 1000);
   const testKey = '__test_suite_tmp__';
-  const testFile = join(process.cwd(), 'data', `${testKey}.json`);
-  const proc = spawn(process.execPath, ['server.js'], {env: {...process.env, PORT: String(port)}, stdio: ['ignore', 'pipe', 'pipe']});
+  const dataDir = mkdtempSync(join(tmpdir(), 'stars-viewer-test-'));   // never the real ./data: this test deletes cache files
+  const testFile = join(dataDir, `${testKey}.json`);
+  const proc = spawn(process.execPath, ['server.js'], {env: {...process.env, PORT: String(port), STARS_DATA: dataDir}, stdio: ['ignore', 'pipe', 'pipe']});
   try {
     await new Promise((resolve, reject) => {
       const t = setTimeout(() => reject(new Error('server startup timeout')), 3000);
@@ -272,6 +287,36 @@ test('server.js: static serving, HEAD, cache PUT/GET, and DNS-rebinding / cross-
     assert.equal(getRes.status, 200);
     assert.deepEqual(await getRes.json(), {hello: 'world', count: 42});
 
+    // Big cache files are stored gzip-compressed on disk and read back transparently; plain legacy files still load.
+    const big = {rows: Array.from({length: 4000}, (_, i) => ({i, text: 'commit message number ' + i}))};
+    assert.equal((await fetch(`${base}/cache/${testKey}`, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(big)})).status, 204);
+    const onDisk = readFileSync(testFile);
+    assert.equal(onDisk[0] === 0x1f && onDisk[1] === 0x8b, true, 'stored gzip-compressed');
+    assert.ok(onDisk.length < JSON.stringify(big).length / 3, 'and much smaller');
+    assert.deepEqual(await (await fetch(`${base}/cache/${testKey}`)).json(), big);
+    writeFileSync(testFile, JSON.stringify({legacy: true}));
+    assert.deepEqual(await (await fetch(`${base}/cache/${testKey}`)).json(), {legacy: true});
+    assert.equal((await fetch(`${base}/cache/%E0%A4%A`)).status, 400, 'a malformed URL is a 400, not a 500');
+
+    // A missing key is "no data yet" (200 null), not an error.
+    const missing = await fetch(`${base}/cache/__nothing_here__`);
+    assert.equal(missing.status, 200);
+    assert.equal(await missing.json(), null);
+
+    // DELETE removes one key, or everything (all cache files of the data folder, nothing else).
+    await fetch(`${base}/cache/a:one`, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: '{"x":1}'});
+    await fetch(`${base}/cache/a:two`, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: '{"x":2}'});
+    assert.equal((await fetch(`${base}/cache/a:one`, {method: 'DELETE'})).status, 204);
+    assert.equal(await (await fetch(`${base}/cache/a:one`)).json(), null);
+    assert.deepEqual(await (await fetch(`${base}/cache/a:two`)).json(), {x: 2});
+    writeFileSync(join(dataDir, 'notes.txt'), 'not a cache file');
+    const wiped = await fetch(`${base}/cache`, {method: 'DELETE'});
+    assert.equal(wiped.status, 200);
+    assert.ok((await wiped.json()).deleted >= 2);
+    assert.deepEqual(readdirSync(dataDir), ['notes.txt'], 'every cache file is gone, other files are left alone');
+    assert.equal((await fetch(`${base}/cache`, {method: 'GET'})).status, 405);
+    assert.equal((await fetch(`${base}/cache`, {method: 'DELETE', headers: {Origin: 'https://evil.example'}})).status, 403, 'other sites can not wipe the cache');
+
     // Cross-site Origin / Sec-Fetch-Site must be rejected with 403
     const evilOrigin = await fetch(`${base}/cache/${testKey}`, {headers: {Origin: 'https://evil.example'}});
     assert.equal(evilOrigin.status, 403);
@@ -279,7 +324,7 @@ test('server.js: static serving, HEAD, cache PUT/GET, and DNS-rebinding / cross-
     assert.equal(evilFetchSite.status, 403);
   } finally {
     proc.kill();
-    rmSync(testFile, {force: true});
+    rmSync(dataDir, {recursive: true, force: true});
   }
 });
 
