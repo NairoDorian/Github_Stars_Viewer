@@ -2,6 +2,10 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<!-- This page holds a GitHub token: scripts run only from this site (plus the file:// notice below, by its hash: update the
+     hash if that script changes, scripts/test.mjs checks it), and data can only go to GitHub's API, star-history.com and
+     the local cache server. Images: avatars only. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-k1A5qNFUqVrpB1hNfK1c+he6YCBpVuq3ZwnrhZcYW4g='; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://*.githubusercontent.com; connect-src 'self' https://api.github.com https://api.star-history.com; object-src 'none'; base-uri 'none'; form-action 'self'">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Stars Viewer</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='14' fill='%23e3b341'%3E%E2%98%85%3C/text%3E%3C/svg%3E">
@@ -13,7 +17,7 @@
   <h1>★ Stars Viewer</h1>
   <input id="user" placeholder="GitHub username or profile URL" size="28" aria-label="GitHub user">
   <button class="primary" id="load">Load stars</button>
-  <input id="q" type="search" placeholder="Search name, about, topics, &quot;exact phrase&quot;, -exclude, lang:rust, stars:>1000…  (/ to focus)" title="Supports &quot;exact phrases&quot;, -excluded terms, and qualifiers: lang:, owner:, topic:, is:active, is:archived, is:fork, stars:>1000" aria-label="Search">
+  <input id="q" type="search" placeholder="Search name, about, topics, &quot;exact phrase&quot;, -exclude, lang:rust, stars:>1000…  (/ to focus)" title="Supports &quot;exact phrases&quot;, -excluded terms, and qualifiers: lang:, owner:, topic:, is:active, is:archived, is:fork, stars:>1000, stars:>=1k, stars:10..500" aria-label="Search">
   <select id="sort" aria-label="Sort"></select><!-- options come from SORT_OPTIONS in js/sort.js (filled by initList) -->
 </header>
 

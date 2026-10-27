@@ -5,20 +5,37 @@
 // Run:  node server.js [--open]      then open http://localhost:8787   (PORT env var to change the port, STARS_DATA the data folder)
 const http = require('http'), fs = require('fs'), fsp = fs.promises, path = require('path'), zlib = require('zlib'), {exec} = require('child_process');
 const {promisify} = require('util'), gzip = promisify(zlib.gzip), gunzip = promisify(zlib.gunzip);
+const {MAX_STRING_LENGTH} = require('buffer').constants;
+
+// Windows may briefly lock a file that another program (virus scanner, indexer) or a rename is touching: retry those.
+const LOCKED = new Set(['EBUSY', 'EPERM', 'EACCES']);
+const pause = ms => new Promise(r => setTimeout(r, ms));
 
 // Cache files of 64 KB or more are stored gzip-compressed (JSON text shrinks ~3-4x). The file keeps its .json name; a
 // read checks for the gzip signature, so plain files written by older versions still load.
+// Only a missing file means "nothing stored yet" (null). Any other failure (a damaged file, a file still locked) throws, so
+// the app marks the key unreadable instead of building an empty replacement and saving it over the real data.
 const GZIP_MIN = 64 * 1024;
-const readCache = async file => {
-  const d = await fsp.readFile(file);
-  return d[0] === 0x1f && d[1] === 0x8b ? gunzip(d) : d;
-};
+async function readCache(file) {
+  for (let i = 0; ; i++) {
+    try {
+      const d = await fsp.readFile(file);
+      return d[0] === 0x1f && d[1] === 0x8b ? await gunzip(d) : d;
+    } catch (e) {
+      if (e.code === 'ENOENT') return null;
+      if (i >= 5 || !LOCKED.has(e.code)) throw e;
+      await pause(50 * (i + 1));
+    }
+  }
+}
 
 const PORT = Number(process.env.PORT) || 8787;
 const ROOT = __dirname, PUBLIC = path.join(ROOT, 'public');
 const DATA = process.env.STARS_DATA ? path.resolve(process.env.STARS_DATA) : path.join(ROOT, 'data');   // STARS_DATA: tests use a temp folder
 const URL_ = `http://localhost:${PORT}`;
-const MAX_BODY = 1024 * 1024 * 1024;   // largest cache file accepted (READMEs ~10-20 MB; commit messages and release notes can reach a few hundred MB)
+// Largest cache file accepted: a bigger body could not even be read as one string to check it is JSON. In practice the
+// READMEs file is ~10-20 MB and commit messages / release notes are split into 256 shards of a few MB each.
+const MAX_BODY = MAX_STRING_LENGTH;
 const TYPES = {'.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
   '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon'};
 fs.mkdirSync(DATA, {recursive: true});
@@ -41,11 +58,11 @@ const trusted = req => ALLOWED_HOSTS.has(req.headers.host) &&
 async function writeAtomic(file, data) {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   await fsp.writeFile(tmp, data.length >= GZIP_MIN ? await gzip(data) : data);
-  for (let i = 0; ; i++) {   // Windows may briefly lock a file that's being read (EPERM/EBUSY): retry
+  for (let i = 0; ; i++) {   // the target may be locked for a moment (see LOCKED): retry
     try { await fsp.rename(tmp, file); return; }
     catch (e) {
       if (i >= 10) { await fsp.rm(tmp, {force: true}); throw e; }
-      await new Promise(r => setTimeout(r, 50 * (i + 1)));
+      await pause(50 * (i + 1));
     }
   }
 }
@@ -111,7 +128,7 @@ async function handle(req, res) {
     const file = dataFile(key);
     if (req.method === 'GET') {
       await queues.get(file)?.catch(() => {});   // never read while a write is pending
-      const d = await readCache(file).catch(() => null);
+      const d = await readCache(file);   // a failed read is a 500 (see readCache)
       return send(res, 200, d || 'null', 'application/json');   // a missing key is "no data yet", not an error (a cold load reads ~260 keys)
     }
     if (req.method === 'PUT') { await save(file, await readBody(req)); return send(res, 204); }

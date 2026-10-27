@@ -12,6 +12,7 @@ Object.defineProperty(globalThis, 'localStorage', {
 const {S, nextGen} = await import('../public/js/state.js');
 const {indexReadmes, needsReadme, enrich} = await import('../public/js/sync.js');
 const {gitSha} = await import('../public/js/github.js');
+const store = await import('../public/js/store.js');
 /** Sets each file's `oid` to the real git blob hash of its text, as GitHub reports it. */
 const hashed = async files => { for (const f of Object.values(files)) f.oid = await gitSha(f.text); return files; };
 
@@ -148,7 +149,7 @@ test('refreshing the tiles when no README is indexed never shows a README step',
   const realFetch = globalThis.fetch;
   try {
     fakeGitHub(await hashed({'o/a': {text: '# a'}, 'o/b': {text: '# b'}}));
-    S.token = 'tok'; S.readmes = {}; S.history = {};
+    S.user = 'tilesonly'; S.token = 'tok'; S.readmes = {}; S.history = {};
     S.repos = [repo(21, 'o/a'), repo(22, 'o/b')];
     const g = nextGen();
     await enrich(g);   // fetches the details
@@ -156,5 +157,7 @@ test('refreshing the tiles when no README is indexed never shows a README step',
     await new Promise(resolve => setTimeout(resolve, 150));   // the panel redraws a moment later
     assert.ok(els['#lanes'].innerHTML.includes('data-lane="details"'));
     assert.ok(!els['#lanes'].innerHTML.includes('data-lane="readmes"'));
-  } finally { globalThis.fetch = realFetch; delete globalThis.document; S.token = ''; S.readmes = {}; S.repos = []; }
+    // A job that never touched READMEs doesn't write them: an empty copy saved here could replace the real file.
+    assert.equal(await store.get('readmes:tilesonly'), null);
+  } finally { globalThis.fetch = realFetch; delete globalThis.document; S.user = ''; S.token = ''; S.readmes = {}; S.repos = []; }
 });

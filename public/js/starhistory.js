@@ -241,10 +241,12 @@ function pump() {
   }
 }
 
+const watched = new Set();   // chart elements being observed; the ones a re-render removed are let go (see watchStarCharts)
 const observer = typeof IntersectionObserver !== 'undefined' && new IntersectionObserver(entries => {
   for (const e of entries) {
     if (!e.isIntersecting) continue;
     observer.unobserve(e.target);
+    watched.delete(e.target);
     const full = e.target.dataset.sh, k = key(full);
     if (fresh(curveFor(full)) || recentlyFailed(k) || pending.has(k)) continue;
     pending.add(k); queue.push(full); pump();
@@ -264,8 +266,10 @@ export function forgetStarCharts() {
 /** Starts watching every activity block under `root`; their star history loads when they come into view. */
 export function watchStarCharts(root) {
   if (!observer || !root) return;
+  // Every render replaces the cards: stop observing the old ones, or the observer would collect them on each keystroke.
+  for (const el of watched) if (!el.isConnected) { observer.unobserve(el); watched.delete(el); }
   for (const el of root.querySelectorAll('.activity[data-sh]')) {
     const full = el.dataset.sh;
-    if (!fresh(curveFor(full)) && !recentlyFailed(key(full))) observer.observe(el);
+    if (!fresh(curveFor(full)) && !recentlyFailed(key(full))) { observer.observe(el); watched.add(el); }
   }
 }

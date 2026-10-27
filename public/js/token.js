@@ -37,10 +37,25 @@ function openTokenPanel(open, remember = false) {
   if (open) { checkToken(); p.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
 }
 
+/** A token as pasted: line breaks and spaces picked up while copying are dropped. GitHub tokens are plain ASCII; anything
+ *  else (the "…" of a placeholder, an invisible character) can't even be sent in a request header, which would show up
+ *  as a confusing network error on every request. Returns {token} or {token: '', error}. */
+export function cleanToken(value) {
+  const token = String(value ?? '').replace(/\s+/g, '');
+  return /^[\x21-\x7e]*$/.test(token) ? {token}
+    : {token: '', error: '⚠ This token has characters a GitHub token never has (copied with “…” or an invisible character?). Paste it again.'};
+}
+
 /** Sets (or, with '', removes) the token everywhere: state, input, button, saved config (unless `save` is false, as when
- *  everything was just erased), rate-limit summary. */
+ *  everything was just erased), rate-limit summary. An unusable token is refused and the current one kept. */
 export function setToken(value, {save = true} = {}) {
-  S.token = value.trim();
+  const {token, error} = cleanToken(value);
+  if (error) {
+    $('#tpSummary').textContent = '· ⚠ invalid token';
+    $('#limit').textContent = error;
+    return;
+  }
+  S.token = token;
   $('#token').value = S.token;
   $('#tokenBtn').textContent = S.token ? '🔑 Token' : '🔑 Add token';
   forgetMe();
@@ -49,6 +64,7 @@ export function setToken(value, {save = true} = {}) {
 }
 
 export function initToken(token) {
+  token = cleanToken(token).token;   // a token stored by an older version is checked the same way
   S.token = token;
   $('#token').value = token;
   $('#tokenBtn').textContent = token ? '🔑 Token' : '🔑 Add token';

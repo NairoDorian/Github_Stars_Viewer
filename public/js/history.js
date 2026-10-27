@@ -137,8 +137,10 @@ export function historyTotals() {
  * Are the stored releases still the repo's releases? Same count and same newest release (tag, created, updated). Records
  * written before `updatedAt` was tracked have a two-part key: they match on the two parts they have.
  */
-const sameReleases = (rec, c) => rec.relN === c.relN &&
-  (rec.relTop === c.relTop || (rec.relTop.split('|').length === 2 && c.relTop.startsWith(rec.relTop + '|')));
+const sameReleases = (rec, c) => {
+  const top = rec.relTop || '';
+  return rec.relN === c.relN && (top === c.relTop || (top.split('|').length === 2 && c.relTop.startsWith(top + '|')));
+};
 
 /**
  * Brings stored records in line with the options. Stripping more and shorter caps are applied to the stored text right
@@ -163,7 +165,12 @@ export function reconcile(o = histOpts()) {
       }
     } else if (have !== flags) patch.ro = flags;
     if (rec.c?.length > lim(o.commits)) { patch.c = rec.c.slice(0, o.commits); patch.capped = true; patch.done = true; out.trimmed++; }
-    else if (rec.capped && rec.done && lim(o.commits) > rec.c.length) { delete S.history[k]; markHistory(k); out.restart++; continue; }
+    else if (rec.capped && rec.done && lim(o.commits) > (rec.c?.length || 0)) {
+      // The cap went up: the commits are walked again from the head (a cut-off record has no exact place to continue
+      // from). Its release notes stay.
+      Object.assign(patch, {head: null, tail: null, c: [], done: false, capped: false, at: 0});
+      out.restart++;
+    }
     if (Object.keys(patch).length) { S.history[k] = {...rec, ...patch}; markHistory(k); }
   }
   if (out.stripped || out.refetch || out.trimmed || out.restart) bumpIndex();
@@ -299,7 +306,7 @@ function planStage(checks) {
   for (const [r, c] of checks) {
     const k = rkey(r), rec = S.history[k];
     const needRel = !rec || !sameReleases(rec, c) || now - (rec.relAt || rec.at || 0) > RELEASES_MAX_AGE + spread(r);
-    const job = {r, k, c, failed: false, needRel,
+    const job = {r, k, c, failed: false, needRel, relDone: false,
       needNew: !!c.head && (!rec || rec.head !== c.head), needOld: !!c.head && !!rec && rec.head === c.head && !rec.done};
     if (!c.head && !rec?.done) set(k, {head: null, tail: null, c: [], done: true});   // empty repository
     if (job.needRel || job.needNew || job.needOld) { jobs.push(job); continue; }
@@ -332,6 +339,7 @@ async function releaseStage(run, jobs) {
       t.nodes.push(...rel.nodes.filter(n => !n.isDraft));
       if (rel.pageInfo.hasNextPage && t.nodes.length < MAX_RELEASES) { t.after = rel.pageInfo.endCursor; queue.push(t); return; }
       set(t.job.k, {rel: t.nodes.slice(0, MAX_RELEASES).map(n => toRelease(n, run.o)), relN: t.job.c.relN, relTop: t.job.c.relTop, relAt: Date.now(), ro: flags});
+      t.job.relDone = true;
       done++;
     });
     status(`Fetching release notes… ${done}/${total} repos`);
@@ -351,8 +359,8 @@ const commitPage = t => `object(expression:${JSON.stringify(t.oid)}){...on Commi
  *  `start` stored commits, from the commit `base`: a first walk, or the rest of an unfinished one). */
 function newWalker(job) {
   const rec = S.history[job.k], w = {job, k: job.k, over: false, dead: false};
-  if (job.needNew && rec?.c.length) return Object.assign(w, {kind: 'join', old: rec, known: new Set(rec.c.map(e => e[0])), fresh: [], head: null, from: null, lastOid: null});
-  return startBulk(w, job.c.head, job.needNew ? 0 : rec.c.length);
+  if (job.needNew && rec?.c?.length) return Object.assign(w, {kind: 'join', old: rec, known: new Set(rec.c.map(e => e[0])), fresh: [], head: null, from: null, lastOid: null});
+  return startBulk(w, job.c.head, job.needNew ? 0 : rec?.c?.length || 0);
 }
 const startBulk = (w, base, start) => Object.assign(w, {kind: 'bulk', base, start, count: start, next: start, want: Infinity, total: null,
   fast: false, pages: new Map(), acc: [], lastOid: null, done: false, capped: false, final: false, gen: (w.gen || 0) + 1});
@@ -372,10 +380,10 @@ function syncRecord(w) {
   if (w.done) w.final = true;
 }
 
-/** Fetches the commit messages of the repos in `jobs`. Returns how many repos are unfinished. */
 /** How far along a walker is, 0..1: the share of its commits stored, so the bar moves page by page (big repos weigh what they cost). */
 const fractionOf = w => w.over ? 1 : w.kind === 'bulk' && Number.isFinite(w.want) && w.want > 0 ? Math.min(0.99, w.count / w.want) : 0;
 
+/** Fetches the commit messages of the repos in `jobs`. Returns how many repos are unfinished. */
 async function commitStage(run, jobs) {
   const items = jobs.filter(j => j.needNew || j.needOld).map(newWalker), queue = items.map(firstTask);
   const total = items.length, t0 = Date.now(), c0 = historyTotals().commits;
@@ -409,9 +417,9 @@ async function commitStage(run, jobs) {
     const cursorOk = !t.seq && h.pageInfo.endCursor === `${w.base} ${t.off + nodes.length - 1}`;
     if (t.first) {
       if (t.off > 0 && !cursorOk) { w.gen++; queue.push(seqTask(w)); return; }   // resumed with a cursor we built and GitHub didn't confirm
-      w.fast = cursorOk;
       w.total = h.totalCount ?? null;
-      w.want = w.fast && w.total != null ? Math.min(w.total, lim(run.o.commits)) : lim(run.o.commits);
+      w.fast = cursorOk && w.total != null;   // without a count there is no end to queue pages up to ("no limit" would never stop)
+      w.want = w.fast ? Math.min(w.total, lim(run.o.commits)) : lim(run.o.commits);
       if (w.fast) for (let off = t.off + COMMIT_PAGE; off < w.want; off += COMMIT_PAGE) queue.push({item: w, oid: w.base, after: `${w.base} ${off - 1}`, off, gen: w.gen});
     } else if (!t.seq && !cursorOk) {   // a parallel page disagreed about offsets: distrust them all, go on one page at a time
       w.fast = false; w.gen++; w.pages.clear();
@@ -431,7 +439,8 @@ async function commitStage(run, jobs) {
   };
 
   await pump(run, queue, {parallel: COMMIT_PARALLEL, batch: COMMIT_BATCH}, async batch => {
-    const live = batch.filter(t => !t.item.dead);
+    // Not sent: pages of an abandoned walk, and pages queued before a walk fell back to one page at a time (older gen).
+    const live = batch.filter(t => !t.item.dead && (t.gen == null || t.gen === t.item.gen));
     if (!live.length) return;
     let data;
     try { data = await gqlRun(run, live, commitPage, jobRepo); }
@@ -473,12 +482,13 @@ export async function syncHistory(g, repos, {force = false} = {}) {
   const left = await Promise.all([releaseStage(run, jobs), commitStage(run, jobs)]);   // the two stages run at the same time
   if (g !== S.gen) return {summary: ''};
 
-  // A repo is marked as checked only when every part of it succeeded; anything else is looked at again next time.
+  // A repo is marked as checked only when every part of it succeeded (its commits walked to the end, its releases fetched
+  // if they had to be); anything else, e.g. releases cut short by Cancel, is looked at again next time.
   const stamp = Date.now();
   let failed = 0;
   for (const j of jobs) {
     if (j.failed) failed++;
-    else if (!run.fatal && S.history[j.k]?.done) { Object.assign(S.history[j.k], {at: stamp, pushed: j.r.pushed}); markHistory(j.k); }
+    else if (!run.fatal && S.history[j.k]?.done && (!j.needRel || j.relDone)) { Object.assign(S.history[j.k], {at: stamp, pushed: j.r.pushed}); markHistory(j.k); }
   }
   await flush(run, true);
   const t = historyTotals(), skipped = run.skipped + failed;

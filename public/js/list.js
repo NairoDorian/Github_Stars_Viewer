@@ -48,18 +48,29 @@ export function parseQuery(raw) {
   return {inc, exc, quals, hasQuery: inc.length > 0 || exc.length > 0 || quals.length > 0};
 }
 
+/** "1500", "1.5k", "2m" → a number; NaN when it isn't one. */
+const count = s => {
+  const m = s.match(/^(\d+(?:\.\d+)?)([km]?)$/);
+  return m ? Number(m[1]) * ({k: 1e3, m: 1e6}[m[2]] || 1) : NaN;
+};
+/** Does the qualifier hold for this repo? null when it can't be understood (e.g. "is:foo", "stars:lots"): such a
+ *  qualifier is ignored instead of hiding every repo, with or without a "-" in front. */
 function checkQual(r, {k, v}) {
   if (k === 'lang' || k === 'language') return (r.lang || '').toLowerCase() === v || (r.langs || []).some(([n]) => n.toLowerCase() === v);
   if (k === 'owner' || k === 'user') return (r.owner || '').toLowerCase() === v;
   if (k === 'topic' || k === 'tag') return (r.topics || []).some(t => t.toLowerCase() === v);
-  if (k === 'is') return v === 'archived' ? !!r.archived : v === 'active' ? !r.archived : v === 'fork' ? !!r.fork : true;
-  if (k === 'stars') {
-    const m = v.match(/^(>=|<=|>|<|=)?(\d+)$/);
-    if (!m) return true;
-    const op = m[1] || '=', n = Number(m[2]), s = r.stars ?? 0;
+  if (k === 'is') return v === 'archived' ? !!r.archived : v === 'active' ? !r.archived : v === 'fork' ? !!r.fork : null;
+  if (k === 'stars') {   // GitHub's forms: stars:>1000, stars:>=1k, stars:10..500, stars:100..*, stars:*..50
+    const s = r.stars ?? 0, range = v.split('..');
+    if (range.length === 2) {
+      const lo = range[0] === '*' ? -Infinity : count(range[0]), hi = range[1] === '*' ? Infinity : count(range[1]);
+      return Number.isNaN(lo) || Number.isNaN(hi) ? null : s >= lo && s <= hi;
+    }
+    const m = v.match(/^(>=|<=|>|<|=)?(.+)$/), n = count(m[2]), op = m[1] || '=';
+    if (Number.isNaN(n)) return null;
     return op === '>' ? s > n : op === '>=' ? s >= n : op === '<' ? s < n : op === '<=' ? s <= n : s === n;
   }
-  return true;
+  return null;
 }
 
 const MAX_SNIPS = 4;
@@ -75,7 +86,7 @@ const around = (text, term) => {
  *  different place. Returns {snips} or null; snips explain the terms that matched only inside a README, a commit
  *  message or a release note (one line per source, newest commit / release first, at most MAX_SNIPS). */
 export function match(r, q, inReadme, inHistory = false) {
-  for (const qual of q.quals) if (checkQual(r, qual) === qual.neg) return null;
+  for (const qual of q.quals) { const ok = checkQual(r, qual); if (ok !== null && ok === qual.neg) return null; }
   for (const t of q.exc) if (hay(r).includes(t) || (inReadme && readmeLower(r).includes(t)) || (inHistory && inHistoryText(r, t))) return null;
   const snips = [];
   for (const t of q.inc) {
@@ -296,7 +307,26 @@ export function resetFilters() {
   shown.clear();
 }
 
-let currentMatches = [];
+// What the list on screen was rendered from: the matches in order ({r, snips}) and the highlight. "Show more" adds the
+// next cards from it instead of searching and drawing the whole list again; export downloads it.
+let shownMatches = [], shownRe = null;
+
+/** The "Show more (N left)" button under the list, hidden when every match is on screen. */
+function moreButton() {
+  const left = shownMatches.length - limit, more = $('#more');
+  more.hidden = left <= 0;
+  if (left > 0) more.textContent = `Show more (${left} left)`;
+}
+
+/** Appends the next PAGE cards of the matches already on screen. */
+function showMore() {
+  if ($('#more').hidden) return;
+  const from = limit;
+  limit += PAGE;
+  $('#list').insertAdjacentHTML('beforeend', shownMatches.slice(from, limit).map(x => card(x.r, {snips: x.snips, re: shownRe})).join(''));
+  moreButton();
+  watchStarCharts($('#list'));
+}
 
 export function render() {
   const rawQ = $('#q').value;
@@ -319,7 +349,8 @@ export function render() {
     if (okLang && okTopic && okOwner) out.push({r, snips: m.snips});
   }
   sortRepos(out, $('#sort').value, 'name');
-  currentMatches = out.map(x => x.r);
+  shownMatches = out;
+  shownRe = re;
 
   const pills = [['lang', 'Language'], ['topic', 'Topic'], ['owner', 'Owner']]
     .filter(([k]) => filters[k])
@@ -329,9 +360,7 @@ export function render() {
   $('#count').innerHTML = `<span>${out.length} of ${S.repos.length} repos${filtered ? ' (filtered)' : ''}</span>` +
     (pills.length ? ` <span class="active-filters">${pills.join('')}<button class="clear-filters" data-clear-filters title="Clear active filters">Clear</button></span>` : '') + exportBtns;
   $('#list').innerHTML = out.slice(0, limit).map(x => card(x.r, {snips: x.snips, re})).join('');
-  const left = out.length - limit, more = $('#more');
-  more.hidden = left <= 0;   // everything shown: no button at all
-  if (left > 0) more.textContent = `Show more (${left} left)`;
+  moreButton();
   indexCounts();
   renderFacets({forLang, forTopic, forOwner}, `${rawQ.trim().toLowerCase()}\0${inReadme ? 1 : 0}${inHistory ? 1 : 0}`);
   watchStarCharts($('#list'));
@@ -376,12 +405,14 @@ function renderFacets({forLang, forTopic, forOwner}, queryKey) {
 
 /** Downloads the currently shown (filtered and sorted) repositories as Markdown or JSON. */
 function exportMatches(fmt) {
-  if (!currentMatches.length) return;
+  const repos = shownMatches.map(x => x.r);
+  if (!repos.length) return;
   const user = S.user || 'github';
+  const oneLine = s => String(s).replace(/\s+/g, ' ').trim();   // a description with line breaks would end its list item
   const body = fmt === 'json'
-    ? JSON.stringify(currentMatches, null, 2)
-    : `# ★ ${user}'s Starred Repositories (${currentMatches.length})\n\n` +
-      currentMatches.map(r => `- **[${r.full}](${r.url})** (★ ${fmtN(r.stars)}${r.lang ? ` · ${r.lang}` : ''})${r.about ? ` — ${r.about}` : ''}`).join('\n') + '\n';
+    ? JSON.stringify(repos, null, 2)
+    : `# ★ ${user}'s Starred Repositories (${repos.length})\n\n` +
+      repos.map(r => `- **[${r.full}](${r.url})** (★ ${fmtN(r.stars)}${r.lang ? ` · ${r.lang}` : ''})${r.about ? ` — ${oneLine(r.about)}` : ''}`).join('\n') + '\n';
   const url = URL.createObjectURL(new Blob([body], {type: fmt === 'json' ? 'application/json' : 'text/markdown;charset=utf-8'}));
   const a = Object.assign(document.createElement('a'), {href: url, download: `stars-${user.toLowerCase()}.${fmt}`});
   document.body.append(a); a.click(); a.remove();
@@ -462,7 +493,6 @@ export function initList() {
   };
   $('#inReadme').onchange = () => { limit = PAGE; render(); };
   $('#inHistory').onchange = async e => { if (e.target.checked) await prepareHistorySearch(); limit = PAGE; render(); };
-  const showMore = () => { if (!$('#more').hidden) { limit += PAGE; render(); } };
   $('#more').onclick = showMore;
   // Infinite scroll: when the button comes near the viewport, load the next step automatically.
   if (typeof IntersectionObserver !== 'undefined')

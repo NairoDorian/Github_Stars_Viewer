@@ -12,7 +12,7 @@
   from cached results and new searches. Results are cached for 3 days in data/discover_<user>.json. */
 import {S, ukey, rkey, readmeText, readmeLower, starredSet, starredIds} from './state.js';
 import {$, DAY, esc, escRe, ago, status, tally} from './util.js';
-import {gh, ghSearch, repoMeta, repoCardDetails, repoSortDetails, mapStar, whoAmI, setStar, needToken} from './github.js';
+import {gh, ghSearch, repoMeta, repoCardDetails, repoSortDetails, mapStar, whoAmI, setStar, needToken, isFatalError} from './github.js';
 import {saveDisc, saveStars} from './store.js';
 import {render, searchFor, card} from './list.js';
 import {watchStarCharts} from './starhistory.js';
@@ -231,10 +231,15 @@ function exploreTheme(id, keys, members, opts = {}) {
     const hideForks = S.hideForks;
     const {add, finish} = collector(keys, hideForks), note = [];
     const page = depth + 1;
+    let fatal = false;   // a bad token or a used-up rate limit: the remaining searches would only fail the same way
     const step = async (label, fn) => {
-      if (!alive()) return;
+      if (fatal || !alive()) return;
       progress(depth ? `Finding more suggestions (round ${page})… ${label}` : label);
-      try { await fn(); } catch (e) { if (e?.name !== 'AbortError') note.push(`${label.replace(/…$/, '')}: ${e.message}`); }
+      try { await fn(); } catch (e) {
+        if (e?.name === 'AbortError') return;
+        note.push(`${label.replace(/…$/, '')}: ${e.message}`);
+        fatal = isFatalError(e);
+      }
     };
     const n = S.token ? 3 : 1;   // search API allows 30/min with a token, 10/min without
     // 1. Keyword searches: ask GitHub for non-forks directly when the filter is active.

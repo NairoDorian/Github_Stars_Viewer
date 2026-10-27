@@ -17,7 +17,7 @@ globalThis.window ??= {dispatchEvent() {}};   // a rate-limit error asks the pag
 globalThis.CustomEvent ??= class extends Event { constructor(type, init) { super(type); this.detail = init?.detail; } };   // Node 18 has none
 
 const {S, nextGen} = await import('../public/js/state.js');
-const {sync} = await import('../public/js/sync.js');
+const {sync, task} = await import('../public/js/sync.js');
 
 const PUSHED = '2026-01-01T00:00:00Z';
 /** A REST "starred" item (star+json media type). */
@@ -104,6 +104,21 @@ test('a repo cached before ids existed is matched by name and its README moves t
     assert.deepEqual(S.repos.map(r => r.id), [77]);
     assert.equal(S.readmes['77'].t, 'legacy text');
     assert.deepEqual(Object.keys(S.readmes), ['77']);
+  });
+});
+
+test('no job starts while the profile\'s cache is still being read (it would save half-loaded data over it)', async () => {
+  await check(async () => {
+    const calls = fakeStarList([star(1), star(2)]);
+    let loaded;
+    S.loading = new Promise(resolve => { loaded = resolve; });   // what load() does until READMEs and history are read
+    try {
+      await task(sync);   // "Check for updates" clicked meanwhile
+      assert.equal(calls.length, 0, 'nothing was fetched, so nothing could be saved');
+      assert.match(els['#status'].textContent, /Still reading the cached data/);
+    } finally { S.loading = null; loaded(); }
+    await task(sync);
+    assert.equal(S.repos.length, 2, 'once the cache is read, the job runs');
   });
 });
 

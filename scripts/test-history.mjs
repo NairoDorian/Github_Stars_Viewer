@@ -16,11 +16,12 @@ const {parseQuery, match, card} = await import('../public/js/list.js');
  *  history.js sends, including offset cursors ("<commit> <index>", counted from the commit the query starts at).
  *  `calls` counts them: check, releases, first (first page, asks totalCount), after (page at a cursor), seq (page from an
  *  explicit commit, no cursor). `state`: failAfter (answer "rate limit" after N queries), secondaryFor (answer the next N
- *  with a 403 "slow down"), delay (ms per query), maxInFlight (observed parallelism). `cursors`: 'ok' | 'opaque' (cursors
- *  carry no offsets) | 'lying' (cursors at an offset are wrong and so is the content). */
+ *  with a 403 "slow down"), delay (ms per query), maxInFlight (observed parallelism), releaseGate (a promise that pages of
+ *  releases wait for). `cursors`: 'ok' | 'opaque' (cursors carry no offsets) | 'lying' (cursors at an offset are wrong and
+ *  so is the content). */
 function fakeGitHub(repos, {cursors = 'ok'} = {}) {
   const calls = {check: 0, releases: 0, first: 0, after: 0, seq: 0};
-  const state = {failAfter: Infinity, queries: 0, secondaryFor: 0, delay: 0, inFlight: 0, maxInFlight: 0};
+  const state = {failAfter: Infinity, queries: 0, secondaryFor: 0, delay: 0, inFlight: 0, maxInFlight: 0, releaseGate: null};
   globalThis.fetch = async (url, init) => {
     const reply = (data, errors) => ({ok: true, status: 200, headers: new Headers(), json: async () => ({data, errors})});
     if (++state.queries > state.failAfter) return reply(null, [{message: 'API rate limit exceeded'}]);
@@ -29,6 +30,7 @@ function fakeGitHub(repos, {cursors = 'ok'} = {}) {
     try {
       if (state.delay) await new Promise(r => setTimeout(r, state.delay));
       const query = JSON.parse(init.body).query, data = {};
+      if (state.releaseGate && query.includes('releases(first:25')) await state.releaseGate;
       const starts = [...query.matchAll(/(r\d+):repository\(owner:"([^"]+)",name:"([^"]+)"\)\{/g)];
       starts.forEach((m, i) => {
         const body = query.slice(m.index + m[0].length, starts[i + 1]?.index ?? query.length);
@@ -195,6 +197,37 @@ test('if GitHub\'s cursors can not be trusted, the repo is fetched one page at a
       if (cursors === 'opaque') assert.equal(gh.calls.after, 0, 'no offset cursor was even tried');
     });
   }
+});
+
+test('after the fallback to one page at a time, the offset pages still waiting in the queue are never requested', async () => {
+  const repos = {'o/long': {commits: makeCommits(0, 12_000), releases: []}};
+  await withGitHub(repos, {cursors: 'lying'}, async (gh, g) => {
+    setHistOpts({commits: 0});   // no limit: 119 offset pages are queued at once
+    await syncHistory(g, S.repos, {force: true});
+    assert.deepEqual(S.history['500'].c.map(e => e[0]), oids(repos['o/long'].commits));
+    // 8 requests of 12 pages are in flight when the first wrong cursor comes back; the 23 pages still queued are dropped.
+    assert.ok(gh.calls.after <= 8 * 12, `offset pages requested: ${gh.calls.after} of 119`);
+  });
+});
+
+test('a repo is marked as checked only when its releases were fetched too (Cancel between two pages of releases)', async () => {
+  const releases = Array.from({length: 30}, (_, i) => release('v' + i, 'notes ' + i, String(10 + (i % 18))));
+  const repos = {'o/r': {commits: makeCommits(0, 5), releases}};
+  await withGitHub(repos, {}, async (gh, g) => {
+    let open;
+    gh.state.releaseGate = new Promise(resolve => { open = resolve; });
+    const run = syncHistory(g, S.repos, {force: true});
+    while (!S.history['500']?.done) await new Promise(resolve => setTimeout(resolve, 2));   // the commits are complete...
+    S.stop = true;   // ...and Cancel is clicked while the first page of releases is on its way
+    open();
+    try { await run; } finally { S.stop = false; }
+    assert.equal(S.history['500'].rel.length, 0, 'the second page of releases was never fetched');
+    assert.equal(needsHistory(S.repos[0]), true, 'so the repo is not stamped as checked: the next check finishes it');
+    gh.state.releaseGate = null;
+    await syncHistory(g, S.repos);   // an ordinary update check, not the toolbar button
+    assert.equal(S.history['500'].rel.length, 30);
+    assert.equal(needsHistory(S.repos[0]), false);
+  });
 });
 
 test('the commit cap and "no limit" decide how many pages are requested', async () => {
@@ -402,14 +435,18 @@ test('options: defaults keep links, notes are cleaned and capped, changes reconc
   S.history = {b: {c: [], rel: [['v1', '', 1, 'short', 0]], done: true, ro: 'm:1000'}, d: {c: [], rel: [['v1', '', 1, 'y'.repeat(1000), 0]], done: true, ro: 'm:1000'}};
   r = reconcile({mentions: true, links: false, notes: 6000});
   assert.deepEqual([r.refetch, S.history.b.ro, S.history.d.relN], [1, 'm:6000', -1]);
-  // Commit cap: lowering trims what is stored; raising it walks again only the repos that had been cut off.
-  S.history = {t: {c: Array.from({length: 5}, (_, i) => ['o' + i, i, 'm']), rel: [], done: true, capped: false, ro: optFlags(DEFAULT_OPTS)}};
+  // Commit cap: lowering trims what is stored; raising it walks again only the repos that had been cut off, keeping their
+  // release notes.
+  S.history = {t: {c: Array.from({length: 5}, (_, i) => ['o' + i, i, 'm']), rel: [['v1', '', 1, 'kept notes', 0]], relN: 1, relTop: 'v1|a|b', relAt: 5,
+    head: 'h', tail: 't', done: true, capped: false, ro: optFlags(DEFAULT_OPTS)}};
   reconcile({...DEFAULT_OPTS, commits: 3});
   assert.equal(S.history.t.c.length, 3);
   assert.equal(S.history.t.capped, true);
   r = reconcile({...DEFAULT_OPTS, commits: 10_000});
   assert.equal(r.restart, 1);
-  assert.equal(S.history.t, undefined);
+  const t = S.history.t;
+  assert.deepEqual([t.c, t.head, t.tail, t.done, t.capped], [[], null, null, false, false], 'the commits are walked again from the head');
+  assert.deepEqual([t.rel[0][3], t.relN, t.relTop, t.relAt], ['kept notes', 1, 'v1|a|b', 5], 'the release notes stay, and are not fetched again');
   // persisted in localStorage
   setHistOpts({links: true, notes: 3000});
   assert.deepEqual([histOpts().links, histOpts().notes, histOpts().mentions], [true, 3000, true]);

@@ -106,9 +106,9 @@ export const mapStar = ({starred_at, repo: x}) => ({
   archived: x.archived, fork: x.fork, created: x.created_at, pushed: x.pushed_at, starred: starred_at, branch: x.default_branch,
 });
 
-/** Repository search, most-starred first. `page` goes deeper into the results (GitHub serves up to 1000). */
+/** Repository search, most-starred first. `page` goes deeper into the results (GitHub serves the first 1000). */
 export async function ghSearch(q, perPage = 50, page = 1) {
-  if (perPage * page > 1000) return [];
+  if (perPage * (page - 1) >= 1000) return [];   // the page starts beyond result 1000 (a page that ends past it still has some)
   const r = await gh(`/search/repositories?q=${encodeURIComponent(q)}&sort=stars&order=desc&per_page=${perPage}&page=${page}`);
   return r.ok ? (await r.json()).items || [] : [];
 }

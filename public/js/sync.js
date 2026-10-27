@@ -9,7 +9,8 @@
       release: see parseLast in github.js) + languages + 12-month commit activity + README hash together.
    4. README hash equal to the cached one (or to the hash of the cached text) → no download. Only READMEs that really
       changed are downloaded, 10 per GraphQL call. Unusual README names/locations fall back to REST with ETags.
-   5. If commit messages / release notes were indexed, history.js tops them up (and refreshes every tile again, cheaply).
+   5. If commit messages / release notes were indexed, history.js tops them up (and refreshes the tiles of the repos it
+      checks, cheaply).
    A safety-net max age (spread per repo so they don't all expire the same day) re-checks things occasionally.
 
   Jobs run one at a time per tab (task) and per profile across tabs (a Web Lock). The Cancel button sets S.stop: a job
@@ -58,9 +59,11 @@ async function withLock(fn) {
   });
 }
 
-/** Runs job(gen) unless another job is running for the current profile. Errors end up in the status line.
+/** Runs job(gen) unless another job is running for the current profile, or the profile's cache is still being read
+ *  (the job would save half-loaded data over it). Errors end up in the status line.
  *  The Cancel button (S.stop) asks the job to save what it has and end. */
 export function task(job) {
+  if (S.loading) { status('⏳ Still reading the cached data, try again in a moment'); return Promise.resolve(); }
   if (running && runningGen === S.gen) { status('⏳ Busy with another task, please wait'); return running; }
   const g = S.gen, cancel = $('#cancelTask');
   runningGen = g;
@@ -278,7 +281,7 @@ async function refreshDetails(g, {wantReadmes, wantEnrich}) {
   const rest = viaRest.length && !fatal ? await restReadmes(g, viaRest, true, got) : null;   // `got`: already counted by the step's bar
   if (g !== S.gen) return {summary: ''};
   if (wantReadmes && !fatal && !S.stop) finish('readmes');   // otherwise it would keep ticking while commits are checked
-  await saveReadmes(g);
+  if (wantReadmes) await saveReadmes(g);   // a job that never touched READMEs doesn't rewrite them
   if (g !== S.gen) return {summary: ''};
   bumpIndex();
   render();

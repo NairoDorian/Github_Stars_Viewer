@@ -40,32 +40,41 @@ async function load() {
   const prevUser = S.user.toLowerCase();
   const g = nextGen();          // running jobs see the new generation and abort without saving
   forgetHistoryDirty();         // shards the previous profile had not saved yet must not be written for this one
+  // Until every part of the cache is read, S holds a mix of empty and loaded data: a job started now (a toolbar click)
+  // would save it over the real cache. task() refuses to start jobs meanwhile.
+  let loaded;
+  S.loading = new Promise(resolve => { loaded = resolve; });
   S.user = u;
   $('#user').value = u;
   history.replaceState(null, '', '?user=' + encodeURIComponent(u));
   saveConfig();
 
-  const [stars, disc] = await Promise.all([get('stars:' + ukey()), get('discover:' + ukey())]);
-  if (g !== S.gen) return;
-  if (stars && stars.v > CACHE_VERSION) status('⚠ This cache was written by a newer version of the app.');
-  if (prevUser && prevUser !== u.toLowerCase()) resetFilters();
-  S.repos = stars?.repos || [];
-  S.starPages = stars?.pages || [];
-  S.readmes = {};
-  S.history = {};
-  S.disc = disc || {dismissed: [], results: {}};
-  closeDiscover();
-  render();   // stars on screen now; the large README cache loads right after
-  status(stars ? `Cached ${ago(stars.at)} · ${S.repos.length} stars · checking for updates…`
-    : 'No cache for this user yet, downloading…' + (persisting() ? '' : ' (💾 Keep cache is off: nothing will be saved)'));
+  try {
+    const [stars, disc] = await Promise.all([get('stars:' + ukey()), get('discover:' + ukey())]);
+    if (g !== S.gen) return;
+    if (stars && stars.v > CACHE_VERSION) status('⚠ This cache was written by a newer version of the app.');
+    if (prevUser && prevUser !== u.toLowerCase()) resetFilters();
+    S.repos = stars?.repos || [];
+    S.starPages = stars?.pages || [];
+    S.readmes = {};
+    S.history = {};
+    S.disc = disc || {dismissed: [], results: {}};
+    closeDiscover();
+    render();   // stars on screen now; the large README cache loads right after
+    status(stars ? `Cached ${ago(stars.at)} · ${S.repos.length} stars · checking for updates…`
+      : 'No cache for this user yet, downloading…' + (persisting() ? '' : ' (💾 Keep cache is off: nothing will be saved)'));
 
-  const [readmes, commitHistory] = await Promise.all([get('readmes:' + ukey()), loadHistory(g)]);
-  if (g !== S.gen) return;
-  S.readmes = readmes || {};
-  S.history = commitHistory || {};
-  await reconcileStored(g);   // stored release notes follow the strip / length options
-  bumpIndex();
-  migrateReadmes();
+    const [readmes, commitHistory] = await Promise.all([get('readmes:' + ukey()), loadHistory(g)]);
+    if (g !== S.gen) return;
+    S.readmes = readmes || {};
+    S.history = commitHistory || {};
+    await reconcileStored(g);   // stored release notes follow the strip / length options
+    bumpIndex();
+    migrateReadmes();
+  } finally {
+    if (g === S.gen) S.loading = null;   // a newer load owns the flag now
+    loaded();
+  }
   if ($('#inHistory').checked) { await prepareHistorySearch(); if (g !== S.gen) return; }   // build the search text in slices, not in the first render
   if ($('#inReadme').checked || $('#inHistory').checked) render();
   // Show the new user's cache immediately. The old profile's network job can finish before this sync starts.
@@ -102,6 +111,7 @@ function initCacheToggle({serverUp, persistOn}) {
 /** Deletes ALL stored data (local server files, this browser's storage, preferences, this tab's state, the token). */
 async function clearEverything() {
   nextGen();   // jobs still running see a new generation and write nothing after the wipe
+  S.loading = null;     // a profile being read is abandoned: this tab is about to be empty, which is consistent
   forgetStarCharts();   // neither does a pending star-chart save
   const {files} = await clearAll();
   Object.assign(S, {repos: [], starPages: [], readmes: {}, history: {}, disc: {dismissed: [], results: {}}, starCurves: {}});

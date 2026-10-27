@@ -63,6 +63,7 @@ async function change(patch) {
   summary();
   const note = $('#optNote');
   note.textContent = 'Applying…';
+  while (S.loading) await S.loading;   // the records must be loaded before they can be changed
   await waitIdle();   // never edit records while an index run is writing them
   const o = histOpts(), g = S.gen, r = reconcile(o);
   if (g === S.gen) await saveHistory(g);
@@ -116,6 +117,7 @@ export function initHistOpts() {
     }
     clearTimeout(armed); armed = null;
     clear.textContent = 'Clear commit & release index'; clear.classList.remove('confirm');
+    if (S.loading) return status('⏳ Still reading the cached data, try again in a moment');   // the load would bring the index back
     await waitIdle();
     const g = S.gen;
     S.history = {};

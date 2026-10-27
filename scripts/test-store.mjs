@@ -144,6 +144,35 @@ test('a key that could not be read is never overwritten by what this tab holds; 
   assert.equal(store.isUnreadable('discover:nobody'), false);
 });
 
+test('a history save cut short by a profile switch leaves nothing to be written under the new profile', async () => {
+  jar.clear(); prefs.clear();
+  const srv = fakeServer();
+  const store = await freshStore();
+  await store.initStore();
+  await store.setPersist(true);
+  const {nextGen} = await import('../public/js/state.js');
+  S.user = 'old';
+  const g = nextGen();
+  S.history = {1: {c: [], rel: [], done: true}};
+  store.markAllHistory();
+  const serverFetch = globalThis.fetch;
+  let switched = false;
+  globalThis.fetch = async (url, init) => {
+    const answer = await serverFetch(url, init);
+    if (init?.method === 'PUT' && !switched) {   // what load() does when another profile is picked mid-save
+      switched = true;
+      S.user = 'new'; S.history = {};
+      nextGen(); store.forgetHistoryDirty();
+    }
+    return answer;
+  };
+  try {
+    assert.equal(await store.saveHistory(g), false, 'the old save stops');
+    assert.equal(store.historyDirty(), 0, 'and marks nothing for the new profile, whose shards are still being read');
+    assert.equal([...srv.files.keys()].filter(k => k.startsWith('history:new:')).length, 0);
+  } finally { globalThis.fetch = serverFetch; Object.assign(S, {user: '', history: {}}); }
+});
+
 test('shards the previous profile left unsaved are forgotten', async () => {
   const store = await freshStore();
   store.markHistory('123');

@@ -16,7 +16,7 @@ const CACHE_COOKIE = 'starsViewerCache';   // "1" = keep the cache, "0" = don't;
 const OLD_FLAG = 'starsViewer.browserCache';   // localStorage flag of earlier versions, read as a fallback
 
 let mode = 'memory', serverUp = false, persistOn = false;
-const mem = new Map();   // memory mode: the whole cache; browser mode: values already read or written (saves re-reading IndexedDB)
+const mem = new Map();   // memory mode: the whole cache; browser mode: a copy of what was read or written, kept when the cache is switched off
 // Keys whose stored copy could NOT be read (server hiccup, corrupt file, IndexedDB error). get() answers null for them like for
 // "nothing stored", so this tab would build a near-empty replacement; put() refuses to overwrite the real file with it.
 const unreadable = new Set();
@@ -29,7 +29,7 @@ function idb(txMode, fn) {
     r.onupgradeneeded = () => r.result.createObjectStore('kv');
     r.onsuccess = () => res(r.result);
     r.onerror = () => rej(r.error);
-  });
+  }).catch(e => { dbp = null; throw e; });   // a failed open is tried again by the next call, not remembered forever
   return dbp.then(db => new Promise((res, rej) => {
     const tx = db.transaction('kv', txMode), req = fn(tx.objectStore('kv'));
     tx.oncomplete = () => res(req?.result);
@@ -189,7 +189,7 @@ export async function saveHistory(g = S.gen, history = S.history) {
   for (const [k, rec] of Object.entries(history)) { const shard = shards.get(shardOf(k)); if (shard) shard[k] = rec; }
   let ok = true;
   for (const [i, data] of shards) {
-    if (g !== S.gen) { todo.forEach(x => dirtyShards.add(x)); return false; }
+    if (g !== S.gen) return false;   // another profile now: the rest belongs to the old one and is never written for the new one
     if (!(await put(`history:${user}:${i}`, data))) { dirtyShards.add(i); ok = false; }
   }
   return ok;

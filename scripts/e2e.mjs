@@ -22,6 +22,14 @@ const channel = process.env.E2E_CHANNEL === undefined ? 'chrome' : process.env.E
 const browser = await chromium.launch({channel});
 const context = await browser.newContext({viewport: {width: 1280, height: 900}});
 await context.addCookies([{name: 'starsViewerCache', value: '1', url: base}]);   // "Keep cache" is off unless the cookie says so
+// Every progress step the page showed, as "<step>:<state>", recorded as it appears: the panel hides itself a few seconds
+// after a job, which a slow test machine could miss. (Init scripts are injected by the browser, not limited by the CSP.)
+await context.addInitScript(() => {
+  const seen = window.__lanes = new Set();
+  new MutationObserver(() => { for (const el of document.querySelectorAll('#lanes .lane')) seen.add(`${el.dataset.lane}:${el.classList[1]}`); })
+    .observe(document, {subtree: true, childList: true});
+});
+const lanesSeen = () => page.evaluate(() => [...window.__lanes]);
 const page = await context.newPage();
 const errors = [];
 page.on('pageerror', e => errors.push('PAGEERROR ' + e.message));
@@ -93,7 +101,16 @@ await page.route('https://api.github.com/**', async r => {
 
 // ---- helpers ----
 const status = () => page.textContent('#status');
-const waitStatus = (re, timeout = 30000) => page.waitForFunction(s => new RegExp(s).test(document.querySelector('#status').textContent), re.source, {timeout});
+/** Waits until fn(arg), run in the page, returns something truthy. Not page.waitForFunction: it needs eval in the page,
+ *  which the page's Content-Security-Policy forbids, and this test runs under the real policy (a violation fails it). */
+async function until(fn, arg = null, timeout = 30000) {
+  for (const t0 = Date.now(); ;) {
+    if (await page.evaluate(fn, arg).catch(() => false)) return;
+    if (Date.now() - t0 > timeout) throw new Error(`timed out after ${timeout} ms waiting for ${String(fn).slice(0, 140)}`);
+    await new Promise(r => setTimeout(r, 50));
+  }
+}
+const waitStatus = (re, timeout = 30000) => until(s => new RegExp(s).test(document.querySelector('#status').textContent), re.source, timeout);
 const count = async () => (await page.textContent('#count')).replace(/⬇.*/, '').trim();
 const search = async q => { await page.fill('#q', q); await page.waitForTimeout(500); return count(); };
 const cookie = async () => (await context.cookies(base)).find(c => c.name === 'starsViewerCache')?.value;
@@ -103,8 +120,8 @@ try {
   await page.goto(base + '/');
   await waitStatus(/all checked/);
   step('loads a profile with 3 stars', await status());
-  assert.match(await page.locator('#lanes').innerText(), /Pull the star list[\s\S]*Update repo details/, 'the first load shows its steps');
-  await page.waitForSelector('.lane.done[data-lane="stars"]', {timeout: 5000});
+  const firstLanes = await lanesSeen();
+  for (const lane of ['stars:done', 'details:done']) assert.ok(firstLanes.includes(lane), `the first load shows its steps (${lane}): ${firstLanes}`);
   step('first load: the star-list pull and the details update are shown as steps, then done');
 
   // ---- tiles ----
@@ -132,8 +149,8 @@ try {
   await page.waitForSelector('#lanes .lane[data-lane="commits"]', {timeout: 10000});   // (the lanes of the first sync may still be fading out)
   const lanesText = await page.locator('#lanes').innerText();
   for (const label of ['Check commits & releases', 'Fetch release notes', 'Fetch commit messages']) assert.match(lanesText, new RegExp(label), 'step shown: ' + label);
-  await page.waitForFunction(() => /Indexing commit messages/.test(document.querySelector('#status').textContent), null, {timeout: 20000});
-  await page.waitForFunction(() => (document.querySelector('.lane[data-lane="commits"] progress')?.value ?? 0) > 0, null, {timeout: 5000});   // the commit bar has moved
+  await waitStatus(/Indexing commit messages/, 20000);
+  await until(() => (document.querySelector('.lane[data-lane="commits"] progress')?.value ?? 0) > 0, null, 5000);   // the commit bar has moved
   if (process.env.E2E_LANES) await page.screenshot({path: process.env.E2E_LANES});   // optional: what the panel looks like mid-run
   assert.match(await page.locator('.lane[data-lane="commits"] .lane-text').innerText(), /\d+% · .*repos · .*commits · .*\/s · elapsed/, 'with its numbers');
   await page.click('#cancelTask');
@@ -167,14 +184,15 @@ try {
   // ---- options change stored text without any request ----
   Object.assign(calls, {first: 0, after: 0, seq: 0, rel: 0});
   await page.check('#optLinks');
-  await page.waitForFunction(() => /Applied to the stored release notes of 2 repos/.test(document.querySelector('#optNote').textContent), null, {timeout: 10000});
+  await until(() => /Applied to the stored release notes of 2 repos/.test(document.querySelector('#optNote').textContent), null, 10000);
   assert.match(await search('pull/9'), /^0 of 3/, 'links stripped from stored notes');
   assert.match(await search('docs'), /^2 of 3/, 'markdown link text survives');
   assert.equal(calls.rel + calls.first + calls.after + calls.seq, 0, 'stripping needs no download');
   await page.uncheck('#optLinks');
-  await page.waitForFunction(() => /downloaded again/.test(document.querySelector('#optNote').textContent), null, {timeout: 10000});
+  await until(() => /downloaded again/.test(document.querySelector('#optNote').textContent), null, 10000);
   assert.match(await search('pull/9'), /^0 of 3/, 'the stripped text can not come back until it is downloaded again');
-  await page.click('#indexHistory');
+  await page.click('#indexHistory');   // the status still shows the previous run's "🔎 … indexed": wait for this job to end
+  await page.waitForSelector('#cancelTask', {state: 'hidden', timeout: 60000});
   await waitStatus(/🔎 .*indexed/);
   assert.equal(calls.rel, 2, 'only the release notes of repos that have releases are fetched again');
   assert.equal(calls.first + calls.after + calls.seq, 0, 'and no commits');
@@ -183,9 +201,9 @@ try {
 
   // ---- "no limit" values ----
   await page.selectOption('#optCommits', '0');
-  await page.waitForFunction(() => /ALL commits/.test(document.querySelector('#optNote').textContent), null, {timeout: 10000});
+  await until(() => /ALL commits/.test(document.querySelector('#optNote').textContent), null, 10000);
   await page.selectOption('#optNotes', '0');
-  await page.waitForFunction(() => /Applied|Saved/.test(document.querySelector('#optNote').textContent), null, {timeout: 10000});
+  await until(() => /Applied|Saved/.test(document.querySelector('#optNote').textContent), null, 10000);
   assert.match(await page.textContent('#histOptsSummary'), /@mentions stripped/);
   assert.match(await search('zebra crash'), /^1 of 3/, 'changing a cap never loses what is stored');
   step('dropdowns offer ALL commits and entire release notes');
@@ -193,7 +211,9 @@ try {
   // ---- reload: state comes back from the shards, panel state is remembered ----
   await page.fill('#q', '');
   await page.reload();
-  await waitStatus(/\d+ stars/);
+  // "N stars" shows as soon as the star list is read, before the commit index is; the check that follows the load means
+  // everything was read.
+  await waitStatus(/all checked/);
   assert.equal(await page.isVisible('#histOpts'), true, 'panel stays open');
   assert.deepEqual([await page.inputValue('#optCommits'), await page.inputValue('#optNotes')], ['0', '0'], 'the "no limit" choices are remembered');
   await page.check('#inHistory');

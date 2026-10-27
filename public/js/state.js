@@ -2,7 +2,7 @@
 
 export const S = {
   user: '',          // GitHub login whose stars are shown
-  token: '',         // GitHub token (saved in data/config.json)
+  token: '',         // GitHub token (stored with the config only while "💾 Keep cache" is on)
   repos: [],         // starred repos, shape built by mapStar() in github.js
   starPages: [],     // [{etag, ids}] per star-list page, for conditional (304) re-fetches
   readmes: {},       // {<repo id>: {t: text, sha, path, etag, at, pushed}}
@@ -13,6 +13,7 @@ export const S = {
   hideForks: false,  // shared toolbar filter for starred repos and Discover
   stop: false,       // set by the Cancel button: running jobs save what they have and end (see sync.js task())
   gen: 0,            // bumped when the user changes: running jobs compare it and stop without saving
+  loading: null,     // a Promise while load() reads the profile's cache: jobs started then would save half-loaded data
 };
 
 let genCtrl = new AbortController(), ctrlGen = 0;

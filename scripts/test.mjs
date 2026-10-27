@@ -11,7 +11,7 @@ Object.defineProperty(globalThis, 'localStorage', {
 const {esc, safeUrl, fmtN, ago, tally, chunks, pool, sleep, DAY} = await import('../public/js/util.js');
 const {S, rkey, readmeLower, starredSet, starredIds, nextGen, genSignal} = await import('../public/js/state.js');
 const {sortRepos} = await import('../public/js/sort.js');
-const {languageShares, activityNow, recordStars, starGains, gitSha, gql, isFatalError, ACTIVITY_BUCKETS, ACTIVITY_SPAN} = await import('../public/js/github.js');
+const {languageShares, activityNow, recordStars, starGains, gitSha, gql, ghSearch, isFatalError, ACTIVITY_BUCKETS, ACTIVITY_SPAN} = await import('../public/js/github.js');
 const {curveFor, drawableCurve, starsAt, parseStarHistorySvg, loadCurve, pruneCurves, forgetStarCharts, TUNING: STAR_TUNING} = await import('../public/js/starhistory.js');
 const {detectThemes, keywordMembers, collector, pruneResults} = await import('../public/js/discover.js');
 const {migrateReadmes, needsEnrich, needsReadme} = await import('../public/js/sync.js');
@@ -59,6 +59,54 @@ test('util: esc, safeUrl, fmtN, ago, tally, chunks, pool, sleep', async () => {
   setTimeout(() => ctrl.abort(), 15);
   await sleep(5000, ctrl.signal);
   assert.ok(Date.now() - t0 < 1000, 'sleep should abort early');
+
+  // ...and a sleep that simply ends removes its abort listener (one signal lives through a whole index run)
+  const sig = new AbortController().signal, counts = {add: 0, remove: 0};
+  const add = sig.addEventListener.bind(sig), remove = sig.removeEventListener.bind(sig);
+  sig.addEventListener = (...a) => { counts.add++; return add(...a); };
+  sig.removeEventListener = (...a) => { counts.remove++; return remove(...a); };
+  await sleep(1, sig); await sleep(1, sig);
+  assert.deepEqual(counts, {add: 2, remove: 2});
+
+  // pool: once a call fails, no new item is started (e.g. the remaining star-list pages after a rate limit)
+  let started = 0;
+  await assert.rejects(pool([1, 2, 3, 4, 5, 6], 2, async x => { started++; if (x === 1) throw new Error('boom'); await sleep(5); }), /boom/);
+  await sleep(40);
+  assert.equal(started, 2, 'only the call already in flight finished');
+});
+
+test('token: whitespace from copying is dropped; a character no GitHub token has is refused instead of breaking every request', async () => {
+  const {cleanToken} = await import('../public/js/token.js');
+  assert.deepEqual(cleanToken('  ghp_abc123\r\n'), {token: 'ghp_abc123'});
+  assert.deepEqual(cleanToken('github_pat_11AB\n_cd'), {token: 'github_pat_11AB_cd'});
+  assert.deepEqual(cleanToken(''), {token: ''});
+  for (const bad of ['ghp_…', 'ghp_ab​cd', 'tökén']) {
+    const r = cleanToken(bad);
+    assert.equal(r.token, '');
+    assert.match(r.error, /Paste it again/, JSON.stringify(bad));
+  }
+});
+
+test('github: search pages are asked for up to the 1000th result, not beyond', async () => {
+  const realFetch = globalThis.fetch;
+  let asked = 0;
+  globalThis.fetch = async () => { asked++; return {ok: true, status: 200, headers: new Headers(), json: async () => ({items: [{full_name: 'a/b'}]})}; };
+  try {
+    assert.equal((await ghSearch('x', 60, 17)).length, 1, 'results 961-1000 exist');
+    assert.deepEqual(await ghSearch('x', 50, 21), [], 'results 1001-1050 do not');
+    assert.equal(asked, 1);
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test('index.html: the Content-Security-Policy allows the inline file:// notice by its exact hash', async () => {
+  const {createHash} = await import('node:crypto');
+  const html = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
+  const csp = html.match(/http-equiv="Content-Security-Policy" content="([^"]+)"/)?.[1];
+  assert.ok(csp, 'the page has a policy');
+  const inline = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
+  assert.ok(inline.length >= 1);
+  for (const s of inline) assert.ok(csp.includes(`'sha256-${createHash('sha256').update(s).digest('base64')}'`), 'update the hash in the policy when the inline script changes');
+  assert.match(csp, /connect-src 'self' https:\/\/api\.github\.com https:\/\/api\.star-history\.com;/, 'data only goes to GitHub, star-history.com and the local cache');
 });
 
 test('state: nextGen aborts previous genSignal, starredSet/starredIds track S.repos', () => {
@@ -359,6 +407,17 @@ test('list: parseQuery and match support exact phrases, negation, and qualifiers
   assert.equal(match(r, parseQuery('stars:<500'), false), null);            // star threshold not met
   assert.equal(match(r, parseQuery('is:archived'), false), null);           // not archived
 
+  // A qualifier that can't be understood is ignored, with or without "-", instead of hiding every repo.
+  for (const q of ['is:foo', '-is:foo', 'stars:lots', '-stars:lots', 'stars:>>5']) assert.ok(match(r, parseQuery(q), false), q);
+  // GitHub's star forms: ranges, open ends, k / m suffixes (r has 115,000 stars)
+  assert.ok(match(r, parseQuery('stars:100000..200000'), false));
+  assert.equal(match(r, parseQuery('stars:10..500'), false), null);
+  assert.ok(match(r, parseQuery('stars:100k..*'), false));
+  assert.equal(match(r, parseQuery('stars:*..1k'), false), null);
+  assert.ok(match(r, parseQuery('stars:>=1.5k'), false));
+  assert.equal(match(r, parseQuery('stars:<0.1m'), false), null);
+  assert.equal(match(r, parseQuery('-stars:>100K'), false), null, 'negated, and upper-case suffixes work too');
+
   // A quote still being typed is ignored instead of making the search match nothing.
   assert.deepEqual(parseQuery('"android').inc, ['android']);
   assert.deepEqual(parseQuery('-"flutter').exc, ['flutter']);
@@ -423,6 +482,11 @@ test('server.js: static serving, HEAD, cache PUT/GET, and DNS-rebinding / cross-
     assert.deepEqual(answers.map(r => r.status), Array(25).fill(204));
     assert.ok(bodies.includes(JSON.stringify(await (await fetch(`${base}/cache/${testKey}`)).json())), 'one of the saved states is on disk, intact');
     assert.deepEqual(readdirSync(dataDir).filter(f => f.endsWith('.tmp')), [], 'no temp files are left behind');
+
+    // A file that exists but can't be read is an error, never "nothing stored": the app would otherwise build an empty
+    // replacement and save it over the real data (it marks the key unreadable instead, see store.js).
+    writeFileSync(testFile, Buffer.from([0x1f, 0x8b, 8, 0, 1, 2, 3]));   // a damaged compressed file
+    assert.equal((await fetch(`${base}/cache/${testKey}`)).status, 500);
 
     // A missing key is "no data yet" (200 null), not an error.
     const missing = await fetch(`${base}/cache/__nothing_here__`);

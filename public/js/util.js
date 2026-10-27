@@ -37,16 +37,24 @@ export const secs = t0 => ((performance.now() - t0) / 1000).toFixed(1) + 's';
 /** Status line under the toolbar. */
 export const status = text => { $('#status').textContent = text; };
 
+/** Waits ms, or less if `signal` aborts. The abort listener is removed either way: a generation's signal lives through
+ *  thousands of sleeps during a long index run. */
 export const sleep = (ms, signal) => new Promise(r => {
   if (signal?.aborted) return r();
-  const t = setTimeout(r, ms);
-  signal?.addEventListener('abort', () => { clearTimeout(t); r(); }, {once: true});
+  const done = () => { clearTimeout(t); signal?.removeEventListener('abort', done); r(); };
+  const t = setTimeout(done, ms);
+  signal?.addEventListener('abort', done, {once: true});
 });
 
-/** Runs fn over every item with at most n calls in flight. */
+/** Runs fn over every item with at most n calls in flight. Once a call throws, no new item is started and the error is
+ *  thrown (the calls already in flight finish on their own). */
 export async function pool(items, n, fn) {
-  let i = 0;
-  const worker = async () => { while (i < items.length) await fn(items[i++]); };
+  let i = 0, failed = false;
+  const worker = async () => {
+    while (!failed && i < items.length) {
+      try { await fn(items[i++]); } catch (e) { failed = true; throw e; }
+    }
+  };
   await Promise.all(Array.from({length: Math.min(n, items.length)}, worker));
 }
 
