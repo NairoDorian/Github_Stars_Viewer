@@ -17,6 +17,9 @@ const OLD_FLAG = 'starsViewer.browserCache';   // localStorage flag of earlier v
 
 let mode = 'memory', serverUp = false, persistOn = false;
 const mem = new Map();   // memory mode: the whole cache; browser mode: values already read or written (saves re-reading IndexedDB)
+// Keys whose stored copy could NOT be read (server hiccup, corrupt file, IndexedDB error). get() answers null for them like for
+// "nothing stored", so this tab would build a near-empty replacement; put() refuses to overwrite the real file with it.
+const unreadable = new Set();
 
 // ---- IndexedDB (browser mode) ----
 let dbp = null;
@@ -77,6 +80,7 @@ export async function setPersist(on) {
   writeCookie(CACHE_COOKIE, on ? '1' : '0');
   try { localStorage.removeItem(OLD_FLAG); } catch {}
   persistOn = on;
+  unreadable.clear();   // read failures belong to the backend that was in use
   if (on) { mode = serverUp ? 'server' : 'browser'; return; }
   if (mode === 'browser') {
     for (const k of await idb('readonly', s => s.getAllKeys())) if (!mem.has(k)) mem.set(k, await idb('readonly', s => s.get(k)));
@@ -90,6 +94,7 @@ export async function setPersist(on) {
 export async function clearAll() {
   mem.clear();
   dirtyShards.clear();
+  unreadable.clear();
   let files = 0;
   if (serverUp) {
     try { const r = await fetch('/cache', {method: 'DELETE'}); if (r.ok) files = (await r.json()).deleted ?? 0; } catch {}
@@ -117,17 +122,31 @@ export async function saveAll(g = S.gen) {
 export async function get(key) {
   try {
     if (mode === 'memory') return mem.get(key) ?? null;
+    let v;
     if (mode === 'browser') {
-      const v = (await idb('readonly', s => s.get(key))) ?? null;
+      v = (await idb('readonly', s => s.get(key))) ?? null;
       if (v !== null) mem.set(key, v);
-      return v;
+    } else {
+      const r = await fetch('/cache/' + encodeURIComponent(key), {cache: 'no-store'});
+      if (!r.ok) throw new Error('server returned ' + r.status);   // a missing key is a 200 "null", so this is a real failure
+      v = await r.json();
     }
-    const r = await fetch('/cache/' + encodeURIComponent(key), {cache: 'no-store'});
-    return r.ok ? await r.json() : null;
-  } catch (e) { console.warn('cache read failed', key, e); return null; }
+    unreadable.delete(key);
+    return v;
+  } catch (e) { console.warn('cache read failed', key, e); unreadable.add(key); return null; }
 }
 
+/** Was this key's stored copy unreadable the last time it was read? (Writing it is refused, see put.) */
+export const isUnreadable = key => unreadable.has(key);
+
+/** Forgets which history shards are waiting to be saved (another profile is being loaded: they belong to the old one). */
+export const forgetHistoryDirty = () => { dirtyShards.clear(); };
+
 export async function put(key, value) {
+  if (unreadable.has(key)) {
+    status(`⚠ "${key}" could not be read, so the stored copy is kept as it is and not overwritten. Reload the page to try again.`);
+    return false;
+  }
   try {
     if (mode !== 'server') mem.set(key, value);   // kept for online tabs (also lets the browser cache be switched on/off later)
     if (mode === 'browser') await idb('readwrite', s => s.put(value, key));

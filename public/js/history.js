@@ -232,8 +232,10 @@ async function gqlRun(run, items, fields, nameOf) {
     catch (e) {
       if (!e.secondary || attempt >= 3 || halted(run)) throw e;
       run.slotCap = Math.max(1, Math.floor(Math.min(run.slotCap, 8) / 2));
-      status(`GitHub asked to slow down: waiting ${Math.round(TUNING.slowDownMs * (attempt + 1) / 1000)} s, then continuing with fewer parallel requests…`);
-      await sleep(TUNING.slowDownMs * (attempt + 1));
+      const wait = TUNING.slowDownMs * (attempt + 1);
+      status(`GitHub asked to slow down: waiting ${Math.round(wait / 1000)} s, then continuing with fewer parallel requests…`);
+      for (let waited = 0; waited < wait && !halted(run); waited += 500) await sleep(Math.min(500, wait - waited));   // Cancel ends the wait
+      if (halted(run)) throw e;
     }
   }
 }

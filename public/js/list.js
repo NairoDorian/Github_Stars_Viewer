@@ -7,7 +7,7 @@ import {S, rkey, readmeEntry, readmeText, readmeLower, historyIndex, historyHit,
 import {$, esc, escRe, fmtN, ago, when, safeUrl, tally, status} from './util.js';
 import {activityNow, starGains, ACTIVITY_SPAN, ACTIVITY_BUCKETS} from './github.js';
 import {drawableCurve, starsAt, watchStarCharts} from './starhistory.js';
-import {sortRepos} from './sort.js';
+import {sortRepos, SORT_OPTIONS} from './sort.js';
 
 const PAGE = 200;   // cards rendered per step; more load automatically when you reach the end (or via Show more)
 const filters = {lang: null, topic: null, owner: null};
@@ -244,11 +244,19 @@ function snipHTML(r, s, re) {
 
 /** "🔎 1,204 commits · 3 releases" once commit messages / release notes are indexed for this repo. */
 function historyBadge(r) {
-  const h = S.history[rkey(r)];
-  if (!h || !(h.c?.length || h.rel?.length)) return '';
-  const part = [h.c.length ? `${h.c.length.toLocaleString()}${h.done ? '' : '+'} commits` : '', h.rel.length ? `${h.rel.length} release${h.rel.length === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ');
-  const note = h.capped ? ` (only the newest ${h.c.length.toLocaleString()} commits)` : h.done ? '' : ' (still being indexed)';
+  const h = S.history[rkey(r)], nc = h?.c?.length || 0, nr = h?.rel?.length || 0;   // a record may lack either list
+  if (!nc && !nr) return '';
+  const part = [nc ? `${nc.toLocaleString()}${h.done ? '' : '+'} commits` : '', nr ? `${nr} release${nr === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ');
+  const note = h.capped ? ` (only the newest ${nc.toLocaleString()} commits)` : h.done ? '' : ' (still being indexed)';
   return `<span title="Commit messages and release notes searchable with “Search in commits &amp; releases”${note}">🔎 ${part}</span>`;
+}
+
+/** At most 8 topics; when there are more, the ones matching the active topic filter or the search come first. */
+function pickTopics(topics, re) {
+  if (topics.length <= 8) return topics;
+  const test = re && new RegExp(re.source, 'i');   // a copy without the "g" flag, whose .test() would remember a position
+  const rank = t => t === filters.topic || (test && test.test(t)) ? 1 : 0;
+  return [...topics].sort((a, b) => rank(b) - rank(a)).slice(0, 8);
 }
 
 /** Shared card layout. Discovery passes a normalized repo plus reasons and actions. */
@@ -257,12 +265,7 @@ export function card(r, {snips = [], re = null, suggestion = false, reasons = []
   const home = safeUrl(r.homepage);
   const license = r.license && r.license !== 'NOASSERTION' ? `<span>${esc(r.license)}</span>` : '';
   const tag = suggestion ? 'li' : 'div';
-  const topics = r.topics || [];
-  const shownTopics = topics.length <= 8 ? topics : [...topics].sort((a, b) => {
-    const ma = a === filters.topic || (re && new RegExp(re.source, 'i').test(a)) ? 1 : 0;
-    const mb = b === filters.topic || (re && new RegExp(re.source, 'i').test(b)) ? 1 : 0;
-    return mb - ma;
-  }).slice(0, 8);
+  const shownTopics = pickTopics(r.topics || [], re);
   return `<${tag} class="card${suggestion ? ' suggestion-card' : ''}">
     <div class="owner">${avatar ? `<img src="${esc(avatar)}" loading="lazy" alt="">` : ''}<span class="chip" tabindex="0" role="button" data-owner="${esc(r.owner)}">${hl(r.owner, re)}</span>${r.archived ? ' · archived' : ''}${r.fork ? ' · fork' : ''}</div>
     <a href="${esc(safeUrl(r.url))}" target="_blank" rel="noopener">${hl(r.name, re)}</a>
@@ -270,7 +273,7 @@ export function card(r, {snips = [], re = null, suggestion = false, reasons = []
     ${snips.map(s => snipHTML(r, s, re)).join('')}
     <div class="chips">${shownTopics.map(t => `<span class="chip" tabindex="0" role="button" data-topic="${esc(t)}">${hl(t, re)}</span>`).join('')}</div>
     <div class="meta">
-      <span>★ ${fmtN(r.stars)}</span>${r.forks != null ? `<span>⑂ ${fmtN(r.forks)}</span>` : ''}${r.issues != null ? `<span title="Open issues">◉ ${fmtN(r.issues)} issues</span>` : ''}${r.lang ? `<span class="chip" tabindex="0" role="button" data-lang="${esc(r.lang)}">● ${esc(r.lang)}</span>` : ''}${license}
+      <span>★ ${fmtN(r.stars)}</span>${r.forks != null ? `<span>⑂ ${fmtN(r.forks)}</span>` : ''}${r.issues != null ? `<span title="Open issues and pull requests">◉ ${fmtN(r.issues)} open</span>` : ''}${r.lang ? `<span class="chip" tabindex="0" role="button" data-lang="${esc(r.lang)}">● ${esc(r.lang)}</span>` : ''}${license}
       ${lastCommitTile(r)}
       ${historyBadge(r)}
       ${lastReleaseTile(r, suggestion)}
@@ -382,7 +385,7 @@ function exportMatches(fmt) {
   const url = URL.createObjectURL(new Blob([body], {type: fmt === 'json' ? 'application/json' : 'text/markdown;charset=utf-8'}));
   const a = Object.assign(document.createElement('a'), {href: url, download: `stars-${user.toLowerCase()}.${fmt}`});
   document.body.append(a); a.click(); a.remove();
-  URL.revokeObjectURL(url);
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);   // revoking at once can cancel the download in some browsers
 }
 
 /** Before the first search over commit messages / release notes: builds their search text without freezing the page. */
@@ -404,15 +407,27 @@ export async function searchFor(q) {
 
 const FACETS_PREF = 'starsViewer.hideFacets';   // localStorage: sidebar hidden?
 const SORT_PREF = 'starsViewer.sort';
-function setFacetsHidden(hide) {
+function setFacetsHidden(hide, save = true) {
   document.querySelector('main').classList.toggle('nofacets', hide);
   const b = $('#toggleFacets');
   b.textContent = hide ? '◧ Show filters' : '◧ Hide filters';
   b.setAttribute('aria-expanded', String(!hide));
-  try { localStorage.setItem(FACETS_PREF, hide ? '1' : '0'); } catch {}
+  if (save) try { localStorage.setItem(FACETS_PREF, hide ? '1' : '0'); } catch {}
+}
+
+/** After "Clear cache" erased the stored preferences: the toolbar shows the defaults again (nothing is saved back). */
+export function resetListPrefs() {
+  S.hideForks = false;
+  $('#hideForks').checked = false;
+  $('#sort').value = 'starred';
+  $('#inReadme').checked = $('#inHistory').checked = false;   // the indexes they search are gone too
+  setFacetsHidden(false, false);
+  limit = PAGE;
 }
 
 export function initList() {
+  // One list of sort choices for the toolbar and for Discover (sort.js); "Best match" only makes sense for suggestions.
+  $('#sort').innerHTML = SORT_OPTIONS.filter(([key]) => key !== 'relevance').map(([key, label]) => `<option value="${key}">${esc(label)}</option>`).join('');
   try { S.hideForks = localStorage.getItem('starsViewer.hideForks') === '1'; } catch {}
   $('#hideForks').checked = S.hideForks;
   $('#hideForks').onchange = e => {

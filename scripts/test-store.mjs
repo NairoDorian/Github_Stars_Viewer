@@ -114,3 +114,41 @@ test('saveAll writes the whole tab state; clearAll erases the server files, this
   assert.equal(jar.get('starsViewerCache'), '1', 'the toggle itself is a preference and stays');
   Object.assign(S, {user: '', token: '', repos: [], readmes: {}, history: {}, starCurves: {}});
 });
+
+test('a key that could not be read is never overwritten by what this tab holds; a later good read lifts the block', async () => {
+  jar.clear(); prefs.clear();
+  const srv = fakeServer();
+  const store = await freshStore();
+  await store.initStore();
+  await store.setPersist(true);
+  srv.files.set('readmes:someone', JSON.stringify({1: {t: 'precious'}}));
+  const serverFetch = globalThis.fetch;
+  let failing = true;
+  globalThis.fetch = async (url, init) => failing && (init?.method || 'GET') === 'GET'
+    ? {ok: false, status: 500, headers: new Headers(), json: async () => ({})} : serverFetch(url, init);
+
+  assert.equal(await store.get('readmes:someone'), null, 'a failed read looks like "nothing stored"...');
+  assert.equal(store.isUnreadable('readmes:someone'), true, '...but is remembered as a failure');
+  assert.equal(await store.put('readmes:someone', {}), false, 'so the near-empty copy of this tab is refused');
+  assert.deepEqual(JSON.parse(srv.files.get('readmes:someone')), {1: {t: 'precious'}}, 'and the stored data is untouched');
+  assert.equal(await store.put('stars:someone', {repos: []}), true, 'other keys are not affected');
+
+  failing = false;
+  assert.deepEqual(await store.get('readmes:someone'), {1: {t: 'precious'}});
+  assert.equal(store.isUnreadable('readmes:someone'), false);
+  assert.equal(await store.put('readmes:someone', {2: {t: 'new'}}), true);
+  assert.deepEqual(JSON.parse(srv.files.get('readmes:someone')), {2: {t: 'new'}});
+
+  // A key that simply doesn't exist (200 "null") is not a failure.
+  assert.equal(await store.get('discover:nobody'), null);
+  assert.equal(store.isUnreadable('discover:nobody'), false);
+});
+
+test('shards the previous profile left unsaved are forgotten', async () => {
+  const store = await freshStore();
+  store.markHistory('123');
+  store.markHistory('456');
+  assert.ok(store.historyDirty() > 0);
+  store.forgetHistoryDirty();
+  assert.equal(store.historyDirty(), 0);
+});

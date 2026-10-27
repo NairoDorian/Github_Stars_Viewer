@@ -11,15 +11,19 @@ Object.defineProperty(globalThis, 'localStorage', {
 const {esc, safeUrl, fmtN, ago, tally, chunks, pool, sleep, DAY} = await import('../public/js/util.js');
 const {S, rkey, readmeLower, starredSet, starredIds, nextGen, genSignal} = await import('../public/js/state.js');
 const {sortRepos} = await import('../public/js/sort.js');
-const {languageShares, activityNow, recordStars, starGains, gitSha, ACTIVITY_BUCKETS, ACTIVITY_SPAN} = await import('../public/js/github.js');
-const {curveFor, drawableCurve, starsAt, curveGains, parseStarHistorySvg} = await import('../public/js/starhistory.js');
-const {detectThemes, keywordMembers, collector} = await import('../public/js/discover.js');
+const {languageShares, activityNow, recordStars, starGains, gitSha, gql, isFatalError, ACTIVITY_BUCKETS, ACTIVITY_SPAN} = await import('../public/js/github.js');
+const {curveFor, drawableCurve, starsAt, parseStarHistorySvg, loadCurve, pruneCurves, forgetStarCharts, TUNING: STAR_TUNING} = await import('../public/js/starhistory.js');
+const {detectThemes, keywordMembers, collector, pruneResults} = await import('../public/js/discover.js');
 const {migrateReadmes, needsEnrich, needsReadme} = await import('../public/js/sync.js');
 const {card, languagesHTML, activityHTML, parseQuery, match} = await import('../public/js/list.js');
 import {spawn} from 'node:child_process';
 import {rmSync, readFileSync, writeFileSync, mkdtempSync, readdirSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+
+// github.js asks the page to show the token panel with a window event; starhistory.js announces loaded charts the same way.
+globalThis.window ??= {dispatchEvent() {}};
+globalThis.CustomEvent ??= class extends Event { constructor(type, init) { super(type); this.detail = init?.detail; } };   // Node 18 has none
 
 test('util: esc, safeUrl, fmtN, ago, tally, chunks, pool, sleep', async () => {
   assert.equal(esc('<a href="x">&\'</a>'), '&lt;a href=&quot;x&quot;&gt;&amp;&#39;&lt;/a&gt;');
@@ -34,6 +38,9 @@ test('util: esc, safeUrl, fmtN, ago, tally, chunks, pool, sleep', async () => {
   assert.equal(fmtN(12400), '12k');
   assert.equal(fmtN(1_250_000), '1.3M');
   assert.equal(fmtN(NaN), '0');
+  assert.equal(fmtN(-1500), '-1.5k', 'negative counts (stars lost) are abbreviated too');
+  assert.equal(fmtN(-12), '-12');
+  assert.equal(fmtN(-2_000_000), '-2.0M');
 
   assert.equal(ago(null), '—');
   assert.equal(ago(Date.now() - 5000), 'just now');
@@ -123,7 +130,6 @@ test('starhistory: curveFor deduplication, starsAt interpolation, and SVG parsin
   assert.equal(starsAt(c.pts, 1000), 10);
   assert.equal(starsAt(c.pts, 2500), 20);
   assert.equal(starsAt(c.pts, 5000), 30);
-  assert.deepEqual(curveGains(c.pts, 2, 1000, 3000), [0, 20]);
   assert.ok(drawableCurve('owner/repo')?.pts);
 
   // Minimal DOMParser shim to verify parseStarHistorySvg on path & tick elements
@@ -223,6 +229,115 @@ test('sync & list: migrateReadmes, needsEnrich, card rendering, and activityHTML
   assert.ok(cardHtml.includes('Demo &lt;script&gt; repo'));
   assert.ok(cardHtml.includes('docs/README.md'), 'viewerLinks should use cached README path via rkey(r)');
   assert.ok(cardHtml.includes('role="button"'));
+  assert.ok(cardHtml.includes('◉ 2 open'), 'open issues and pull requests, the same meaning on starred and suggestion cards');
+});
+
+test('list: a history record missing its commit or release list renders instead of throwing; matching topics survive the cut to 8', () => {
+  S.starCurves = {};
+  const repo = {id: 31, full: 'a/b', name: 'b', owner: 'a', topics: [], stars: 1};
+  S.history = {'31': {rel: [['v1', '', 0, 'notes', 0]], done: true}};   // no `c`
+  assert.ok(card(repo).includes('1 release'));
+  S.history = {'31': {c: [['aaaaaaaaaa', 1, 'msg']], done: false}};     // no `rel`
+  assert.ok(card(repo).includes('1+ commits'));
+  S.history = {'31': {done: true}};
+  assert.ok(!card(repo).includes('🔎'));
+  S.history = {};
+
+  const many = {...repo, topics: [...Array.from({length: 9}, (_, i) => 'topic' + i), 'needle']};
+  const re = /needle/gi;
+  for (let i = 0; i < 2; i++) {   // twice: a /g regex remembers its position between .test() calls
+    const html = card(many, {re});
+    assert.ok(html.includes('data-topic="needle"'), 'the searched topic is shown first');
+    assert.equal((html.match(/data-topic=/g) || []).length, 8);
+  }
+});
+
+test('github: fatal errors (bad token, used-up budget) are told apart from "slow down" answers', async () => {
+  const realFetch = globalThis.fetch, token = S.token;
+  S.token = 'tok';
+  const answer = (status, headers = {}, body = {}) => async () => ({ok: status < 300, status, headers: new Headers(headers), json: async () => body});
+  try {
+    globalThis.fetch = answer(401);
+    await assert.rejects(gql('query{}'), e => e.fatal === true && isFatalError(e));
+    globalThis.fetch = answer(403, {'x-ratelimit-remaining': '0'});
+    await assert.rejects(gql('query{}'), e => e.fatal === true && isFatalError(e));
+    globalThis.fetch = answer(403);   // budget left: the secondary limit
+    await assert.rejects(gql('query{}'), e => e.secondary === true && !isFatalError(e));
+    globalThis.fetch = answer(200, {}, {data: null, errors: [{type: 'RATE_LIMITED', message: 'API rate limit already exceeded'}]});
+    await assert.rejects(gql('query{}'), e => e.fatal === true && isFatalError(e));
+    globalThis.fetch = answer(200, {}, {data: null, errors: [{message: 'You have exceeded a secondary rate limit'}]});
+    await assert.rejects(gql('query{}'), e => e.secondary === true && !isFatalError(e), 'GitHub can report "slow down" inside a 200 answer');
+    globalThis.fetch = answer(200, {}, {data: {r0: null}});
+    assert.deepEqual(await gql('query{}'), {r0: null});
+    assert.equal(isFatalError(new Error('GraphQL 502')), false);
+    assert.equal(isFatalError(new Error('Network error (offline, or GitHub timed out or cut the answer)')), false);
+  } finally { globalThis.fetch = realFetch; S.token = token; }
+});
+
+test('discover: pruneResults keeps the newest 40 and anything under 30 days old, and never the one just made', () => {
+  const now = Date.now();
+  S.disc = {dismissed: [], results: {old: {at: now - 40 * DAY}, keepme: {at: now - 50 * DAY}}};
+  for (let i = 0; i < 45; i++) S.disc.results['r' + i] = {at: now - i * 60_000};
+  pruneResults('keepme', now);
+  const ids = Object.keys(S.disc.results);
+  assert.equal(ids.length, 41);
+  assert.ok(ids.includes('keepme') && ids.includes('r0') && ids.includes('r39'));
+  assert.ok(!ids.includes('old') && !ids.includes('r40'));
+  S.disc = {dismissed: [], results: {}};
+});
+
+test('starhistory: a failed refresh is remembered, "Clear cache" drops charts still downloading, old charts are pruned', async () => {
+  const realFetch = globalThis.fetch, events = [];
+  globalThis.window.dispatchEvent = e => events.push(e.detail);
+  STAR_TUNING.retryMs = 1;
+  try {
+    // Every try fails (503) while a stale "unavailable" entry is saved: the stale entry stays, and the failure is
+    // remembered so the card isn't retried at once (drawableCurve answers null only when nothing is known).
+    const stale = {v: 3, at: Date.now() - 2 * DAY, pts: null};
+    S.starCurves = {'o/r': stale};
+    assert.equal(drawableCurve('o/r'), null, 'stale and not known to be failing: it will be fetched');
+    let tries = 0;
+    globalThis.fetch = async () => { tries++; return {ok: false, status: 503, text: async () => ''}; };
+    await loadCurve('O/R');
+    assert.equal(tries, 4);
+    assert.equal(S.starCurves['o/r'], stale);
+    assert.ok(drawableCurve('o/r'), 'the failure is remembered');
+    assert.deepEqual(events, ['o/r']);
+
+    // 404 is an answer: cached as "no chart".
+    globalThis.fetch = async () => ({ok: false, status: 404, text: async () => ''});
+    await loadCurve('n/f');
+    assert.equal(S.starCurves['n/f'].pts, null);
+
+    // "Clear cache" while a chart is downloading: its answer must not bring data back.
+    S.starCurves = {};
+    let answer;
+    globalThis.fetch = () => new Promise(resolve => { answer = () => resolve({ok: true, status: 200, text: async () => '<svg/>'}); });
+    const loading = loadCurve('late/chart');
+    forgetStarCharts();
+    answer();
+    await loading;
+    assert.deepEqual(S.starCurves, {});
+
+    // A request that hangs is cut off by its timeout instead of holding a download slot forever.
+    STAR_TUNING.timeoutMs = 20;
+    globalThis.fetch = (url, init) => new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(new Error('aborted'))));
+    const t0 = Date.now();
+    await loadCurve('hang/chart');
+    assert.ok(Date.now() - t0 < 5000);
+    assert.equal(S.starCurves['hang/chart'], undefined);
+
+    const now = Date.now();
+    S.starCurves = {fresh: {at: now - DAY}, old: {at: now - 61 * DAY}, undated: {}};
+    pruneCurves(now);
+    assert.deepEqual(Object.keys(S.starCurves), ['fresh']);
+  } finally {
+    globalThis.fetch = realFetch;
+    globalThis.window.dispatchEvent = () => {};
+    STAR_TUNING.retryMs = 1000; STAR_TUNING.timeoutMs = 20_000;
+    forgetStarCharts();   // clears the pending cache save, so the test run can end
+    S.starCurves = {};
+  }
 });
 
 test('list: parseQuery and match support exact phrases, negation, and qualifiers', () => {
@@ -297,6 +412,17 @@ test('server.js: static serving, HEAD, cache PUT/GET, and DNS-rebinding / cross-
     writeFileSync(testFile, JSON.stringify({legacy: true}));
     assert.deepEqual(await (await fetch(`${base}/cache/${testKey}`)).json(), {legacy: true});
     assert.equal((await fetch(`${base}/cache/%E0%A4%A`)).status, 400, 'a malformed URL is a 400, not a 500');
+
+    // Invalid JSON is the client's mistake (400, not 500) and leaves the stored file alone.
+    const json = {'Content-Type': 'application/json'};
+    assert.equal((await fetch(`${base}/cache/${testKey}`, {method: 'PUT', headers: json, body: '{not json'})).status, 400);
+    assert.deepEqual(await (await fetch(`${base}/cache/${testKey}`)).json(), {legacy: true});
+    // Overlapping saves of one key are coalesced, and every request is answered by a write that carried its data.
+    const bodies = Array.from({length: 25}, (_, i) => JSON.stringify({n: i}));
+    const answers = await Promise.all(bodies.map(body => fetch(`${base}/cache/${testKey}`, {method: 'PUT', headers: json, body})));
+    assert.deepEqual(answers.map(r => r.status), Array(25).fill(204));
+    assert.ok(bodies.includes(JSON.stringify(await (await fetch(`${base}/cache/${testKey}`)).json())), 'one of the saved states is on disk, intact');
+    assert.deepEqual(readdirSync(dataDir).filter(f => f.endsWith('.tmp')), [], 'no temp files are left behind');
 
     // A missing key is "no data yet" (200 null), not an error.
     const missing = await fetch(`${base}/cache/__nothing_here__`);

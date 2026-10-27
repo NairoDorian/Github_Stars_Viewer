@@ -7,11 +7,6 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
-  pages: write
-  id-token: write
-concurrency:
-  group: pages
-  cancel-in-progress: true
 jobs:
   test:   # syntax check + unit tests; a broken build is never published
     runs-on: ubuntu-latest
@@ -25,6 +20,13 @@ jobs:
     needs: test
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:   # only the deploy job may publish
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:   # one deployment at a time; a newer push waits instead of cancelling a deployment that is running
+      group: pages
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

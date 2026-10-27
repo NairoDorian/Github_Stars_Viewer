@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Stars Viewer</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='14' fill='%23e3b341'%3E%E2%98%85%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="app.css">
 <script type="module" src="js/main.js"></script>
 </head>
@@ -13,16 +14,7 @@
   <input id="user" placeholder="GitHub username or profile URL" size="28" aria-label="GitHub user">
   <button class="primary" id="load">Load stars</button>
   <input id="q" type="search" placeholder="Search name, about, topics, &quot;exact phrase&quot;, -exclude, lang:rust, stars:>1000…  (/ to focus)" title="Supports &quot;exact phrases&quot;, -excluded terms, and qualifiers: lang:, owner:, topic:, is:active, is:archived, is:fork, stars:>1000" aria-label="Search">
-  <select id="sort" aria-label="Sort">
-    <option value="starred">Recently starred</option>
-    <option value="stars">Most stars</option>
-    <option value="starsAsc">Fewest stars</option>
-    <option value="commit">Last commit</option>
-    <option value="release">Last release</option>
-    <option value="name">Name</option>
-    <option value="owner">Owner</option>
-    <option value="created">Newest repo</option>
-  </select>
+  <select id="sort" aria-label="Sort"></select><!-- options come from SORT_OPTIONS in js/sort.js (filled by initList) -->
 </header>
 
 <!-- Shown only when the page is opened as a file (browsers don't run JS modules from file://). -->

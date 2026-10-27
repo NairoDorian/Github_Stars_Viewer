@@ -1,4 +1,4 @@
-// Syntax-check both module files and the CommonJS local server on Windows, macOS and Linux.
+// Syntax-check every browser module and the CommonJS local server, then run all scripts/test*.mjs, on Windows, macOS and Linux.
 const {readdirSync, readFileSync} = require('node:fs');
 const {join} = require('node:path');
 const {spawnSync} = require('node:child_process');

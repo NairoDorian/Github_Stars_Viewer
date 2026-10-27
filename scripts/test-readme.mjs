@@ -10,12 +10,13 @@ Object.defineProperty(globalThis, 'localStorage', {
 });
 
 const {S, nextGen} = await import('../public/js/state.js');
-const {indexReadmes, needsReadme} = await import('../public/js/sync.js');
+const {indexReadmes, needsReadme, enrich} = await import('../public/js/sync.js');
 const {gitSha} = await import('../public/js/github.js');
 /** Sets each file's `oid` to the real git blob hash of its text, as GitHub reports it. */
 const hashed = async files => { for (const f of Object.values(files)) f.oid = await gitSha(f.text); return files; };
 
-/** Fake GitHub: `files` maps "owner/name" → {text, oid, cut} where `cut` makes GraphQL report the blob as truncated. */
+/** Fake GitHub: `files` maps "owner/name" → {text, oid, cut, path} where `cut` makes GraphQL report the blob as truncated
+ *  and `path` is the README's file name (default README.md): only the matching `m<i>` lookup of the details query finds it. */
 function fakeGitHub(files) {
   const calls = {details: 0, download: 0, rest: 0, light: 0};
   globalThis.fetch = async (url, init) => {
@@ -31,8 +32,10 @@ function fakeGitHub(files) {
         } else {   // the details check, with the README's hash
           calls.details++;
           if (!body.includes('languages(')) calls.light++;   // the light query: only the README hash
+          const lookups = {};   // m0, m1…: one per README name the query asks about
+          for (const mm of body.matchAll(/(m\d+):object\(expression:"HEAD:([^"]+)"\)/g)) lookups[mm[1]] = (f.path || 'README.md') === mm[2] ? {oid: f.oid} : null;
           data[m[1]] = {lastCommit: {target: {committedDate: '2024-01-01T00:00:00Z'}}, releases: {nodes: []}, latestRelease: null,
-            languages: {totalSize: 0, edges: []}, defaultBranchRef: null, m0: {oid: f.oid}, m1: null};
+            languages: {totalSize: 0, edges: []}, defaultBranchRef: null, ...lookups};
         }
       });
       return json(data);
@@ -120,5 +123,38 @@ test('a README an older version cut at 100,000 characters is recognised and down
     // A short README an old version stored is complete: it is simply kept.
     S.readmes = {'7': {t: 'short', sha: files['o/old'].oid, at: Date.now(), pushed: 'p1'}};
     assert.equal(needsReadme(S.repos[0]), false);
+  } finally { globalThis.fetch = realFetch; delete globalThis.document; S.token = ''; S.readmes = {}; S.repos = []; }
+});
+
+test('a README with an unusual file name (README.rst) is found and downloaded by GraphQL, with its path', async () => {
+  const el = {value: '', checked: false, textContent: '', innerHTML: '', hidden: false};
+  globalThis.document = {querySelector: () => el};
+  const realFetch = globalThis.fetch;
+  try {
+    const files = await hashed({'o/rst': {text: 'Title\n=====\n\nreStructuredText body', path: 'README.rst'}});
+    const calls = fakeGitHub(files);
+    S.token = 'tok'; S.readmes = {}; S.history = {};
+    S.repos = [repo(11, 'o/rst')];
+    await indexReadmes(nextGen());
+    assert.equal(S.readmes['11'].path, 'README.rst');
+    assert.ok(S.readmes['11'].t.includes('reStructuredText body'));
+    assert.equal(calls.rest, 0, 'no per-repo REST request was needed');
+  } finally { globalThis.fetch = realFetch; delete globalThis.document; S.token = ''; S.readmes = {}; S.repos = []; }
+});
+
+test('refreshing the tiles when no README is indexed never shows a README step', async () => {
+  const els = {};
+  globalThis.document = {querySelector: sel => (els[sel] ??= {value: '', checked: false, textContent: '', innerHTML: '', hidden: false})};
+  const realFetch = globalThis.fetch;
+  try {
+    fakeGitHub(await hashed({'o/a': {text: '# a'}, 'o/b': {text: '# b'}}));
+    S.token = 'tok'; S.readmes = {}; S.history = {};
+    S.repos = [repo(21, 'o/a'), repo(22, 'o/b')];
+    const g = nextGen();
+    await enrich(g);   // fetches the details
+    await enrich(g);   // everything is fresh now: "nothing to do" used to finish a README step that does not exist
+    await new Promise(resolve => setTimeout(resolve, 150));   // the panel redraws a moment later
+    assert.ok(els['#lanes'].innerHTML.includes('data-lane="details"'));
+    assert.ok(!els['#lanes'].innerHTML.includes('data-lane="readmes"'));
   } finally { globalThis.fetch = realFetch; delete globalThis.document; S.token = ''; S.readmes = {}; S.repos = []; }
 });

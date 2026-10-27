@@ -16,12 +16,12 @@
 //   token.js        the 🔑 token panel
 import {S, ukey, nextGen, bumpIndex} from './state.js';
 import {$, ago, status} from './util.js';
-import {get, saveConfig, initStore, setPersist, persisting, clearAll, saveAll, loadHistory, CACHE_VERSION} from './store.js';
+import {get, saveConfig, initStore, setPersist, persisting, clearAll, saveAll, loadHistory, forgetHistoryDirty, CACHE_VERSION} from './store.js';
 import {task, waitIdle, sync, enrich, indexReadmes, migrateReadmes} from './sync.js';
 import {indexHistory} from './history.js';
 import {initHistOpts, resetHistOpts, reconcileStored} from './histopts.js';
-import {render, initList, resetFilters} from './list.js';
-import {initDiscover, closeDiscover} from './discover.js';
+import {render, initList, resetFilters, resetListPrefs, prepareHistorySearch} from './list.js';
+import {initDiscover, closeDiscover, resetDiscoverPrefs} from './discover.js';
 import {initToken, setToken} from './token.js';
 import {forgetStarCharts} from './starhistory.js';
 
@@ -39,6 +39,7 @@ async function load() {
   if (!u) return status('⚠ Enter a GitHub username or profile URL.');
   const prevUser = S.user.toLowerCase();
   const g = nextGen();          // running jobs see the new generation and abort without saving
+  forgetHistoryDirty();         // shards the previous profile had not saved yet must not be written for this one
   S.user = u;
   $('#user').value = u;
   history.replaceState(null, '', '?user=' + encodeURIComponent(u));
@@ -65,6 +66,7 @@ async function load() {
   await reconcileStored(g);   // stored release notes follow the strip / length options
   bumpIndex();
   migrateReadmes();
+  if ($('#inHistory').checked) { await prepareHistorySearch(); if (g !== S.gen) return; }   // build the search text in slices, not in the first render
   if ($('#inReadme').checked || $('#inHistory').checked) render();
   // Show the new user's cache immediately. The old profile's network job can finish before this sync starts.
   await waitIdle();
@@ -105,7 +107,9 @@ async function clearEverything() {
   Object.assign(S, {repos: [], starPages: [], readmes: {}, history: {}, disc: {dismissed: [], results: {}}, starCurves: {}});
   setToken('', {save: false});
   resetFilters();
+  resetListPrefs();      // the stored preferences are gone: the controls show the defaults again
   closeDiscover();
+  resetDiscoverPrefs();
   resetHistOpts();
   bumpIndex();
   render();

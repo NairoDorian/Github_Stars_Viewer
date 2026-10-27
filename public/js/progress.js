@@ -7,7 +7,7 @@
 //   report(id, done, total, detail)   progress (done may be fractional)   finish(id, note)    a step is complete
 //   stopAll(stopped)          end the job: running steps become done / stopped      settle()   hide the panel soon
 //   reset()                   hide the panel now
-import {$} from './util.js';
+import {$, esc} from './util.js';
 
 /** Default names of the steps; callers may pass their own label to start(). */
 const LABELS = {stars: 'Pull the star list', details: 'Update repo details', readmes: 'Download READMEs',
@@ -31,7 +31,6 @@ export function eta(l, now = clock()) {
   return `~${duration(elapsed / l.done * (l.total - l.done))} left`;
 }
 
-const esc = s => String(s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 function row(id, l, n, now) {
   const known = l.total > 0, pct = l.state === 'done' ? 100 : known ? Math.min(100, Math.floor(l.done / l.total * 100)) : null;
   const bar = l.state === 'waiting' ? '<progress value="0" max="1"></progress>'

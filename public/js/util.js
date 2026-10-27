@@ -13,6 +13,7 @@ export const safeUrl = u => /^https?:\/\//i.test(u || '') ? u : '';
 export function fmtN(n) {
   const value = Number(n ?? 0);
   if (!Number.isFinite(value)) return '0';
+  if (value < 0) return '-' + fmtN(-value);   // "stars gained" can be negative
   if (value >= 999_950) return (value / 1e6).toFixed(value >= 9_950_000 ? 0 : 1) + 'M';   // thresholds are where rounding would print "1000k" / "10.0M"
   if (value >= 1e3) return (value / 1e3).toFixed(value >= 9_950 ? 0 : 1) + 'k';
   return String(value);

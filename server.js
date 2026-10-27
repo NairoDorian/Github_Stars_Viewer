@@ -38,30 +38,38 @@ const trusted = req => ALLOWED_HOSTS.has(req.headers.host) &&
 
 // Writes to the same file are queued and coalesced; each goes to a temp file that is then renamed over the old one,
 // so a crash or overlapping saves never leave a half-written or corrupted cache file.
-const queues = new Map(), pendingBuf = new Map();
-function save(file, buf) {
-  JSON.parse(buf);   // refuse to store invalid JSON
-  const hadPending = pendingBuf.has(file);
-  pendingBuf.set(file, buf);
-  if (hadPending) return queues.get(file);
-  const next = (queues.get(file) || Promise.resolve()).catch(() => {}).then(async () => {
-    while (pendingBuf.has(file)) {
-      const data = pendingBuf.get(file);
-      pendingBuf.delete(file);
-      const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-      await fsp.writeFile(tmp, data.length >= GZIP_MIN ? await gzip(data) : data);
-      for (let i = 0; ; i++) {   // Windows may briefly lock a file that's being read (EPERM/EBUSY): retry
-        try { await fsp.rename(tmp, file); break; }
-        catch (e) {
-          if (i >= 10) { await fsp.rm(tmp, {force: true}); throw e; }
-          await new Promise(r => setTimeout(r, 50 * (i + 1)));
-        }
-      }
+async function writeAtomic(file, data) {
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  await fsp.writeFile(tmp, data.length >= GZIP_MIN ? await gzip(data) : data);
+  for (let i = 0; ; i++) {   // Windows may briefly lock a file that's being read (EPERM/EBUSY): retry
+    try { await fsp.rename(tmp, file); return; }
+    catch (e) {
+      if (i >= 10) { await fsp.rm(tmp, {force: true}); throw e; }
+      await new Promise(r => setTimeout(r, 50 * (i + 1)));
     }
+  }
+}
+
+// One queued write per file at a time: `waiting` holds the write that hasn't started yet. A request that arrives meanwhile
+// replaces its data (only the newest state is worth writing) and joins its waiters. Every write settles exactly the requests
+// whose data it carried, so a failed write is never reported as saved, and a failure never reaches an earlier request.
+const queues = new Map(), waiting = new Map();
+function save(file, buf) {
+  try { JSON.parse(buf); }   // refuse to store invalid JSON
+  catch { throw Object.assign(new Error('body is not valid JSON'), {code: 400}); }
+  return new Promise((resolve, reject) => {
+    const job = waiting.get(file);
+    if (job) { job.buf = buf; job.waiters.push({resolve, reject}); return; }
+    const mine = {buf, waiters: [{resolve, reject}]};
+    waiting.set(file, mine);
+    const next = (queues.get(file) || Promise.resolve()).then(async () => {
+      waiting.delete(file);
+      try { await writeAtomic(file, mine.buf); mine.waiters.forEach(w => w.resolve()); }
+      catch (e) { mine.waiters.forEach(w => w.reject(e)); }
+    });
+    queues.set(file, next);
+    next.then(() => { if (queues.get(file) === next) queues.delete(file); });
   });
-  queues.set(file, next);
-  next.finally(() => { if (queues.get(file) === next && !pendingBuf.has(file)) queues.delete(file); }).catch(() => {});
-  return next;
 }
 
 /** Resolves when every queued cache write has finished, so a delete can't be undone by a write still in flight. */
@@ -126,7 +134,7 @@ const openBrowser = () => exec(process.platform === 'win32' ? `start "" "${URL_}
 
 http.createServer((req, res) => handle(req, res).catch(e => {
   console.error(req.method, req.url, e.message);
-  if (!res.headersSent) send(res, e.code === 413 ? 413 : 500, e.message);
+  if (!res.headersSent) send(res, e.code === 413 || e.code === 400 ? e.code : 500, e.message);
   else res.end();
 })).on('error', e => {
   if (e.code === 'EADDRINUSE') {   // most likely the app is already running: just open it

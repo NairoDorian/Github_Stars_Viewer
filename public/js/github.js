@@ -47,27 +47,34 @@ const resetNote = r => { const t = r.headers.get('x-ratelimit-reset'); return t 
 /** REST GET. Throws on auth / rate-limit / unexpected errors; returns the response for 2xx, 304 and 404. */
 export async function gh(path, extraHeaders) {
   const r = await ghFetch(path, {headers: headers(extraHeaders)});
-  if (r.status === 401) { needToken(); throw new Error('Token rejected by GitHub. Update it in the 🔑 panel.'); }
+  if (r.status === 401) { needToken(); throw Object.assign(new Error('Token rejected by GitHub. Update it in the 🔑 panel.'), {fatal: true}); }
   if (r.status === 429 || (r.status === 403 && r.headers.get('x-ratelimit-remaining') === '0')) {
     if (!S.token) needToken();
-    throw new Error('Rate limited' + (S.token ? '' : ', add a token') + resetNote(r));
+    throw Object.assign(new Error('Rate limited' + (S.token ? '' : ', add a token') + resetNote(r)), {fatal: true});
   }
   if (!r.ok && r.status !== 404 && r.status !== 304) throw new Error('GitHub ' + r.status);
   return r;
 }
 
-/** GraphQL query → data. Partial results (some repos missing/private) come back as null entries, not errors. */
+/** GraphQL query → data. Partial results (some repos missing/private) come back as null entries, not errors.
+ *  Errors that make every further request pointless carry `fatal` (bad token, used-up budget); GitHub's "slow down"
+ *  carries `secondary`: callers may wait and retry (see isFatalError). */
 export async function gql(query) {
   const r = await ghFetch('/graphql', {method: 'POST', headers: headers(), body: JSON.stringify({query})});
-  if (r.status === 401) { needToken(); throw new Error('Token rejected by GitHub. Update it in the 🔑 panel.'); }
+  if (r.status === 401) { needToken(); throw Object.assign(new Error('Token rejected by GitHub. Update it in the 🔑 panel.'), {fatal: true}); }
   if (r.status === 403 || r.status === 429) {
-    if (r.headers.get('x-ratelimit-remaining') === '0') throw new Error('GraphQL rate limit reached' + resetNote(r));   // used up: ends the run
+    if (r.headers.get('x-ratelimit-remaining') === '0') throw Object.assign(new Error('GraphQL rate limit reached' + resetNote(r)), {fatal: true});   // used up: ends the run
     // Still has budget: GitHub's secondary limit ("slow down", too many requests at once). Callers may wait and retry.
     throw Object.assign(new Error('GitHub asked to slow down (secondary limit)'), {secondary: true});
   }
   if (!r.ok) throw new Error('GraphQL ' + r.status);
   const body = await r.json();
-  if (!body.data) throw new Error('GraphQL: ' + (body.errors?.[0]?.message || 'no data'));
+  if (!body.data) {   // GitHub can also report limits inside a 200 answer
+    const first = body.errors?.[0], msg = first?.message || 'no data';
+    if (/secondary rate limit|abuse/i.test(msg)) throw Object.assign(new Error('GitHub asked to slow down (secondary limit)'), {secondary: true});
+    if (first?.type === 'RATE_LIMITED') throw Object.assign(new Error('GraphQL rate limit reached' + resetNote(r)), {fatal: true});
+    throw new Error('GraphQL: ' + msg);
+  }
   return body.data;
 }
 
@@ -86,8 +93,10 @@ export const gqlRepos = (items, fields, nameOf = r => [r.owner, r.name]) =>
 /** "owner/name" → [owner, name], for gqlRepos over lists of full names. */
 export const splitFull = full => full.split('/');
 
-/** An error that makes every further request pointless (bad token, rate limit): jobs stop instead of retrying. */
-export const isFatalError = e => /token|rate limit/i.test(e?.message || '');
+/** An error that makes every further request pointless (bad token, used-up rate limit): jobs stop instead of retrying.
+ *  Errors flagged by gh() / gql() are exact; an unflagged one is judged by its message, except "slow down" answers, which
+ *  are worth waiting out. */
+export const isFatalError = e => e?.fatal === true || (!e?.secondary && /token|rate limit/i.test(e?.message || ''));
 
 /** REST "starred" item (star+json media type) → the compact repo shape stored in the cache. */
 export const mapStar = ({starred_at, repo: x}) => ({
@@ -208,12 +217,13 @@ export function parseLast(d) {
     releaseLatest: best && latest && latest !== best.tagName ? latest : null};   // GitHub's "Latest" when it differs
 }
 
-/** Full card details for visible suggestions. Details are saved with the discovery result. */
+/** Full card details for visible suggestions. Details are saved with the discovery result. Open issues and open pull
+ *  requests are added up: that is what REST's open_issues_count (shown on starred cards) means. */
 export async function repoCardDetails(fulls) {
   const out = new Map();
   if (!S.token) return out;
   const end = Date.now(), fields = LANG_FIELDS + ' ' + activityFields(end) + ' ' + LAST_FIELDS +
-    ' forkCount createdAt pushedAt homepageUrl licenseInfo{spdxId} owner{login avatarUrl} issues(states:OPEN){totalCount}';
+    ' forkCount createdAt pushedAt homepageUrl licenseInfo{spdxId} owner{login avatarUrl} issues(states:OPEN){totalCount} pullRequests(states:OPEN){totalCount}';
   await pool(chunks(fulls, 10), 6, async batch => {
     let data;
     try { data = await gqlRepos(batch, fields, splitFull); }
@@ -224,7 +234,7 @@ export async function repoCardDetails(fulls) {
       out.set(f.toLowerCase(), {langs: languageShares(d.languages), activity: parseActivity(d, end), ...parseLast(d),
         forks_count: d.forkCount, created_at: d.createdAt,
         pushed_at: d.pushedAt, homepage: d.homepageUrl, license: d.licenseInfo?.spdxId || null,
-        open_issues_count: d.issues?.totalCount, owner: d.owner ? {login: d.owner.login, avatar_url: d.owner.avatarUrl} : null});
+        open_issues_count: d.issues && d.pullRequests ? d.issues.totalCount + d.pullRequests.totalCount : d.issues?.totalCount, owner: d.owner ? {login: d.owner.login, avatar_url: d.owner.avatarUrl} : null});
     });
   });
   return out;

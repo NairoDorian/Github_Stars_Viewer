@@ -180,35 +180,37 @@ export function starsAt(pts, t) {
   return v0 + (v1 - v0) * (t - t0) / (t1 - t0);
 }
 
-/** Stars gained per bucket for `n` buckets of `span` ms ending now. */
-export function curveGains(pts, n, span, now = Date.now()) {
-  const start = now - n * span;
-  return Array.from({length: n}, (_, i) => Math.max(0, Math.round(starsAt(pts, start + (i + 1) * span) - starsAt(pts, start + i * span))));
-}
-
 // ---------- lazy loading ----------
 const queue = [], pending = new Set();
-let active = 0, saveTimer = null;
+let active = 0, saveTimer = null, epoch = 0;   // epoch: bumped by forgetStarCharts(), so loads started before it write nothing
+/** Knobs so tests don't wait: first retry delay (doubles each time) and the per-request time limit. */
+export const TUNING = {retryMs: 1000, timeoutMs: 20_000};
+const CURVE_MAX_AGE = 60 * 864e5;   // the cache is shared by all profiles and suggestions: charts nobody looked at for 2 months go
+
+/** Drops saved charts older than CURVE_MAX_AGE (a card that needs one again just loads it again). */
+export function pruneCurves(now = Date.now()) {
+  for (const [k, c] of Object.entries(S.starCurves)) if (!(now - (c?.at || 0) <= CURVE_MAX_AGE)) delete S.starCurves[k];
+}
 
 /** Fetches one chart. star-history.com sometimes answers 403/429/5xx for a moment (the same repo works seconds later),
  *  so those and network errors are retried with backoff and never cached. Only 404, or a chart without a readable
- *  curve, is cached as "unavailable" (retried after a day). */
-async function load(full) {
-  const k = key(full), url = `https://api.star-history.com/svg?repos=${encodeURIComponent(k)}&type=Date`;
-  for (let attempt = 0; attempt < 4; attempt++) {
-    let r = null;
-    try { r = await fetch(url); } catch {}
-    if (r?.ok) { failedAt.delete(k); S.starCurves[k] = {v: PARSER, at: Date.now(), pts: parseStarHistorySvg(await r.text())}; break; }
-    if (r?.status === 404) { failedAt.delete(k); S.starCurves[k] = {v: PARSER, at: Date.now(), pts: null}; break; }
-    await new Promise(res => setTimeout(res, 1000 * 2 ** attempt));   // 403 / 429 / 5xx / network: wait and retry
+ *  curve, is cached as "unavailable" (retried after a day). A request that hangs is cut off after TUNING.timeoutMs. */
+export async function loadCurve(full) {
+  const k = key(full), url = `https://api.star-history.com/svg?repos=${encodeURIComponent(k)}&type=Date`, mine = epoch;
+  let ok = false;   // not "is there a curve in the cache": a stale one may be there while every retry failed
+  for (let attempt = 0; attempt < 4 && !ok; attempt++) {
+    let r = null, text = null;
+    try { r = await fetch(url, {signal: AbortSignal.timeout?.(TUNING.timeoutMs)}); if (r.ok) text = await r.text(); } catch {}
+    if (mine !== epoch) return;   // "Clear cache" happened meanwhile: don't bring the wiped data back
+    if (text !== null) { S.starCurves[k] = {v: PARSER, at: Date.now(), pts: parseStarHistorySvg(text)}; ok = true; }
+    else if (r?.status === 404) { S.starCurves[k] = {v: PARSER, at: Date.now(), pts: null}; ok = true; }
+    else if (attempt < 3) await new Promise(res => setTimeout(res, TUNING.retryMs * 2 ** attempt));   // 403 / 429 / 5xx / network: wait and retry
+    if (mine !== epoch) return;
   }
-  if (!S.starCurves[k]) {   // still failing: fall back to local star history for 5 min before retrying
-    failedAt.set(k, Date.now());
-    window.dispatchEvent(new CustomEvent('star-curve', {detail: k}));
-    return;
-  }
+  if (ok) failedAt.delete(k);
+  else failedAt.set(k, Date.now());   // still failing: fall back to local star history for 5 min before retrying
   window.dispatchEvent(new CustomEvent('star-curve', {detail: k}));
-  saveTimer ??= setTimeout(() => { saveTimer = null; put('starcurves', S.starCurves); }, 2500);   // batch cache writes
+  if (ok) saveTimer ??= setTimeout(() => { saveTimer = null; pruneCurves(); put('starcurves', S.starCurves); }, 2500);   // batch cache writes
 }
 
 /** Drops queued items no longer in the DOM and picks a currently visible card first. */
@@ -234,7 +236,7 @@ function pump() {
     const full = nextFromQueue();
     if (!full) break;
     active++;
-    load(full).catch(() => { /* malformed or unavailable chart: leave it uncached for a later render */ })
+    loadCurve(full).catch(() => { /* malformed or unavailable chart: leave it uncached for a later render */ })
       .finally(() => { active--; pending.delete(key(full)); pump(); });
   }
 }
@@ -251,6 +253,7 @@ const observer = typeof IntersectionObserver !== 'undefined' && new Intersection
 
 /** Drops queued chart loads and the pending cache write (after "Clear cache": nothing may be written afterwards). */
 export function forgetStarCharts() {
+  epoch++;   // downloads in flight are dropped when they answer
   clearTimeout(saveTimer);
   saveTimer = null;
   queue.length = 0;

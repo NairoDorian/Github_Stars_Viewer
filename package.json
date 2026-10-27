@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js --open",
     "check": "node scripts/check.cjs",
-    "test": "node --test scripts/test.mjs scripts/test-history.mjs"
+    "test": "node --test scripts/test.mjs scripts/test-history.mjs scripts/test-readme.mjs scripts/test-store.mjs scripts/test-progress.mjs scripts/test-sync.mjs"
   },
   "engines": { "node": ">=18" }
 }

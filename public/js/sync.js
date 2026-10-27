@@ -27,7 +27,8 @@ const ENRICH_MAX_AGE = 7 * DAY, README_MAX_AGE = 30 * DAY;
 // READMEs are the first source of information and are never trimmed. Older versions cut them at this many characters;
 // such records are recognised (they lack `whole`) and downloaded again in full.
 const LEGACY_README_CAP = 100_000;
-const README_NAMES = ['README.md', 'readme.md'];   // checked via GraphQL; covers most repos
+// Checked via GraphQL (one cheap lookup each); a repo with any other name falls back to the REST endpoint.
+const README_NAMES = ['README.md', 'readme.md', 'Readme.md', 'README.markdown', 'README.rst', 'README.txt', 'README'];
 const DETAIL_FIELDS = ['release', 'releaseAt', 'releasePre', 'releaseLatest', 'commitAt', 'langs', 'activity', 'enrichedAt', 'enrichedPushed'];
 
 const spread = r => ((r.id || 0) % 7) * DAY;
@@ -123,6 +124,9 @@ async function fetchStarPages(g) {
   await pool(Array.from({length: lastPage - 1}, (_, i) => i + 2), 10, async p => { pages[p - 1] = await fetchPage(p); got++; shown(lastPage); });
   // The list may have grown beyond what the cache knew: continue while pages come back full.
   while (pages.at(-1).items.length === 100 && g === S.gen) { pages.push(await fetchPage(pages.length + 1)); got++; shown(Math.max(lastPage, got)); }
+  // Unstarring shrinks the list, but an unchanged first page (304) carries no page count: the cache's old last pages
+  // then come back empty. Drop them, or they would be requested again on every check.
+  while (pages.length > 1 && !pages.at(-1).items.length) pages.pop();
   return pages;
 }
 
@@ -198,7 +202,11 @@ export async function sync(g) {
 async function refreshDetails(g, {wantReadmes, wantEnrich}) {
   if (!S.token) return wantReadmes ? restReadmes(g, S.repos.filter(needsReadme)) : {summary: 'add a token for releases'};
   const todo = S.repos.filter(r => (wantEnrich && needsEnrich(r)) || (wantReadmes && needsReadme(r)));
-  if (!todo.length) { finish('details', 'all up to date'); finish('readmes', 'all up to date'); return {summary: 'details up to date (0 requests)'}; }
+  if (!todo.length) {
+    finish('details', 'all up to date');
+    if (wantReadmes) finish('readmes', 'all up to date');   // READMEs not indexed: there is no such step to finish
+    return {summary: 'details up to date (0 requests)'};
+  }
   start('details', todo.length);
 
   const now0 = Date.now();   // activity buckets are counted up to this moment
@@ -226,7 +234,7 @@ async function refreshDetails(g, {wantReadmes, wantEnrich}) {
       if (isFull) Object.assign(r, parseLast(d), {langs: languageShares(d.languages), activity: parseActivity(d, now0), enrichedAt: now, enrichedPushed: r.pushed});
       if (!wantReadmes || !needsReadme(r)) continue;
       const k = rkey(r), c = S.readmes[k];
-      const hit = README_NAMES.map((path, i) => d['m' + i] && {path, oid: d['m' + i].oid}).find(Boolean);
+      const hit = README_NAMES.map((path, i) => d['m' + i]?.oid && {path, oid: d['m' + i].oid}).find(Boolean);   // a directory named README has no oid
       if (!hit) { viaRest.push(r); continue; }
       const sameSha = c && !readmeCut(c) && (c.sha === hit.oid || (!c.sha && c.t && await gitSha(c.t) === hit.oid));
       if (g !== S.gen) return;
@@ -267,8 +275,9 @@ async function refreshDetails(g, {wantReadmes, wantEnrich}) {
     }
   });
 
-  const rest = viaRest.length && !fatal ? await restReadmes(g, viaRest, true) : null;
+  const rest = viaRest.length && !fatal ? await restReadmes(g, viaRest, true, got) : null;   // `got`: already counted by the step's bar
   if (g !== S.gen) return {summary: ''};
+  if (wantReadmes && !fatal && !S.stop) finish('readmes');   // otherwise it would keep ticking while commits are checked
   await saveReadmes(g);
   if (g !== S.gen) return {summary: ''};
   bumpIndex();
@@ -279,8 +288,9 @@ async function refreshDetails(g, {wantReadmes, wantEnrich}) {
     (S.stop ? ' · ■ stopped, progress saved' : '') + (fatal ? ` · ⚠ ${fatal.message} (progress saved)` : '')};
 }
 
-/** REST path (no token, or unusual README names). ETag conditional requests make "unchanged" nearly free. */
-async function restReadmes(g, todo, quiet = false) {
+/** REST path (no token, or unusual README names). ETag conditional requests make "unchanged" nearly free. `quiet`: part of a
+ *  bigger job (refreshDetails owns the step, the saving and the final render); `base` = READMEs that job already counted. */
+async function restReadmes(g, todo, quiet = false, base = 0) {
   if (!todo.length) { if (!quiet) finish('readmes', 'all up to date'); return {got: 0, same: 0, summary: 'READMEs up to date (0 requests)'}; }
   if (!quiet) start('readmes', todo.length);
   if (!S.token && todo.length > 50) status(`⚠ ${todo.length} READMEs to check but only ~60 requests/hour without a token. Add one in the 🔑 panel.`);
@@ -299,9 +309,10 @@ async function restReadmes(g, todo, quiet = false) {
         S.readmes[k] = readmeRecord(r, {t: text, etag: res.headers.get('ETag')}); got++;
       }
     } catch (e) { if (isFatalError(e)) fatal = e; else failed++; }   // transient: retried next time
-    if (!quiet && g === S.gen) {
-      if (++done % 25 === 0) status(`READMEs ${done}/${todo.length}…`);
-      report('readmes', done, todo.length, `${done.toLocaleString()} of ${todo.length.toLocaleString()} checked`);
+    if (g === S.gen) {
+      done++;
+      if (!quiet && done % 25 === 0) status(`READMEs ${done}/${todo.length}…`);
+      report('readmes', base + done, base + todo.length, `${(base + done).toLocaleString()} of ${(base + todo.length).toLocaleString()} ${quiet ? 'downloaded' : 'checked'}`);
     }
   });
   if (!quiet && g === S.gen) finish('readmes');

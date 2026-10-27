@@ -19,6 +19,15 @@ import {watchStarCharts} from './starhistory.js';
 import {SORT_OPTIONS, sortRepos} from './sort.js';
 
 const DISC_TTL = 3 * DAY;
+// Every theme, keyword and "✨ Show suggestions" result is cached with its card details, so the cache is kept bounded.
+const KEEP_RESULTS = 40, RESULT_MAX_AGE = 30 * DAY;
+
+/** Drops results found over 30 days ago and, beyond the newest 40, the oldest ones. `keep` (the result just made) stays. */
+export function pruneResults(keep, now = Date.now()) {
+  Object.entries(S.disc.results).sort((a, b) => (b[1].at || 0) - (a[1].at || 0)).forEach(([id, res], i) => {
+    if (id !== keep && (i >= KEEP_RESULTS || now - (res.at || 0) > RESULT_MAX_AGE)) delete S.disc.results[id];
+  });
+}
 
 // ---------------- theme detection ----------------
 const STOP = new Set(`the and for with from into over under your you our this that its are was were has have been
@@ -188,6 +197,7 @@ async function explore(id, {force = false, depth = 0}, run) {
     S.disc.results[id] = {...(old || {}), ...result, items, at: old?.at || Date.now(), depth, forkPolicy,
       sortDatesAt: depth ? null : undefined,   // a deeper page adds candidates that need dates too
       exhausted: depth >= MAX_DEPTH || !result.items.length || !!result.note?.some(n => /rate limited|token rejected/i.test(n))};
+    pruneResults(id);
     await saveDisc(g);
     updated = true;
   } catch (e) { if (rid === runId && e?.name !== 'AbortError') progress('⚠ ' + e.message); }
@@ -448,10 +458,12 @@ function showResults(id) {
   if ((discoverySort === 'release' || discoverySort === 'commit') && S.token) fillSortDates(id, res);
 }
 
-/** Hydrate only the cards on screen, then persist those details with the discovery result. */
+/** Hydrate only the cards on screen, then persist those details with the discovery result.
+ *  CARD_DETAILS_VERSION: bumped when repoCardDetails() returns something new (4: open issues + pull requests added up). */
+const CARD_DETAILS_VERSION = 4;
 let cardBusy = false, activeCardId = null, waitingCardId = null;
 async function fillCardDetails(id, onScreen) {
-  const need = onScreen.filter(c => c.x.cardDetailsVersion !== 3);
+  const need = onScreen.filter(c => c.x.cardDetailsVersion !== CARD_DETAILS_VERSION);
   if (!S.token || !need.length) return;
   if (cardBusy) { if (id !== activeCardId) waitingCardId = id; return; }
   cardBusy = true;
@@ -463,7 +475,7 @@ async function fillCardDetails(id, onScreen) {
     if (g !== S.gen) return;
     for (const c of need) {
       const d = found.get(c.x.full_name.toLowerCase());
-      if (d) { Object.assign(c.x, d, {cardDetailsVersion: 3}); updated = true; }
+      if (d) { Object.assign(c.x, d, {cardDetailsVersion: CARD_DETAILS_VERSION}); updated = true; }
     }
     if (updated) await saveDisc(g);
   } catch (e) { if (g === S.gen && current === id) status('⚠ Could not load suggestion card details: ' + e.message); }
@@ -530,6 +542,8 @@ function show(newTab) {
   else $('#dbody').innerHTML = overviewHTML();
 }
 export const closeDiscover = () => { runId++; busy = false; lastStarred = null; $('#insights').classList.remove('show'); };
+/** After "Clear cache" erased the saved Discover choices: back to the defaults. */
+export function resetDiscoverPrefs() { discoverySort = 'relevance'; tab = 'themes'; shown = PAGE; }
 
 /* Stars a suggestion on GitHub; it then joins your stars and its card is replaced by the next suggestion.
    Needs a token allowed to star: classic token with "public_repo", or fine-grained with "Starring: read and write".
@@ -622,14 +636,14 @@ export function initDiscover() {
     if (repo) exploreRepo(repo);
   });
   $('#insights').addEventListener('click', async e => {
-    const t = e.target.closest('[data-dtab],[data-theme],[data-dismiss],[data-undismiss],[data-unstar],[data-refresh],[data-filterq],[data-pattern],[data-star],[data-more],[data-topic],[data-owner]');
+    const t = e.target.closest('[data-dtab],[data-theme],[data-dismiss],[data-undismiss],[data-unstar],[data-refresh],[data-filterq],[data-pattern],[data-star],[data-more],[data-topic],[data-owner],[data-lang]');
     if (!t) return;
     const d = t.dataset;
     if (d.star) starSuggestion(d.star, t);
     else if (d.unstar) unstarSuggestion(d.unstar, t);
     else if (d.more !== undefined) { shown += PAGE; showResults(current); }
     else if (d.dtab) show(d.dtab);
-    else if (d.pattern || d.topic || d.owner) exploreKeyword(d.pattern || d.topic || d.owner);
+    else if (d.pattern || d.topic || d.owner || d.lang) exploreKeyword(d.pattern || d.topic || d.owner || d.lang);   // chips on suggestion cards
     else if (d.theme) {
       const th = themes[+d.theme];
       document.querySelectorAll('.theme.on').forEach(x => x.classList.remove('on'));
