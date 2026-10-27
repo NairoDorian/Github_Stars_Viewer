@@ -46,7 +46,8 @@ const dataFile = key => path.join(DATA, key.replace(/[^\w.-]/g, '_') + '.json');
 
 // Only this app may talk to the server. The Host check blocks "DNS rebinding" (a web page re-pointing its own domain
 // to 127.0.0.1 to read your token); Origin and Sec-Fetch-Site block other sites from reading or writing the cache.
-const ALLOWED_HOSTS = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`, `[::1]:${PORT}`]);
+// (Browsers leave the port out of Host and Origin when it is the default one, 80.)
+const ALLOWED_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'].map(h => PORT === 80 ? h : `${h}:${PORT}`));
 const ALLOWED_ORIGINS = new Set([...ALLOWED_HOSTS].map(h => 'http://' + h));
 const ALLOWED_SITES = new Set(['same-origin', 'none']);
 const trusted = req => ALLOWED_HOSTS.has(req.headers.host) &&
@@ -101,8 +102,9 @@ async function readBody(req) {
   return Buffer.concat(chunks);
 }
 
+// X-Frame-Options: no other site may show the app in a frame and trick clicks into it (Clear cache, ☆ Star).
 function send(res, code, body = '', type = 'text/plain; charset=utf-8', extra = {}) {
-  res.writeHead(code, {'Content-Type': type, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...extra});
+  res.writeHead(code, {'Content-Type': type, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', ...extra});
   res.end(body);
 }
 

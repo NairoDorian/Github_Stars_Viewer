@@ -8,14 +8,14 @@ Object.defineProperty(globalThis, 'localStorage', {
   configurable: true,
 });
 
-const {esc, safeUrl, fmtN, ago, tally, chunks, pool, sleep, DAY} = await import('../public/js/util.js');
+const {esc, safeUrl, fmtN, fmtDate, ago, when, tally, chunks, pool, sleep, DAY} = await import('../public/js/util.js');
 const {S, rkey, readmeLower, starredSet, starredIds, nextGen, genSignal} = await import('../public/js/state.js');
 const {sortRepos} = await import('../public/js/sort.js');
 const {languageShares, activityNow, recordStars, starGains, gitSha, gql, ghSearch, isFatalError, ACTIVITY_BUCKETS, ACTIVITY_SPAN} = await import('../public/js/github.js');
 const {curveFor, drawableCurve, starsAt, parseStarHistorySvg, loadCurve, pruneCurves, forgetStarCharts, TUNING: STAR_TUNING} = await import('../public/js/starhistory.js');
-const {detectThemes, keywordMembers, collector, pruneResults} = await import('../public/js/discover.js');
+const {detectThemes, keywordMembers, collector, pruneResults, linkRound} = await import('../public/js/discover.js');
 const {migrateReadmes, needsEnrich, needsReadme} = await import('../public/js/sync.js');
-const {card, languagesHTML, activityHTML, parseQuery, match} = await import('../public/js/list.js');
+const {card, languagesHTML, activityHTML, parseQuery, match, exportText} = await import('../public/js/list.js');
 import {spawn} from 'node:child_process';
 import {rmSync, readFileSync, writeFileSync, mkdtempSync, readdirSync} from 'node:fs';
 import {tmpdir} from 'node:os';
@@ -46,6 +46,14 @@ test('util: esc, safeUrl, fmtN, ago, tally, chunks, pool, sleep', async () => {
   assert.equal(ago(Date.now() - 5000), 'just now');
   assert.equal(ago(Date.now() - 3 * DAY), '3d ago');
 
+  // Dates are formatted by cached Intl formats (one per set of options), exactly like toLocaleDateString; no date, no text.
+  const utcYear = {timeZone: 'UTC', year: 'numeric', month: 'short'};
+  assert.equal(fmtDate('2024-03-05T00:00:00Z', utcYear), new Date('2024-03-05T00:00:00Z').toLocaleDateString(undefined, utcYear));
+  assert.equal(fmtDate(0, utcYear), new Date(0).toLocaleDateString(undefined, utcYear), '0 is a date (1970), not "missing"');
+  for (const bad of [null, undefined, '', 'not a date', NaN]) assert.equal(fmtDate(bad, utcYear), '', String(bad));
+  assert.equal(when('garbage'), '', 'never "Invalid Date" in a tooltip');
+  assert.equal(when(undefined), '');
+
   assert.deepEqual(chunks([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]]);
   assert.deepEqual(tally([{a: ['x', 'y']}, {a: ['x']}], r => r.a), [['x', 2], ['y', 1]]);
 
@@ -73,6 +81,14 @@ test('util: esc, safeUrl, fmtN, ago, tally, chunks, pool, sleep', async () => {
   await assert.rejects(pool([1, 2, 3, 4, 5, 6], 2, async x => { started++; if (x === 1) throw new Error('boom'); await sleep(5); }), /boom/);
   await sleep(40);
   assert.equal(started, 2, 'only the call already in flight finished');
+});
+
+test('token: only the "repo" and "public_repo" scopes can star, not sub-scopes such as repo:status', async () => {
+  const {canStar} = await import('../public/js/token.js');
+  for (const [scopes, ok] of [['repo', true], ['public_repo', true], ['read:org, repo', true], ['gist,public_repo', true],
+    ['repo:status', false], ['repo:invite, read:org', false], ['repo_deployment', false], ['read:user', false], ['', false], [null, false]]) {
+    assert.equal(canStar(scopes), ok, JSON.stringify(scopes));
+  }
 });
 
 test('token: whitespace from copying is dropped; a character no GitHub token has is refused instead of breaking every request', async () => {
@@ -334,6 +350,26 @@ test('discover: pruneResults keeps the newest 40 and anything under 30 days old,
   S.disc = {dismissed: [], results: {}};
 });
 
+test('discover: "Linked from your READMEs" rounds follow each other without skipping a link', () => {
+  const links = (n, stars) => Array.from({length: n}, (_, i) => ({f: `${stars}/${i}`, from: new Set(Array.from({length: stars}, (_, k) => 'r' + k))}));
+  const ranked = [...links(40, 2), ...links(300, 1)];   // ranked by how many stars link there
+  const rounds = [0, 1, 2, 3].map(d => linkRound(ranked, d));
+  assert.equal(rounds[0].length, 40, 'the first round: links shared by 2+ stars only');
+  assert.deepEqual(rounds.flat(), ranked, 'later rounds continue right after it: every single link comes up once');
+  assert.deepEqual(linkRound(links(500, 3), 1), links(500, 3).slice(160, 320), 'more than one round of shared links');
+  const singles = links(50, 1);
+  assert.equal(linkRound(singles, 0).length, 50, 'no shared link: the first round takes single links instead of ending empty');
+  assert.equal(linkRound(singles, 1).length, 0);
+});
+
+test('list: the JSON export describes the repos, without the app\'s bookkeeping', () => {
+  const repo = {id: 1, full: 'a/b', url: 'https://github.com/a/b', about: 'line one\nline two', stars: 1500, lang: 'Go', commitAt: '2026-01-01T00:00:00Z',
+    langs: [['Go', 100, null]], starHist: [[1, 2]], activity: {end: 1, counts: []}, enrichedAt: 5, enrichedPushed: 'p'};
+  const [json] = JSON.parse(exportText([repo], 'json', 'me'));
+  assert.deepEqual(Object.keys(json).sort(), ['about', 'commitAt', 'full', 'id', 'lang', 'langs', 'stars', 'url']);
+  assert.equal(exportText([repo], 'md', 'me'), "# ★ me's Starred Repositories (1)\n\n- **[a/b](https://github.com/a/b)** (★ 1.5k · Go) — line one line two\n");
+});
+
 test('starhistory: a failed refresh is remembered, "Clear cache" drops charts still downloading, old charts are pruned', async () => {
   const realFetch = globalThis.fetch, events = [];
   globalThis.window.dispatchEvent = e => events.push(e.detail);
@@ -449,6 +485,7 @@ test('server.js: static serving, HEAD, cache PUT/GET, and DNS-rebinding / cross-
     const headRes = await fetch(`${base}/`, {method: 'HEAD'});
     assert.equal(headRes.status, 200);
     assert.equal(await headRes.text(), '');
+    assert.equal(headRes.headers.get('x-frame-options'), 'DENY', 'no other site may frame the app (it holds the token)');
 
     // Cache PUT & GET
     const putRes = await fetch(`${base}/cache/${testKey}`, {

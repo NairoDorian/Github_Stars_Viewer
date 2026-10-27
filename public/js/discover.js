@@ -284,6 +284,17 @@ function exploreTheme(id, keys, members, opts = {}) {
   });
 }
 
+/** The links one round looks up, from links ranked by how many stars point to them (most first). The first round takes
+ *  only links from 2+ different stars (at most `per`; single links when no link is shared, or the round would come back
+ *  empty and end the search); each later round takes the next `per`, starting right where the previous round stopped,
+ *  so no link is skipped. */
+export function linkRound(ranked, depth, per = 160) {
+  const first = Math.min(per, ranked.filter(c => c.from.size >= 2).length || ranked.length);
+  if (!depth) return ranked.slice(0, first);
+  const from = first + (depth - 1) * per;
+  return ranked.slice(from, from + per);
+}
+
 /** Repos linked from your starred READMEs: 2+ different stars first; deeper rounds also take single links. */
 function exploreMentions(opts = {}) {
   if (!Object.keys(S.readmes).length) {
@@ -300,8 +311,7 @@ function exploreMentions(opts = {}) {
       links.get(k).from.add(r.name);
     }
     // A README linking its own org's repos isn't much of a signal, so links from 2+ different stars come first.
-    const ranked = [...links.values()].sort((a, b) => b.from.size - a.from.size);
-    const top = ranked.slice(depth * 160, (depth + 1) * 160).filter(c => depth > 0 || c.from.size >= 2);
+    const top = linkRound([...links.values()].sort((a, b) => b.from.size - a.from.size), depth);
     const meta = await repoMeta(top.map(c => c.f)), {add, finish} = collector([]);
     if (!alive()) return null;
     for (const c of top) {
@@ -580,8 +590,10 @@ async function starSuggestion(full, btn) {
     }
     catch {
       const [owner, name] = full.split('/');
+      // The suggestion keeps a compact shape: license as its SPDX id, the default branch as `branch` (mapStar reads REST's).
       x = {...candidate, id: candidate?.id, full_name: full, name, owner: candidate?.owner || {login: owner},
-        html_url: `https://github.com/${full}`, topics: candidate?.topics || []};
+        html_url: `https://github.com/${full}`, topics: candidate?.topics || [],
+        license: candidate?.license ? {spdx_id: candidate.license} : null, default_branch: candidate?.branch};
     }
     if (g !== S.gen || user !== ukey()) return status(`★ Starred ${full} on GitHub. Reload ${user}'s stars to see it here.`);
     const repo = mapStar({starred_at: new Date().toISOString(), repo: x});

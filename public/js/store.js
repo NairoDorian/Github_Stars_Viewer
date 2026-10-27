@@ -74,7 +74,8 @@ export async function initStore() {
  * Turns "Keep cache" on or off and remembers the choice in a cookie. On: later reads and writes go to the local server's
  * files (or IndexedDB online); the caller decides what to do with this tab's data (see main.js). Off: this tab keeps
  * working from memory; IndexedDB is erased (its data is copied to memory first); the local server's files are left
- * untouched, use clearAll() to delete them.
+ * untouched, use clearAll() to delete them. Either way this tab's data is kept in memory, so loading the profile again
+ * finds it (the local server's files are never copied into memory: they can be hundreds of MB).
  */
 export async function setPersist(on) {
   writeCookie(CACHE_COOKIE, on ? '1' : '0');
@@ -87,6 +88,8 @@ export async function setPersist(on) {
     await idb('readwrite', s => s.clear());
   }
   mode = 'memory';
+  while (S.loading) await S.loading;   // a profile still being read would be kept half-loaded
+  if (S.user) await saveAll();   // memory mode: keeps references, nothing is copied or written anywhere
 }
 
 /** Deletes everything this app stored: the local server's cache files, this browser's IndexedDB, the app's preferences in
@@ -180,8 +183,16 @@ export const markAllHistory = () => { for (let i = 0; i < HISTORY_SHARDS; i++) d
 export const historyDirty = () => dirtyShards.size;
 
 /** Writes the shards marked dirty (records of `history`, default S.history). True when every write succeeded; a failed
- *  shard stays dirty and is retried by the next call. */
-export async function saveHistory(g = S.gen, history = S.history) {
+ *  shard stays dirty and is retried by the next call. Saves run one after another: a save that started later holds
+ *  newer records, and must not have one of its shards overwritten by an earlier, slower save (a big index takes longer
+ *  to write than the time between two progress saves). */
+let historySaves = Promise.resolve();
+export function saveHistory(g = S.gen, history = S.history) {
+  const save = historySaves.then(() => writeHistory(g, history));
+  historySaves = save.catch(() => {});
+  return save;
+}
+async function writeHistory(g, history) {
   if (g !== S.gen) return false;
   const user = ukey(), todo = [...dirtyShards];
   dirtyShards.clear();

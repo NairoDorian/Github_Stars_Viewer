@@ -4,7 +4,7 @@
    READMEs or the commit messages / release notes; each term may match somewhere different. "exact phrase", -exclude and
    qualifiers (lang: owner: topic: is: stars:) are supported. Matches outside the card fields are explained by snippets. */
 import {S, rkey, readmeEntry, readmeText, readmeLower, historyIndex, historyHit, warmHistoryIndex} from './state.js';
-import {$, esc, escRe, fmtN, ago, when, safeUrl, tally, status} from './util.js';
+import {$, esc, escRe, fmtN, fmtDate, ago, when, safeUrl, tally, status} from './util.js';
 import {activityNow, starGains, ACTIVITY_SPAN, ACTIVITY_BUCKETS} from './github.js';
 import {drawableCurve, starsAt, watchStarCharts} from './starhistory.js';
 import {sortRepos, SORT_OPTIONS} from './sort.js';
@@ -75,7 +75,7 @@ function checkQual(r, {k, v}) {
 
 const MAX_SNIPS = 4;
 const inHistoryText = (r, t) => historyIndex(r)?.low.includes(t) ?? false;
-const date = unix => unix ? new Date(unix * 1000).toLocaleDateString(undefined, {dateStyle: 'medium'}) : '';
+const date = unix => unix ? fmtDate(unix * 1000, {dateStyle: 'medium'}) : '';
 const around = (text, term) => {
   const j = Math.max(0, text.toLowerCase().indexOf(term)), a = Math.max(0, j - 80);
   return (a ? '…' : '') + text.slice(a, a + 220) + (a + 220 < text.length ? '…' : '');
@@ -120,7 +120,7 @@ function hl(text, re) {
    periods (the rhythm stays readable), faint full-height blocks for periods the data doesn't cover, and a native
    tooltip per bar. Values are text in ink colors; only the bars carry the series color. */
 const W = 260, H = 26, BAR = 8, GAP = 2;
-const day = t => new Date(t).toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
+const day = t => fmtDate(t, {month: 'short', day: 'numeric'});
 
 function sparkbars(counts, {end, unit, cls}) {
   const n = counts.length, max = Math.max(1, ...counts.filter(v => v != null)), start = end - n * ACTIVITY_SPAN;
@@ -140,7 +140,7 @@ function starTimeline(pts) {
   const t0 = pts[0][0], t1 = Date.now(), span = Math.max(1, t1 - t0), max = Math.max(1, starsAt(pts, t1));
   const N = 60, x = t => (t - t0) / span * W, y = v => H - 1 - v / max * (H - 3);
   const line = Array.from({length: N + 1}, (_, i) => { const t = t0 + span * i / N; return `${x(t).toFixed(1)},${y(starsAt(pts, t)).toFixed(1)}`; });
-  const month = t => new Date(t).toLocaleDateString(undefined, {month: 'short', year: 'numeric'});
+  const month = t => fmtDate(t, {month: 'short', year: 'numeric'});
   const tips = Array.from({length: 26}, (_, i) => {
     const a = t0 + span * i / 26, b = t0 + span * (i + 1) / 26, va = Math.round(starsAt(pts, a)), vb = Math.round(starsAt(pts, b));
     return `<rect class="hit" x="${x(a).toFixed(1)}" y="0" width="${(W / 26).toFixed(1)}" height="${H}"><title>${month(a)} – ${month(b)}: ${vb.toLocaleString()} stars (+${(vb - va).toLocaleString()})</title></rect>`;
@@ -403,16 +403,24 @@ function renderFacets({forLang, forTopic, forOwner}, queryKey) {
     block('Owners', 'owner', tally(forOwner, r => r.owner).filter(([v, c]) => c > 1 || v === filters.owner), 15);
 }
 
+// Bookkeeping of this app that the JSON export leaves out: check dates, daily star samples (up to 400 per repo) and the
+// commit-chart buckets.
+const NOT_EXPORTED = new Set(['starHist', 'activity', 'enrichedAt', 'enrichedPushed']);
+
+/** The text of an export: repos as JSON, or as a Markdown list. */
+export function exportText(repos, fmt, user) {
+  const oneLine = s => String(s).replace(/\s+/g, ' ').trim();   // a description with line breaks would end its list item
+  return fmt === 'json'
+    ? JSON.stringify(repos, (k, v) => NOT_EXPORTED.has(k) ? undefined : v, 2)
+    : `# ★ ${user}'s Starred Repositories (${repos.length})\n\n` +
+      repos.map(r => `- **[${r.full}](${r.url})** (★ ${fmtN(r.stars)}${r.lang ? ` · ${r.lang}` : ''})${r.about ? ` — ${oneLine(r.about)}` : ''}`).join('\n') + '\n';
+}
+
 /** Downloads the currently shown (filtered and sorted) repositories as Markdown or JSON. */
 function exportMatches(fmt) {
   const repos = shownMatches.map(x => x.r);
   if (!repos.length) return;
-  const user = S.user || 'github';
-  const oneLine = s => String(s).replace(/\s+/g, ' ').trim();   // a description with line breaks would end its list item
-  const body = fmt === 'json'
-    ? JSON.stringify(repos, null, 2)
-    : `# ★ ${user}'s Starred Repositories (${repos.length})\n\n` +
-      repos.map(r => `- **[${r.full}](${r.url})** (★ ${fmtN(r.stars)}${r.lang ? ` · ${r.lang}` : ''})${r.about ? ` — ${oneLine(r.about)}` : ''}`).join('\n') + '\n';
+  const user = S.user || 'github', body = exportText(repos, fmt, user);
   const url = URL.createObjectURL(new Blob([body], {type: fmt === 'json' ? 'application/json' : 'text/markdown;charset=utf-8'}));
   const a = Object.assign(document.createElement('a'), {href: url, download: `stars-${user.toLowerCase()}.${fmt}`});
   document.body.append(a); a.click(); a.remove();

@@ -1,7 +1,7 @@
 // Entry point: boot, loading a profile, and toolbar wiring.
 //
 // Module map (imports only point downwards; list.js never imports discover.js or sync.js, they talk through DOM events):
-//   util.js         helpers: DOM, formatting, safe HTML, concurrency, status line and progress bar
+//   util.js         helpers: DOM, formatting (cached date formats), safe HTML, concurrency, status line
 //   state.js        the shared state object S, generation/cancellation, per-repo cache keys, search-text caches
 //   store.js        the cache: ./data files via server.js locally, or IndexedDB / memory online; sharded history
 //   github.js       GitHub REST/GraphQL client: retries, rate limits, batching, data mapping, last commit / release
@@ -16,7 +16,7 @@
 //   token.js        the 🔑 token panel
 import {S, ukey, nextGen, bumpIndex} from './state.js';
 import {$, ago, status} from './util.js';
-import {get, saveConfig, initStore, setPersist, persisting, clearAll, saveAll, loadHistory, forgetHistoryDirty, CACHE_VERSION} from './store.js';
+import {get, saveConfig, initStore, setPersist, persisting, isUnreadable, clearAll, saveAll, loadHistory, forgetHistoryDirty, CACHE_VERSION} from './store.js';
 import {task, waitIdle, sync, enrich, indexReadmes, migrateReadmes} from './sync.js';
 import {indexHistory} from './history.js';
 import {initHistOpts, resetHistOpts, reconcileStored} from './histopts.js';
@@ -52,7 +52,6 @@ async function load() {
   try {
     const [stars, disc] = await Promise.all([get('stars:' + ukey()), get('discover:' + ukey())]);
     if (g !== S.gen) return;
-    if (stars && stars.v > CACHE_VERSION) status('⚠ This cache was written by a newer version of the app.');
     if (prevUser && prevUser !== u.toLowerCase()) resetFilters();
     S.repos = stars?.repos || [];
     S.starPages = stars?.pages || [];
@@ -61,7 +60,9 @@ async function load() {
     S.disc = disc || {dismissed: [], results: {}};
     closeDiscover();
     render();   // stars on screen now; the large README cache loads right after
-    status(stars ? `Cached ${ago(stars.at)} · ${S.repos.length} stars · checking for updates…`
+    const newer = stars?.v > CACHE_VERSION ? ' (⚠ written by a newer version of the app)' : '';
+    status(stars ? `Cached ${ago(stars.at)}${newer} · ${S.repos.length} stars · checking for updates…`
+      : isUnreadable('stars:' + ukey()) ? '⚠ The cached star list could not be read: it is kept as it is (never overwritten) and a fresh list is shown. Reload the page to try reading it again.'
       : 'No cache for this user yet, downloading…' + (persisting() ? '' : ' (💾 Keep cache is off: nothing will be saved)'));
 
     const [readmes, commitHistory] = await Promise.all([get('readmes:' + ukey()), loadHistory(g)]);

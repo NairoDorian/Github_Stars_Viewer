@@ -61,15 +61,18 @@ async function withLock(fn) {
 
 /** Runs job(gen) unless another job is running for the current profile, or the profile's cache is still being read
  *  (the job would save half-loaded data over it). Errors end up in the status line.
- *  The Cancel button (S.stop) asks the job to save what it has and end. */
+ *  The Cancel button (S.stop) asks the job to save what it has and end.
+ *  A job of an earlier generation (the profile was loaded again) is stopping, but may still hold the profile's lock: the
+ *  new job starts once it has ended, instead of finding the lock taken and reporting another tab. */
 export function task(job) {
   if (S.loading) { status('⏳ Still reading the cached data, try again in a moment'); return Promise.resolve(); }
   if (running && runningGen === S.gen) { status('⏳ Busy with another task, please wait'); return running; }
-  const g = S.gen, cancel = $('#cancelTask');
+  const g = S.gen, cancel = $('#cancelTask'), previous = running || Promise.resolve();
   runningGen = g;
   S.stop = false;
   if (cancel) cancel.hidden = false;
-  const p = withLock(() => job(g)).catch(e => { if (g === S.gen && e?.name !== 'AbortError') status('⚠ ' + e.message); })
+  const p = previous.then(() => g === S.gen ? withLock(() => job(g)) : undefined)
+    .catch(e => { if (g === S.gen && e?.name !== 'AbortError') status('⚠ ' + e.message); })
     .finally(() => {
       if (running !== p) return;
       stopAll(S.stop);   // steps still running are marked done, or stopped if Cancel was clicked
@@ -144,7 +147,7 @@ export async function sync(g) {
   start('stars');
   const pages = await fetchStarPages(g);
   if (g !== S.gen) return;
-  finish('stars', `${pages.length} pages`);
+  finish('stars', `${pages.length} page${pages.length === 1 ? '' : 's'}`);
   // Reached only when every page succeeded: a partial list never overwrites the cache.
 
   const fresh = new Map();

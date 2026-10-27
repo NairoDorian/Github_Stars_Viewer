@@ -6,6 +6,10 @@ import {saveConfig} from './store.js';
 
 const PANEL_STATE = 'tokenPanelOpen';   // localStorage: remembered open/closed state (a UI preference only)
 
+/** Can a classic token with these scopes (GitHub's X-OAuth-Scopes header, "repo, read:org") star repos? Only "repo" and
+ *  "public_repo" can; sub-scopes such as "repo:status" or "repo:invite" can't. */
+export const canStar = scopes => String(scopes ?? '').split(',').some(s => ['repo', 'public_repo'].includes(s.trim()));
+
 /** Checks the token against GitHub: validity, rate limits, and (classic tokens) whether it may star. */
 async function checkToken() {
   const summary = $('#tpSummary'), limit = $('#limit');
@@ -18,10 +22,11 @@ async function checkToken() {
       limit.textContent = '⚠ Token rejected: check it was copied fully and hasn\'t expired.';
       return;
     }
+    if (!r.ok) throw new Error(`GitHub answered ${r.status} while checking the token; try again in a moment.`);
     const {resources: {core, graphql}} = await r.json();
     if (token !== S.token) return;
     const scopes = r.headers.get('X-OAuth-Scopes');   // classic tokens only; null for fine-grained tokens
-    const star = !S.token ? '' : scopes == null ? ' · fine-grained' : /\b(public_)?repo\b/.test(scopes) ? ' · ★ can star' : ' · read-only (add "public_repo" to star)';
+    const star = !S.token ? '' : scopes == null ? ' · fine-grained' : canStar(scopes) ? ' · ★ can star' : ' · read-only (add "public_repo" to star)';
     summary.textContent = S.token ? '· ✅ set' + star : '· not set (60 requests/hour)';
     limit.textContent = `${S.token ? '✅ Token OK' + star : 'No token'} · REST: ${core.remaining}/${core.limit} left ` +
       `(resets ${new Date(core.reset * 1000).toLocaleTimeString()})` + (graphql ? ` · GraphQL: ${graphql.remaining}/${graphql.limit}` : '');

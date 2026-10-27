@@ -28,8 +28,21 @@ export function ago(d) {
   return 'just now';
 }
 
+// toLocaleDateString(…, options) builds a new Intl.DateTimeFormat on every call, which made drawing 200 cards (26 bar
+// tooltips each) take seconds; each format is built once instead.
+const formats = new Map();
+/** A date (ISO text, ms or Date) as local text in the given Intl format; '' when it isn't a valid date. */
+export function fmtDate(d, opts) {
+  const t = d == null || d === '' ? NaN : new Date(d).getTime();
+  if (!Number.isFinite(t)) return '';
+  const key = JSON.stringify(opts);
+  let f = formats.get(key);
+  if (!f) formats.set(key, f = new Intl.DateTimeFormat(undefined, opts));
+  return f.format(t);
+}
+
 /** ISO date → full local date and time, for tooltips. */
-export const when = d => d ? new Date(d).toLocaleString(undefined, {dateStyle: 'medium', timeStyle: 'short'}) : '';
+export const when = d => fmtDate(d, {dateStyle: 'medium', timeStyle: 'short'});
 
 /** Elapsed time since a performance.now() mark, e.g. "2.4s". */
 export const secs = t0 => ((performance.now() - t0) / 1000).toFixed(1) + 's';

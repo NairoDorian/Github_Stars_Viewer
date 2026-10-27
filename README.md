@@ -72,7 +72,7 @@ The token is only ever sent to `api.github.com`. Where it's stored depends on ho
 
 ### The cache
 
-- **💾 Keep cache is OFF by default** everywhere: nothing is stored, the data (and your token) live in the open tab only. Switch it on and a **cookie** remembers the choice for next time. Switching it on loads what is already stored for the profile (stored data wins), or saves what this tab has if nothing is stored yet. Switching it off leaves files in `data/` untouched; online it erases the browser copy.
+- **💾 Keep cache is OFF by default** everywhere: nothing is stored, the data (and your token) live in the open tab only. Switch it on and a **cookie** remembers the choice for next time. Switching it on loads what is already stored for the profile (stored data wins), or saves what this tab has if nothing is stored yet. Switching it off leaves files in `data/` untouched; online it erases the browser copy. Either way the open tab keeps everything it has, so loading the profile again doesn't start from nothing.
 - **🗑 Clear cache** (two clicks) deletes *all* stored data: the `data/` files (through the local server), this browser's IndexedDB, the app's preferences and the token, and empties the open tab.
 - **Format.** One JSON file (or IndexedDB record) per kind and profile: `config`, `stars:<user>`, `readmes:<user>`, `discover:<user>`, `starcurves`, and the commit / release index in 256 shards `history:<user>:<0-255>`. The local server gzip-compresses files of 64 KB or more (about 3x smaller; it reads plain files too); IndexedDB keeps uncompressed copies.
 - **Never overwrites what it couldn't read.** If a stored file can't be read (server hiccup, damaged file, a file another program keeps locked), the app treats it as unreadable instead of "empty" and refuses to save over it until a reload reads it successfully, so a bad moment can't wipe a good cache. Likewise, toolbar jobs only start once a profile's cache has been read completely, so a click while it loads can't save half-loaded data.
@@ -94,7 +94,7 @@ Cache files of 64 KB or more are stored gzip-compressed (about 3x smaller), and 
 
 **Indexing speed.** Commit messages and release notes are fetched from continuous work queues (no waiting for slow repos), releases and commits at the same time, and the pages of one big repo in parallel by offset cursor. That trick is verified for every repo and falls back to one page at a time if GitHub's cursors ever behave differently; if GitHub asks to slow down, the run waits and continues with fewer parallel requests.
 
-The local server listens on `127.0.0.1` only (the data folder can be moved with the `STARS_DATA` environment variable). It refuses requests from other websites, including DNS-rebinding tricks, so no web page can read your cached token. It writes cache files atomically, so they can't be corrupted.
+The local server listens on `127.0.0.1` only (the data folder can be moved with the `STARS_DATA` environment variable). It refuses requests from other websites, including DNS-rebinding tricks, so no web page can read your cached token, and no site can show the app inside a frame to trick clicks into it. It writes cache files atomically, so they can't be corrupted.
 
 Run `npm run check` to syntax-check and run unit tests for the server and all browser modules on Windows, macOS or Linux. `node scripts/e2e.mjs` runs an optional end-to-end test in your installed Chrome against a fake GitHub and an in-memory cache (needs Playwright: `npm i --no-save playwright`); it never touches your real cache.
 

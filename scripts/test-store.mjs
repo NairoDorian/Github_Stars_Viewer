@@ -115,6 +115,49 @@ test('saveAll writes the whole tab state; clearAll erases the server files, this
   Object.assign(S, {user: '', token: '', repos: [], readmes: {}, history: {}, starCurves: {}});
 });
 
+test('switching "Keep cache" off keeps this tab\'s data: loading the profile again does not start from nothing', async () => {
+  jar.clear(); prefs.clear();
+  const srv = fakeServer();
+  const store = await freshStore();
+  await store.initStore();
+  await store.setPersist(true);   // the local server holds the cache; this tab never copied it into memory
+  Object.assign(S, {user: 'Someone', token: 'tok', repos: [{id: 1, full: 'a/b'}], starPages: [], readmes: {1: {t: 'readme'}},
+    history: {1: {c: [['aaaaaaaaaa', 1, 'msg']], rel: [], done: true}}, disc: {dismissed: [], results: {}}, starCurves: {}});
+  try {
+    await store.setPersist(false);
+    assert.deepEqual((await store.get('stars:someone')).repos, S.repos, 'what "Load stars" reads next');
+    assert.equal((await store.get('readmes:someone'))[1].t, 'readme');
+    assert.equal((await store.loadHistory())[1].c[0][2], 'msg', 'and the commit index, which costs many requests to rebuild');
+    assert.ok(!srv.log.some(l => l.startsWith('PUT')), 'nothing was written to the server');
+  } finally { Object.assign(S, {user: '', token: '', repos: [], readmes: {}, history: {}}); }
+});
+
+test('history saves run one after another: a later save is never overwritten by an earlier, slower one', async () => {
+  jar.clear(); prefs.clear();
+  const srv = fakeServer();
+  const store = await freshStore();
+  await store.initStore();
+  await store.setPersist(true);
+  const {nextGen} = await import('../public/js/state.js');
+  S.user = 'order';
+  const g = nextGen(), serverFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {   // the first save's shard takes a while to reach the server
+    if (init?.method === 'PUT' && init.body.includes('"older"')) await new Promise(resolve => setTimeout(resolve, 30));
+    return serverFetch(url, init);
+  };
+  try {
+    S.history = {7: {c: [['aaaaaaaaaa', 1, 'older']], rel: [], done: false}};
+    store.markHistory('7');
+    const first = store.saveHistory(g);
+    await new Promise(resolve => setTimeout(resolve, 5));   // its write is on its way
+    S.history = {7: {c: [['bbbbbbbbbb', 2, 'newer']], rel: [], done: true}};
+    store.markHistory('7');
+    assert.deepEqual(await Promise.all([first, store.saveHistory(g)]), [true, true]);
+    const shard = JSON.parse(srv.files.get(`history:order:${store.shardOf('7')}`));
+    assert.equal(shard[7].c[0][2], 'newer', 'the newest records are what is stored');
+  } finally { globalThis.fetch = serverFetch; Object.assign(S, {user: '', history: {}}); }
+});
+
 test('a key that could not be read is never overwritten by what this tab holds; a later good read lifts the block', async () => {
   jar.clear(); prefs.clear();
   const srv = fakeServer();

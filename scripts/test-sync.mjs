@@ -122,6 +122,23 @@ test('no job starts while the profile\'s cache is still being read (it would sav
   });
 });
 
+test('loading the same profile again during a check: the new check waits for the old one to stop, then runs', async () => {
+  await check(async () => {
+    const calls = fakeStarList([star(1), star(2)]), github = globalThis.fetch;
+    let answer;
+    const held = new Promise(resolve => { answer = resolve; });
+    globalThis.fetch = async (url, init) => { if (!calls.length) await held; return github(url, init); };   // the first page is slow
+    const first = task(sync);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    nextGen();   // "Load stars" for the same profile: the old check is stopping but still holds the profile's lock
+    const second = task(sync);
+    answer();
+    await Promise.all([first, second]);
+    assert.doesNotMatch(els['#status'].textContent, /Another tab/, 'not mistaken for another tab');
+    assert.equal(S.repos.length, 2, 'the new check ran');
+  });
+});
+
 test('a page that fails stops the check and leaves the cached list untouched', async () => {
   await check(async g => {
     const list = Array.from({length: 150}, (_, i) => star(i + 1));
