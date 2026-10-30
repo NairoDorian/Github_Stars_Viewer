@@ -16,11 +16,11 @@
   Jobs run one at a time per tab (task) and per profile across tabs (a Web Lock). The Cancel button sets S.stop: a job
   finishes its current batch, saves, and ends. Nothing is deleted before its replacement arrived: a failed, cancelled
   or aborted refresh always leaves the previous data. */
-import {S, rkey, ukey, bumpIndex} from './state.js';
+import {S, rkey, ukey, bumpIndex} from './state.js';   // S.visit: someone else's stars are on screen (see store.js), which get the lighter check below
 import {$, DAY, status, secs, pool, chunks} from './util.js';
 import {plan, start, report, finish, stopAll, settle} from './progress.js';
-import {gh, gqlRepos, isFatalError, mapStar, gitSha, needToken, LANG_FIELDS, LAST_FIELDS, parseLast, languageShares, activityFields, parseActivity, recordStars} from './github.js';
-import {saveStars, saveReadmes, saveHistory, markHistory} from './store.js';
+import {gh, ghFetch, headers, gqlRepos, isFatalError, mapStar, gitSha, needToken, LANG_FIELDS, LAST_FIELDS, parseLast, languageShares, activityFields, parseActivity, recordStars} from './github.js';
+import {saveStars, saveReadmes, saveHistory, saveUsers, markHistory} from './store.js';
 import {render} from './list.js';
 import {syncHistory} from './history.js';
 
@@ -30,9 +30,15 @@ const ENRICH_MAX_AGE = 7 * DAY, README_MAX_AGE = 30 * DAY;
 const LEGACY_README_CAP = 100_000;
 // Checked via GraphQL (one cheap lookup each); a repo with any other name falls back to the REST endpoint.
 const README_NAMES = ['README.md', 'readme.md', 'Readme.md', 'README.markdown', 'README.rst', 'README.txt', 'README'];
-const DETAIL_FIELDS = ['release', 'releaseAt', 'releasePre', 'releaseLatest', 'commitAt', 'langs', 'activity', 'enrichedAt', 'enrichedPushed'];
+const DETAIL_FIELDS = ['release', 'releaseAt', 'releasePre', 'releaseLatest', 'commitAt', 'langs', 'activity', 'enrichedAt', 'enrichedPushed', 'liteAt'];
 
 const spread = r => ((r.id || 0) % 7) * DAY;
+/** The light check of a visit asks only for last commit and last release (no languages, no 12-month chart, no READMEs):
+ *  a visit is for looking around, so it costs one cheap GraphQL call per 10 repos. A full check (needsEnrich) counts too. */
+export const needsLite = r => {
+  const at = Math.max(r.enrichedAt || 0, r.liteAt || 0);
+  return !at || r.enrichedPushed !== r.pushed || Date.now() - at > ENRICH_MAX_AGE + spread(r);
+};
 // Repos cached before a field existed get it on the next check (one-time): `!r.langs`, `r.activity === undefined`, and
 // `r.releasePre === undefined` (their "last release" came from GitHub's "Latest" badge, not the newest by date).
 export const needsEnrich = r => !r.enrichedAt || !r.langs || r.activity === undefined || r.releasePre === undefined ||
@@ -99,6 +105,54 @@ export function migrateReadmes() {
   }
 }
 
+// ---- repos that left the star list ----
+const MISSING_CHECKS_WITHOUT_TOKEN = 50;   // one REST request each, of the 60 an hour
+const recentlyChecked = r => !!r.gone && Date.now() - (r.gone.checked ?? 0) < DAY;
+
+/**
+ * Why is a cached repo missing from the star list? GitHub silently leaves out repos you can no longer reach, so the list
+ * alone can't tell "unstarred" from "deleted / made private / hidden". Asked per missing repo (checked against the real
+ * ESP32-P4-Knob-Touch-AMOLED-1.75 case: its page, its REST entry, the org's list and the star list all just omit it):
+ *   'unstarred'  it still exists: you unstarred it, so it is forgotten (the list, the cache).
+ *   'gone'       GitHub says "not found" (404), "unavailable for legal reasons" (451) or "access blocked / disabled"
+ *                (403): its local copy is kept and marked (r.gone).
+ * A repo without an entry could not be verified (rate limit, network, an unclear answer): it is kept as it is and asked
+ * again at the next check. The judge is REST by numeric id (GET /repositories/<id>), which follows renames, transfers and
+ * a name taken over by another repo; nothing is ever marked 'gone' on less than such an answer. With a token a GraphQL call
+ * first clears 40 repos at a time that plainly still exist (same id): it may only confirm existence, because GraphQL also
+ * answers null when it merely times out. Without a token it costs one request per repo, at most 50.
+ */
+async function checkMissing(g, missing) {
+  const out = new Map();
+  for (const r of missing) if (recentlyChecked(r)) out.set(r, 'gone');   // verified in the last day: not asked again at every check
+  let todo = missing.filter(r => !out.has(r)).slice(0, S.token ? Infinity : MISSING_CHECKS_WITHOUT_TOKEN), stop = false;
+  if (S.token && todo.length) {
+    const rest = [];
+    await pool(chunks(todo, 40), 4, async batch => {
+      if (g !== S.gen) return;
+      let data;
+      try { data = await gqlRepos(batch, 'databaseId', r => [r.owner, r.name]); } catch { rest.push(...batch); return; }
+      batch.forEach((r, j) => { const d = data['r' + j]; if (d && (r.id == null || d.databaseId === r.id)) out.set(r, 'unstarred'); else rest.push(r); });
+    });
+    todo = rest;
+  }
+  await pool(todo, 6, async r => {
+    if (stop || g !== S.gen) return;
+    try {
+      const res = await ghFetch(r.id != null ? '/repositories/' + r.id : '/repos/' + r.full, {headers: headers()});
+      if (g !== S.gen) return;
+      if (res.status === 404 || res.status === 451) out.set(r, 'gone');
+      else if (res.ok) out.set(r, 'unstarred');   // it exists (by id: whatever it is called now); without a cached id the name is all there is
+      else if (res.status === 401) { needToken(); stop = true; }
+      else if (res.status === 403 || res.status === 429) {
+        if (res.status === 429 || res.headers.get('x-ratelimit-remaining') === '0' || res.headers.get('retry-after')) stop = true;   // budget used up: the rest waits
+        else if (/blocked|disabled|taken down|dmca/i.test((await res.json().catch(() => ({}))).message || '')) out.set(r, 'gone');
+      }
+    } catch { /* offline or aborted: unknown, kept, asked again next time */ }
+  });
+  return out;
+}
+
 // ---- 1. star list ----
 /** All pages in parallel, each conditional on its cached ETag. Returns [{etag, ids, items, hit}] in page order. */
 async function fetchStarPages(g) {
@@ -136,9 +190,14 @@ async function fetchStarPages(g) {
   return pages;
 }
 
-/** Full check: star list, then details (releases/READMEs) for whatever changed. */
+// A repo missing from ONE star-list check keeps its README and commit index. The pages are fetched in parallel, so a star
+// added or removed meanwhile can move a repo across a page boundary and hide it; deleting its (expensive) index on that
+// glimpse would be a loss. Only a second check in a row confirms that it is really gone.
+let gone = {user: '', keys: new Set()};
+
+/** Full check: star list, then details (releases/READMEs) for whatever changed. A visit does the light version. */
 export async function sync(g) {
-  const t0 = performance.now();
+  const t0 = performance.now(), lite = !!S.visit;
   status('Checking GitHub (all pages in parallel)…');
   // The steps of this job, shown up front: what exists in the cache decides which later steps will run.
   const indexed = S.token && Object.keys(S.history).length > 0;
@@ -167,47 +226,63 @@ export async function sync(g) {
     if (oldKey !== newKey && S.history[oldKey]) { S.history[newKey] = S.history[oldKey]; delete S.history[oldKey]; markHistory(oldKey); markHistory(newKey); }
   }
   const freshFulls = new Set([...fresh.values()].map(r => r.full));
-  const removed = S.repos.filter(r => !(r.id ? fresh.has(r.id) : freshFulls.has(r.full))).length;
+  // Repos of the cache that the star list no longer has: unstarred (it still exists: forget it), or deleted / made private /
+  // hidden by GitHub (it can't be listed any more: keep the local copy, marked). See checkMissing.
+  const missing = S.repos.filter(r => !(r.id ? fresh.has(r.id) : freshFulls.has(r.full)));
+  const verdict = await checkMissing(g, missing);
+  if (g !== S.gen) return;
+  const kept = missing.filter(r => verdict.get(r) !== 'unstarred').map(r => verdict.get(r) === 'gone' ? {...r, gone: {at: r.gone?.at ?? Date.now(), checked: recentlyChecked(r) ? r.gone.checked : Date.now()}} : r);
+  const removed = missing.length - kept.length, hidden = kept.filter(r => r.gone).length, unverified = missing.filter(r => !verdict.has(r)).length;
   const hadEnrich = S.repos.some(r => r.enrichedAt || r.commitAt);
   const hadReadmes = Object.keys(S.readmes).length > 0;
   const hadHistory = Object.keys(S.history).length > 0;
 
-  S.repos = [...fresh.values()];
+  S.repos = [...fresh.values(), ...kept];
   for (const r of S.repos) r.starHist = recordStars(r.starHist, r.stars);   // one sample per day → star growth charts
   S.starPages = pages.map(({etag, ids}) => ({etag, ids}));
   const keep = new Set(S.repos.map(rkey));
-  for (const k of Object.keys(S.readmes)) if (!keep.has(k)) delete S.readmes[k];   // unstarred
-  for (const k of Object.keys(S.history)) if (!keep.has(k)) { delete S.history[k]; markHistory(k); }
+  if (gone.user !== ukey()) gone = {user: ukey(), keys: new Set()};
+  const orphans = [...new Set([...Object.keys(S.readmes), ...Object.keys(S.history)])].filter(k => !keep.has(k));
+  const confirmed = orphans.filter(k => gone.keys.has(k));   // missing from the previous check too: really unstarred
+  for (const k of confirmed) { delete S.readmes[k]; if (S.history[k]) { delete S.history[k]; markHistory(k); } }
+  gone.keys = new Set(orphans.filter(k => !confirmed.includes(k)));
+  // Counts of users you no longer star anything from.
+  const owners = new Set(S.repos.map(r => r.owner.toLowerCase()));
+  const staleUsers = Object.keys(S.users).filter(k => !owners.has(k));
+  for (const k of staleUsers) delete S.users[k];
   bumpIndex();
   await saveStars(g);
-  if (removed) await saveReadmes(g);
+  if (confirmed.length) await saveReadmes(g);
+  if (staleUsers.length) await saveUsers(g);
   await saveHistory(g);   // writes only the shards that changed
   if (g !== S.gen) return;   // a profile change may happen while a large cache file is being written
 
   const diff = [added && `+${added} new`, changed && `${changed} with new commits`, renamed && `${renamed} renamed`,
-    removed && `−${removed} unstarred`].filter(Boolean).join(' · ') || 'list up to date';
+    removed && `−${removed} unstarred`, hidden && `${hidden} removed or private (kept)`, unverified && `${unverified} not verified (kept, checked again next time)`].filter(Boolean).join(' · ') || 'list up to date';
   const hits = pages.filter(p => p.hit).length;
   status(`${S.repos.length} stars · ${diff} · ${pages.length} pages in ${secs(t0)}${hits ? ` (${hits} unchanged)` : ''}`);
   render();
 
   // Details only for what's missing or stale. With a token the tiles' last commit / last release are always kept
   // current; READMEs only if they were indexed before.
-  const wantEnrich = hadEnrich || !!S.token;
-  const res = wantEnrich || hadReadmes ? await refreshDetails(g, {wantReadmes: hadReadmes, wantEnrich}) : null;
+  const wantEnrich = lite ? !!S.token : hadEnrich || !!S.token;
+  const res = wantEnrich || hadReadmes ? await refreshDetails(g, {wantReadmes: hadReadmes, wantEnrich, lite}) : null;
   // Commit messages and release notes: only if they were indexed before (the toolbar button does the first full run).
   let hist = null;
   if (g === S.gen && hadHistory && S.token) {
-    hist = await syncHistory(g, S.repos);
+    hist = await syncHistory(g, S.repos.filter(r => !r.gone));
     if (g === S.gen) { bumpIndex(); render(); }
   }
   if (g === S.gen) status(`${S.repos.length} stars · ${diff} · ${res?.summary ? res.summary + ' · ' : ''}${hist?.summary ? hist.summary + ' · ' : ''}all checked in ${secs(t0)}`);
 }
 
 // ---- 2-4. releases, commits, READMEs ----
-/** Refreshes details of repos that need it. Returns {summary}. */
-async function refreshDetails(g, {wantReadmes, wantEnrich}) {
-  if (!S.token) return wantReadmes ? restReadmes(g, S.repos.filter(needsReadme)) : {summary: 'add a token for releases'};
-  const todo = S.repos.filter(r => (wantEnrich && needsEnrich(r)) || (wantReadmes && needsReadme(r)));
+/** Refreshes details of repos that need it. Returns {summary}. `lite`: only last commit and last release (a visit's check). */
+async function refreshDetails(g, {wantReadmes, wantEnrich, lite = false}) {
+  const live = S.repos.filter(r => !r.gone);   // a repo GitHub no longer shows can't be refreshed: its local copy stays as it is
+  if (!S.token) return wantReadmes ? restReadmes(g, live.filter(needsReadme)) : {summary: 'add a token for releases'};
+  const stale = lite ? needsLite : needsEnrich;
+  const todo = live.filter(r => (wantEnrich && stale(r)) || (wantReadmes && needsReadme(r)));
   if (!todo.length) {
     finish('details', 'all up to date');
     if (wantReadmes) finish('readmes', 'all up to date');   // READMEs not indexed: there is no such step to finish
@@ -217,9 +292,9 @@ async function refreshDetails(g, {wantReadmes, wantEnrich}) {
 
   const now0 = Date.now();   // activity buckets are counted up to this moment
   const readmeFields = README_NAMES.map((n, k) => `m${k}:object(expression:${JSON.stringify('HEAD:' + n)}){...on Blob{oid}}`).join(' ');   // the README's git hash
-  const fullFields = LAST_FIELDS + ' ' + LANG_FIELDS + ' ' + activityFields(now0) + (wantReadmes ? ' ' + readmeFields : '');
+  const fullFields = LAST_FIELDS + (lite ? '' : ' ' + LANG_FIELDS + ' ' + activityFields(now0)) + (wantReadmes ? ' ' + readmeFields : '');
   // Repos whose tiles, languages and activity are still fresh only need their README hash: a much lighter query.
-  const full = todo.filter(r => wantEnrich && needsEnrich(r)), light = todo.filter(r => !(wantEnrich && needsEnrich(r)));
+  const full = todo.filter(r => wantEnrich && stale(r)), light = todo.filter(r => !(wantEnrich && stale(r)));
   const batches = [...chunks(full, 10).map(items => ({items, isFull: true})), ...chunks(light, 10).map(items => ({items, isFull: false}))];
   const download = [], viaRest = [];
   let checked = 0, same = 0, skipped = 0, fatal = null;
@@ -237,7 +312,8 @@ async function refreshDetails(g, {wantReadmes, wantEnrich}) {
       if (g !== S.gen) return;   // never write an old profile's results into the newly loaded profile
       const d = data['r' + j];
       if (!d) { skipped++; continue; }   // GraphQL may omit one repo; keep its old details and retry later
-      if (isFull) Object.assign(r, parseLast(d), {langs: languageShares(d.languages), activity: parseActivity(d, now0), enrichedAt: now, enrichedPushed: r.pushed});
+      if (isFull) Object.assign(r, parseLast(d), lite ? {liteAt: now, enrichedPushed: r.pushed}
+        : {langs: languageShares(d.languages), activity: parseActivity(d, now0), enrichedAt: now, enrichedPushed: r.pushed});
       if (!wantReadmes || !needsReadme(r)) continue;
       const k = rkey(r), c = S.readmes[k];
       const hit = README_NAMES.map((path, i) => d['m' + i]?.oid && {path, oid: d['m' + i].oid}).find(Boolean);   // a directory named README has no oid

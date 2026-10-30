@@ -472,6 +472,7 @@ test('server.js: static serving, HEAD, cache PUT/GET, and DNS-rebinding / cross-
   const testKey = '__test_suite_tmp__';
   const dataDir = mkdtempSync(join(tmpdir(), 'stars-viewer-test-'));   // never the real ./data: this test deletes cache files
   const testFile = join(dataDir, `${testKey}.json`);
+  writeFileSync(join(dataDir, 'stars_x.json.123.456.tmp'), '{"half');   // left by a server killed mid-write: removed at startup
   const proc = spawn(process.execPath, ['server.js'], {env: {...process.env, PORT: String(port), STARS_DATA: dataDir}, stdio: ['ignore', 'pipe', 'pipe']});
   try {
     await new Promise((resolve, reject) => {
@@ -480,6 +481,7 @@ test('server.js: static serving, HEAD, cache PUT/GET, and DNS-rebinding / cross-
       proc.on('exit', code => { clearTimeout(t); reject(new Error(`server exited (${code})`)); });
     });
     const base = `http://localhost:${port}`;
+    assert.deepEqual(readdirSync(dataDir), [], 'a temp file left by an earlier crash was removed at startup');
 
     // Static GET & HEAD
     const headRes = await fetch(`${base}/`, {method: 'HEAD'});

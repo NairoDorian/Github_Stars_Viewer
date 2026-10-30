@@ -104,6 +104,7 @@ export const mapStar = ({starred_at, repo: x}) => ({
   about: x.description || '', homepage: x.homepage, stars: x.stargazers_count, forks: x.forks_count,
   issues: x.open_issues_count, lang: x.language, topics: x.topics || [], license: x.license?.spdx_id,
   archived: x.archived, fork: x.fork, created: x.created_at, pushed: x.pushed_at, starred: starred_at, branch: x.default_branch,
+  ownerType: x.owner.type,   // "User" | "Organization" | "Bot": organizations can't star anything (see users.js)
 });
 
 /** Repository search, most-starred first. `page` goes deeper into the results (GitHub serves the first 1000). */
@@ -140,6 +141,56 @@ export async function repoMeta(fulls) {
     });
   });
   return out;
+}
+
+/**
+ * How many repos each user has starred, and their followers, 50 users per GraphQL call (3 calls in parallel).
+ * `onBatch(Map<lower-cased login, {type, name, stars, followers} | null>)` gets every answered batch as it arrives (null:
+ * GitHub knows no such user any more), so callers can show and save progress. `halted()` ends the run between batches.
+ * Token and rate-limit errors (isFatalError) are thrown after the batches already delivered; any other failed batch is
+ * skipped and counted. Returns {failed}.
+ */
+export async function ownerStats(logins, onBatch, halted = () => false) {
+  let failed = 0;
+  await pool(chunks(logins, 50), 3, async batch => {
+    if (halted()) return;
+    let data;
+    try {
+      data = await gql('query{' + batch.map((login, j) => `u${j}:repositoryOwner(login:${JSON.stringify(login)}){__typename login ` +
+        '...on User{name starredRepositories{totalCount} followers{totalCount}} ...on Organization{name}}').join(' ') + '}');
+    } catch (e) {
+      if (isFatalError(e)) throw e;
+      failed += batch.length;   // timeout, "slow down"...: the user can run it again
+      return;
+    }
+    const out = new Map();
+    batch.forEach((login, j) => {
+      const d = data['u' + j];
+      out.set(login.toLowerCase(), !d ? null : {type: d.__typename, name: d.name || '', stars: d.starredRepositories?.totalCount ?? null, followers: d.followers?.totalCount ?? null});
+    });
+    onBatch(out);
+  });
+  return {failed};
+}
+
+/** Every repo a user starred, as [{id, full}], with the list's pages fetched in parallel (public data, no token needed). */
+export async function starredOf(login) {
+  const path = p => `/users/${encodeURIComponent(login)}/starred?per_page=100&page=${p}`;
+  const first = await gh(path(1));
+  if (!first.ok) throw new Error(first.status === 404 ? `User "${login}" not found` : 'GitHub ' + first.status);
+  const last = Number(first.headers.get('Link')?.match(/[?&]page=(\d+)>; rel="last"/)?.[1] || 1), pages = [await first.json()];
+  await pool(Array.from({length: last - 1}, (_, i) => i + 2), 6, async p => { pages[p - 1] = await (await gh(path(p))).json(); });
+  return pages.flat().map(x => ({id: x.id, full: x.full_name}));
+}
+
+/** One user's starred-repo count with a single REST request: the page number of the "last" link when each page holds one
+ *  repo. No link means 0 or 1. `remaining`: requests left this hour (60/h without a token). */
+export async function starredCount(login) {
+  const r = await gh(`/users/${encodeURIComponent(login)}/starred?per_page=1`);
+  const left = r.headers.get('x-ratelimit-remaining'), remaining = left == null ? null : Number(left);
+  if (r.status === 404) return {missing: true, remaining};
+  const last = Number(r.headers.get('Link')?.match(/[?&]page=(\d+)>; rel="last"/)?.[1] || 0);
+  return {stars: last || (r.ok ? (await r.json()).length : 0), remaining};
 }
 
 /** GraphQL fields for a repo's full language breakdown (every language, largest first). */

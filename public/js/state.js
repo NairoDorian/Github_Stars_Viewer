@@ -2,6 +2,10 @@
 
 export const S = {
   user: '',          // GitHub login whose stars are shown
+  home: '',          // YOUR login: the profile that is saved. Any other profile is a visit (see store.js setVisit)
+  visit: '',         // login being visited ('' = not visiting): nothing of a visit is ever written to disk or IndexedDB
+  mine: null,        // while visiting: {ids, names} of the repos YOU starred (null = not known yet), to mark and filter the visited tiles
+  onlyNew: false,    // while visiting: show only repos you have not starred
   token: '',         // GitHub token (stored with the config only while "💾 Keep cache" is on)
   repos: [],         // starred repos, shape built by mapStar() in github.js
   starPages: [],     // [{etag, ids}] per star-list page, for conditional (304) re-fetches
@@ -9,6 +13,7 @@ export const S = {
   history: {},       // {<repo id>: {head, tail, c: [[oid10, unix s, message]…], rel: [[tag, name, unix s, notes, pre]…], done, capped, …}} (history.js)
   indexVer: 0,       // bumped when README / history text changes, so cached search facets are rebuilt
   disc: {dismissed: [], results: {}},   // discovery cache (see discover.js)
+  users: {},         // {<owner login lower-cased>: {at, type, stars, followers, name} | {at, missing}}: how many repos each user of your stars starred (users.js)
   starCurves: {},    // {<owner/name lower-cased>: {at, pts: [[time, stars], …] | null}} from star-history.com (shared by all users)
   hideForks: false,  // shared toolbar filter for starred repos and Discover
   stop: false,       // set by the Cancel button: running jobs save what they have and end (see sync.js task())
@@ -33,6 +38,15 @@ export function genSignal() {
   }
   return genCtrl.signal;
 }
+
+/** Did you star this repo? true / false while visiting, null when that isn't known yet; always true outside a visit (they are your stars). */
+export function isMine(r) {
+  if (!S.visit) return true;
+  if (!S.mine) return null;
+  return S.mine.ids.has(r.id) || S.mine.names.has(String(r.full).toLowerCase());
+}
+/** The set {ids, names} of a list of repos ({id, full}). */
+export const mineOf = repos => ({ids: new Set(repos.map(r => r.id).filter(i => i != null)), names: new Set(repos.map(r => r.full.toLowerCase()))});
 
 export const ukey = () => S.user.toLowerCase();
 

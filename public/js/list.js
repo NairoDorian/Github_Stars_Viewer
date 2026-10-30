@@ -3,9 +3,9 @@
    Search: every positive term must match the card fields (name, owner, about, topics, languages) or, when ticked, the
    READMEs or the commit messages / release notes; each term may match somewhere different. "exact phrase", -exclude and
    qualifiers (lang: owner: topic: is: stars:) are supported. Matches outside the card fields are explained by snippets. */
-import {S, rkey, readmeEntry, readmeText, readmeLower, historyIndex, historyHit, warmHistoryIndex} from './state.js';
+import {S, isMine, rkey, readmeEntry, readmeText, readmeLower, historyIndex, historyHit, warmHistoryIndex} from './state.js';
 import {$, esc, escRe, fmtN, fmtDate, ago, when, safeUrl, tally, status} from './util.js';
-import {activityNow, starGains, ACTIVITY_SPAN, ACTIVITY_BUCKETS} from './github.js';
+import {activityNow, starGains, ACTIVITY_SPAN, ACTIVITY_BUCKETS, setStar, whoAmI, needToken} from './github.js';
 import {drawableCurve, starsAt, watchStarCharts} from './starhistory.js';
 import {sortRepos, SORT_OPTIONS} from './sort.js';
 
@@ -59,7 +59,9 @@ function checkQual(r, {k, v}) {
   if (k === 'lang' || k === 'language') return (r.lang || '').toLowerCase() === v || (r.langs || []).some(([n]) => n.toLowerCase() === v);
   if (k === 'owner' || k === 'user') return (r.owner || '').toLowerCase() === v;
   if (k === 'topic' || k === 'tag') return (r.topics || []).some(t => t.toLowerCase() === v);
-  if (k === 'is') return v === 'archived' ? !!r.archived : v === 'active' ? !r.archived : v === 'fork' ? !!r.fork : null;
+  // is:new / is:mine: did YOU star it (while visiting someone: unknown, hence ignored, until your stars are known). is:removed: deleted, private or hidden on GitHub.
+  if (k === 'is') return v === 'archived' ? !!r.archived : v === 'active' ? !r.archived : v === 'fork' ? !!r.fork : v === 'removed' ? !!r.gone
+    : v === 'mine' ? isMine(r) : v === 'new' ? (isMine(r) === null ? null : !isMine(r)) : null;
   if (k === 'stars') {   // GitHub's forms: stars:>1000, stars:>=1k, stars:10..500, stars:100..*, stars:*..50
     const s = r.stars ?? 0, range = v.split('..');
     if (range.length === 2) {
@@ -151,7 +153,7 @@ function starTimeline(pts) {
 
 /** Commits row (GitHub) + stars row. Stars come from star-history.com (full history, loaded lazily when the card
  *  scrolls into view, see starhistory.js); if it has no data for a repo, the app's own daily star-count samples are used. */
-const shown = new Map();   // lower-cased full name → repo object, so a card can be redrawn when its star history arrives
+const shown = new Map();   // lower-cased full name → repo object, so a card can be redrawn when its star history arrives (reset with the filters, i.e. when the profile changes)
 export function activityHTML(r) {
   const full = r.full || r.full_name;
   if (full) shown.set(full.toLowerCase(), r);
@@ -270,6 +272,37 @@ function pickTopics(topics, re) {
   return [...topics].sort((a, b) => rank(b) - rank(a)).slice(0, 8);
 }
 
+/** While visiting someone: mark what you already starred, and let you star the rest from here. */
+function visitStar(r) {
+  if (!S.visit || r.gone) return '';
+  const mine = isMine(r);
+  return mine === true ? '<span class="mine" title="You already starred this repository">★ starred by you</span>'
+    : mine === false ? `<button class="starbtn" data-vstar="${esc(r.full)}" title="Star on GitHub, on your own account">☆ Star</button>`
+    : '<span class="muted small" title="Reading your own stars to compare…">…</span>';
+}
+
+/** The ☆ Star button of a visited repo: stars it for the token's owner, who must be you (S.home). */
+async function starVisited(full, btn) {
+  if (!S.token) { needToken(); return status('⚠ Starring needs a token. See the 🔑 panel.'); }
+  btn.disabled = true;
+  btn.textContent = 'Starring…';
+  try {
+    const me = await whoAmI();
+    if (S.home && me.toLowerCase() !== S.home.toLowerCase()) throw new Error(`Your token belongs to ${me}, but your profile is ${S.home}.`);
+    const code = await setStar(full, true);
+    if (code === 403 || code === 404) { needToken(); throw new Error('Your token can read but not star. Grant "Starring: Read and write" (fine-grained) or "public_repo" (classic) in the 🔑 panel.'); }
+    if (code >= 300) throw new Error('GitHub ' + code);
+    const repo = S.repos.find(r => r.full.toLowerCase() === full.toLowerCase());
+    if (S.mine) { S.mine.names.add(full.toLowerCase()); if (repo?.id != null) S.mine.ids.add(repo.id); }
+    status(`★ Starred ${full} on GitHub. It joins your stars the next time your own list is loaded.`);
+    window.dispatchEvent(new CustomEvent('mine-changed'));   // main.js redraws the banner and the tiles
+  } catch (e) {
+    status('⚠ ' + e.message);
+    btn.disabled = false;
+    btn.textContent = '☆ Star';
+  }
+}
+
 /** Shared card layout. Discovery passes a normalized repo plus reasons and actions. */
 export function card(r, {snips = [], re = null, suggestion = false, reasons = []} = {}) {
   const avatar = r.avatar ? `${r.avatar}${r.avatar.includes('?') ? '&' : '?'}s=36` : '';
@@ -277,9 +310,10 @@ export function card(r, {snips = [], re = null, suggestion = false, reasons = []
   const license = r.license && r.license !== 'NOASSERTION' ? `<span>${esc(r.license)}</span>` : '';
   const tag = suggestion ? 'li' : 'div';
   const shownTopics = pickTopics(r.topics || [], re);
-  return `<${tag} class="card${suggestion ? ' suggestion-card' : ''}">
+  return `<${tag} class="card${suggestion ? ' suggestion-card' : ''}${r.gone ? ' gone' : ''}">
     <div class="owner">${avatar ? `<img src="${esc(avatar)}" loading="lazy" alt="">` : ''}<span class="chip" tabindex="0" role="button" data-owner="${esc(r.owner)}">${hl(r.owner, re)}</span>${r.archived ? ' · archived' : ''}${r.fork ? ' · fork' : ''}</div>
     <a href="${esc(safeUrl(r.url))}" target="_blank" rel="noopener">${hl(r.name, re)}</a>
+    ${r.gone ? `<div class="gone-note" title="GitHub no longer shows this repository: it was deleted, made private or hidden. You still starred it, so this local copy is kept. It is not updated any more.">🚫 Removed, private or hidden on GitHub · local copy from ${esc(ago(r.gone.at))}</div>` : ''}
     <p class="desc">${r.about ? hl(r.about, re) : '<span class="muted">No description</span>'}</p>
     ${snips.map(s => snipHTML(r, s, re)).join('')}
     <div class="chips">${shownTopics.map(t => `<span class="chip" tabindex="0" role="button" data-topic="${esc(t)}">${hl(t, re)}</span>`).join('')}</div>
@@ -296,7 +330,7 @@ export function card(r, {snips = [], re = null, suggestion = false, reasons = []
     ${suggestion ? `<div class="chips reasons">${reasons.slice(0, 5).map(reason => `<span class="why">${esc(reason)}</span>`).join('')}</div>
       <div class="suggestion-actions"><button class="starbtn" data-star="${esc(r.full)}" title="Star on GitHub">☆ Star</button>
       <button class="x" data-dismiss="${esc(r.full.toLowerCase())}" title="Never suggest this repo again">✕ Not interested</button></div>`
-      : `<button class="similar" data-similar="${esc(rkey(r))}" title="Find repos related to this one that you haven't starred">✨ Show suggestions</button>`}
+      : `<div class="suggestion-actions"><button class="similar" data-similar="${esc(rkey(r))}" title="Find repos related to this one that you haven't starred">✨ Show suggestions</button>${visitStar(r)}</div>`}
   </${tag}>`;
 }
 
@@ -337,6 +371,7 @@ export function render() {
   const out = [], forLang = [], forTopic = [], forOwner = [];
   for (const r of S.repos) {
     if (S.hideForks && r.fork) continue;
+    if (S.visit && S.onlyNew && isMine(r) === true) continue;   // visiting: only what you have not starred yet
     const okLang = !filters.lang || r.lang === filters.lang;
     const okTopic = !filters.topic || r.topics.includes(filters.topic);
     const okOwner = !filters.owner || r.owner === filters.owner;
@@ -355,7 +390,7 @@ export function render() {
   const pills = [['lang', 'Language'], ['topic', 'Topic'], ['owner', 'Owner']]
     .filter(([k]) => filters[k])
     .map(([k, label]) => `<button class="chip filter-pill" data-${k}="${esc(filters[k])}" title="Remove ${label.toLowerCase()} filter">${label}: ${esc(filters[k])} ✕</button>`);
-  const filtered = S.hideForks || pills.length > 0 || q.hasQuery;
+  const filtered = S.hideForks || (S.visit && S.onlyNew) || pills.length > 0 || q.hasQuery;
   const exportBtns = out.length ? `<span class="export-actions"><button class="clear-filters" data-export="md" title="Export shown repos as Markdown">⬇ .md</button><button class="clear-filters" data-export="json" title="Export shown repos as JSON">⬇ .json</button></span>` : '';
   $('#count').innerHTML = `<span>${out.length} of ${S.repos.length} repos${filtered ? ' (filtered)' : ''}</span>` +
     (pills.length ? ` <span class="active-filters">${pills.join('')}<button class="clear-filters" data-clear-filters title="Clear active filters">Clear</button></span>` : '') + exportBtns;
@@ -485,6 +520,13 @@ export function initList() {
   setFacetsHidden(hidden);
   $('#toggleFacets').onclick = () => setFacetsHidden(!document.querySelector('main').classList.contains('nofacets'));
   window.addEventListener('star-curve', e => refreshActivity(e.detail));
+  // A user's row in the Users panel (users.js): show only their repos. The other facets are cleared so the list matches the number clicked.
+  window.addEventListener('filter-owner', e => {
+    filters.lang = filters.topic = null;
+    filters.owner = e.detail;
+    limit = PAGE; render();
+    document.querySelector('main').scrollIntoView({block: 'start', behavior: 'smooth'});
+  });
   let timer;
   // Searching commit messages scans far more text than the card fields, so it waits a little longer after each keystroke.
   $('#q').oninput = () => { clearTimeout(timer); timer = setTimeout(() => { limit = PAGE; render(); }, $('#inHistory').checked ? 300 : 120); };
@@ -509,6 +551,8 @@ export function initList() {
   $('#list').addEventListener('click', e => {
     const b = e.target.closest('[data-similar]');
     if (b) window.dispatchEvent(new CustomEvent('suggest-for', {detail: b.dataset.similar}));
+    const star = e.target.closest('[data-vstar]');
+    if (star) starVisited(star.dataset.vstar, star);
   });
   // Facet, chip and export clicks (sidebar, filter bar and cards).
   document.addEventListener('click', e => {

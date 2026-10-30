@@ -15,8 +15,12 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const {chromium} = createRequire(process.env.PLAYWRIGHT_DIR ? join(process.env.PLAYWRIGHT_DIR, 'x.js') : import.meta.url)('playwright');
 const port = 19000 + Math.floor(Math.random() * 900), base = `http://localhost:${port}`;
 const dataDir = mkdtempSync(join(tmpdir(), 'stars-viewer-e2e-'));
-const server = spawn(process.execPath, ['server.js'], {cwd: root, env: {...process.env, PORT: String(port), STARS_DATA: dataDir}, stdio: 'ignore'});
-await new Promise(r => setTimeout(r, 900));
+const server = spawn(process.execPath, ['server.js'], {cwd: root, env: {...process.env, PORT: String(port), STARS_DATA: dataDir}, stdio: ['ignore', 'pipe', 'inherit']});
+await new Promise((resolve, reject) => {   // ready when it says so, however slow the machine
+  const t = setTimeout(() => reject(new Error('server startup timeout')), 10000);
+  server.stdout.on('data', d => { if (String(d).includes('Stars Viewer running')) { clearTimeout(t); resolve(); } });
+  server.on('exit', code => { clearTimeout(t); reject(new Error(`server exited (${code})`)); });
+});
 
 const channel = process.env.E2E_CHANNEL === undefined ? 'chrome' : process.env.E2E_CHANNEL || undefined;
 const browser = await chromium.launch({channel});
@@ -52,7 +56,7 @@ await page.route(/\/cache(\/.*)?$/, async r => {
 
 // ---- a fake GitHub with 3 starred repos ----
 const names = ['alpha', 'beta', 'gamma'], N = 5000, TOTAL = 3 * N, DELAY = 600;
-const star = (n, i) => ({starred_at: '2026-01-0' + (i + 1) + 'T00:00:00Z', repo: {id: 100 + i, full_name: 'acme/' + n, name: n, owner: {login: 'acme', avatar_url: ''},
+const star = (n, i) => ({starred_at: '2026-01-0' + (i + 1) + 'T00:00:00Z', repo: {id: 100 + i, full_name: 'acme/' + n, name: n, owner: {login: 'acme', avatar_url: '', type: 'User'},
   html_url: 'https://github.com/acme/' + n, description: 'The ' + n + ' project', topics: ['demo'], stargazers_count: 10 + i, forks_count: 1, open_issues_count: 0,
   language: 'Go', license: null, archived: false, fork: false, created_at: '2025-01-01T00:00:00Z', pushed_at: '2026-01-01T00:00:00Z', default_branch: 'main', homepage: null}});
 // Commit number i (0 = oldest, N-1 = newest) has the id "<i in hex, 8 digits>bbbb…"; a repo's history is listed newest first.
@@ -70,6 +74,11 @@ await page.route('https://api.github.com/**', async r => {
   if (u.pathname === '/rate_limit') return json({resources: {core: {remaining: 5000, limit: 5000, reset: 0}, graphql: {remaining: 4999, limit: 5000, reset: 0}}});
   if (u.pathname !== '/graphql') return json({}, 404);
   const q = JSON.parse(r.request().postData()).query, data = {};
+  if (q.includes('repositoryOwner(')) {   // the Users panel: how many repos has each owner starred
+    calls.owners = (calls.owners || 0) + 1;
+    for (const m of q.matchAll(/(u\d+):repositoryOwner\(login:"([^"]+)"\)/g)) data[m[1]] = {__typename: 'User', login: m[2], name: 'Acme Inc', starredRepositories: {totalCount: 7}, followers: {totalCount: 3}};
+    return json({data});
+  }
   const starts = [...q.matchAll(/(r\d+):repository\(owner:"([^"]+)",name:"([^"]+)"\)\{/g)];
   let slow = false;
   starts.forEach((m, i) => {
@@ -131,6 +140,52 @@ try {
   assert.match(beta, /last release v2\.0-rc1 pre-release/, 'newest by date is the pre-release, flagged');
   assert.match(gamma, /no releases/);
   step('tiles show last commit and last release', 'beta → ' + beta.match(/last release \S+( pre-release)?/)[0]);
+
+  // ---- Users: every owner of your stars, how many repos they starred; Visit browses them without saving ----
+  assert.equal(await page.isHidden('#usersPanel'), true, 'the Users panel starts closed');
+  await page.click('#toggleUsers');
+  await until(() => /7/.test(document.querySelector('.users-table tbody')?.textContent || ''), null, 10000);   // the counts arrive on opening (token set)
+  const userRow = (await page.locator('.users-table tbody tr').first().innerText()).replace(/\s+/g, ' ');
+  assert.match(userRow, /acme Acme Inc Person 3 7 3/, 'login, name, type, repos in your stars, their stars, followers: ' + userRow);
+  assert.equal(await page.getAttribute('.users-table a[data-visit]', 'href'), '?visit=acme');
+  assert.equal(await page.getAttribute('.users-table .u-actions a', 'href'), 'https://github.com/acme?tab=stars', 'their stars on GitHub');
+  assert.ok(puts.includes('users:e2etest'), 'the counts are saved with the profile');
+  await page.fill('#usersFilter', 'nobody');
+  await until(() => /No user matches/.test(document.querySelector('#usersTable').textContent), null, 5000);
+  await page.fill('#usersFilter', '');
+  if (process.env.E2E_USERS) await page.screenshot({path: process.env.E2E_USERS});   // optional: what the Users panel looks like
+  step('Users panel lists the owners with their own star counts, a GitHub stars link and a Visit link');
+
+  // A visit: acme's stars come from the same fake GitHub. Nothing may be written, and the profile stays yours.
+  puts = [];
+  await page.click('.users-table a[data-visit]');
+  await until(() => !document.querySelector('#visitBanner').hidden, null, 10000);
+  await waitStatus(/all checked/);
+  assert.match(await page.textContent('#visitBanner'), /Visiting acme · 3 stars · .*nothing about them is saved/);
+  assert.equal(await page.isDisabled('#browserCache'), true, 'the cache box can not be switched during a visit');
+  assert.match(await page.textContent('#cacheLabel'), /Not saved while visiting/);
+  assert.match(await page.title(), /acme/);
+  assert.match(page.url(), /\?user=e2etest&visit=acme$/, 'the URL names you and the visited user');
+  assert.match(await page.textContent('#visitBanner'), /0 not starred by you yet/, 'every visited repo is one you starred too (the fake GitHub gives both the same list)');
+  assert.equal(await page.locator('.card .mine').count(), 3, 'each tile says "starred by you"');
+  assert.equal(await page.locator('[data-vstar]').count(), 0);
+  await page.fill('#q', 'alpha'); await page.waitForTimeout(300);
+  await page.click('#indexReadme');   // even the heavy jobs keep their results in memory
+  await page.waitForSelector('#cancelTask', {state: 'hidden', timeout: 30000});
+  await page.fill('#q', '');
+  assert.deepEqual(puts.filter(k => k !== 'config'), [], 'a visit wrote nothing but the config: ' + puts);
+  assert.equal(JSON.parse(store.config).user, 'e2etest', 'the config still names your profile');
+  if (process.env.E2E_VISIT) await page.screenshot({path: process.env.E2E_VISIT});   // optional: what a visit looks like
+  step('Visit: banner, cache box locked, tab title, ?visit= URL, and nothing written', await status());
+  // acme is not the saved profile (e2etest): the stored copy of the profile is untouched, and Back returns to it
+  await page.click('[data-visit-act="back"]');
+  await until(() => document.querySelector('#visitBanner').hidden, null, 10000);
+  await waitStatus(/all checked/);
+  assert.equal(await page.isDisabled('#browserCache'), false);
+  assert.match(page.url(), /\?user=e2etest$/);
+  assert.match(await page.title(), /^Stars Viewer$/);
+  step('Back returns to your own profile and unlocks the cache box');
+  await page.click('#toggleUsers');   // closed again, as the rest of the test expects
 
   // ---- toolbar groups and the collapsible options panel ----
   assert.deepEqual(await page.locator('.grp-label').allInnerTexts(), ['SEARCH IN', 'INDEX', 'VIEW', 'DATA']);

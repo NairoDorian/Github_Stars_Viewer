@@ -39,6 +39,8 @@ const MAX_BODY = MAX_STRING_LENGTH;
 const TYPES = {'.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
   '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon'};
 fs.mkdirSync(DATA, {recursive: true});
+// A server killed in the middle of a write leaves its temp file behind (see writeAtomic): nothing is writing yet, so they are all stale.
+for (const f of fs.readdirSync(DATA)) if (/\.json\.\d+\.\d+\.tmp$/.test(f)) fs.rmSync(path.join(DATA, f), {force: true});
 
 // Cache keys look like "stars:nairodorian"; they map to files like data/stars_nairodorian.json.
 const KEY = /^[\w.:-]{1,120}$/;

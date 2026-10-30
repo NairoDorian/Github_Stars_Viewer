@@ -7,11 +7,16 @@
 //
 // Keys:  config {token, user} · stars:<user> {v, at, repos, pages} · readmes:<user> {<id>: {…}}
 //        history:<user>:<0-255> {<repo id>: {commit messages + release notes}} (sharded, see below; history.js)
-//        discover:<user> {dismissed, results} · starcurves {<owner/name>: {at, pts}} (star-history.com, all users)
+//        discover:<user> {dismissed, results} · users:<user> {<owner login>: {stars, followers…}} (users.js)
+//        starcurves {<owner/name>: {at, pts}} (star-history.com, all users)
+//
+// Visiting: while S.visit is set (someone else's stars are on screen), every key except 'config' lives in visitMem, a map that
+// is never written to disk or IndexedDB and is emptied when the visit ends. That is the whole guarantee, enforced here in
+// get() / put(), the only door to storage.
 import {S, ukey} from './state.js';
 import {status} from './util.js';
 
-export const CACHE_VERSION = 1;   // bump if the stored shape changes, and migrate in main.js load()
+export const CACHE_VERSION = 2;   // bump if the stored shape changes, and migrate in main.js load(). 2: repos carry ownerType, so older star lists are downloaded once more (their page ETags are dropped)
 const CACHE_COOKIE = 'starsViewerCache';   // "1" = keep the cache, "0" = don't; remembered for a year
 const OLD_FLAG = 'starsViewer.browserCache';   // localStorage flag of earlier versions, read as a fallback
 
@@ -20,6 +25,20 @@ const mem = new Map();   // memory mode: the whole cache; browser mode: a copy o
 // Keys whose stored copy could NOT be read (server hiccup, corrupt file, IndexedDB error). get() answers null for them like for
 // "nothing stored", so this tab would build a near-empty replacement; put() refuses to overwrite the real file with it.
 const unreadable = new Set();
+const visitMem = new Map();
+const visited = new Set();   // logins (lower-cased) visited in this tab and not adopted since: put() refuses their keys, whatever happens
+/** The login a profile key belongs to (stars:<user>, history:<user>:<n>…), or null for shared keys (config, starcurves). */
+const keyUser = key => key.match(/^(?:stars|readmes|discover|users|history):([^:]+)/)?.[1].toLowerCase() ?? null;
+
+/** Starts, switches or (with '') ends a visit. A visit never inherits the previous visit's data. */
+export function setVisit(login) {
+  login = login || '';
+  if (login.toLowerCase() !== S.visit.toLowerCase()) visitMem.clear();
+  S.visit = login;
+  if (login) visited.add(login.toLowerCase());
+}
+/** The profile is wanted as a normal, saved one (loaded as your own, or adopted from a visit): its keys may be written again. */
+export const adoptProfile = login => { visited.delete(String(login).toLowerCase()); };
 
 // ---- IndexedDB (browser mode) ----
 let dbp = null;
@@ -96,6 +115,8 @@ export async function setPersist(on) {
  *  localStorage and this tab's memory. The "Keep cache" cookie stays (a preference, not data). Returns {files}. */
 export async function clearAll() {
   mem.clear();
+  visitMem.clear();
+  visited.clear();
   dirtyShards.clear();
   unreadable.clear();
   let files = 0;
@@ -120,9 +141,18 @@ export async function saveAll(g = S.gen) {
   markAllHistory();
   await saveHistory(g);
   await saveDisc(g);
+  await saveUsers(g);
 }
 
 export async function get(key) {
+  if (S.visit && keyUser(key) !== null) return visitMem.get(key) ?? null;   // a visit reads nothing stored, not even a copy of that profile saved earlier
+  return readStored(key);
+}
+
+/** Reads YOUR stored copy of a key, visit or not (a visit uses it to know which repos you starred). Never writes. */
+export const peek = key => readStored(key);
+
+async function readStored(key) {
   try {
     if (mode === 'memory') return mem.get(key) ?? null;
     let v;
@@ -146,6 +176,12 @@ export const isUnreadable = key => unreadable.has(key);
 export const forgetHistoryDirty = () => { dirtyShards.clear(); };
 
 export async function put(key, value) {
+  if (S.visit && key !== 'config') { visitMem.set(key, value); return true; }   // kept for this visit only
+  const owner = keyUser(key);
+  if (owner !== null && visited.has(owner)) {
+    status(`⚠ ${owner}'s data is not saved: you only visited. Use "★ Make this my profile" to keep it.`);
+    return false;
+  }
   if (unreadable.has(key)) {
     status(`⚠ "${key}" could not be read, so the stored copy is kept as it is and not overwritten. Reload the page to try again.`);
     return false;
@@ -165,11 +201,15 @@ export async function put(key, value) {
 }
 
 // `g` = generation the calling job started in. If the user switched profile meanwhile, nothing is written,
-// so data from one user can never be saved under another.
-export const saveStars = (g = S.gen) => g === S.gen && put('stars:' + ukey(), {v: CACHE_VERSION, at: Date.now(), repos: S.repos, pages: S.starPages});
-export const saveReadmes = (g = S.gen) => g === S.gen && put('readmes:' + ukey(), S.readmes);
-export const saveDisc = (g = S.gen) => g === S.gen && put('discover:' + ukey(), S.disc);
-export const saveConfig = () => put('config', {token: S.token, user: S.user});
+// so data from one user can never be saved under another. While a profile is being read (S.loading) S still holds a mix of
+// the old and the new profile, so nothing is written then either.
+const mayWrite = g => g === S.gen && !S.loading;
+export const saveStars = (g = S.gen) => mayWrite(g) && put('stars:' + ukey(), {v: CACHE_VERSION, at: Date.now(), repos: S.repos, pages: S.starPages});
+export const saveReadmes = (g = S.gen) => mayWrite(g) && put('readmes:' + ukey(), S.readmes);
+export const saveDisc = (g = S.gen) => mayWrite(g) && put('discover:' + ukey(), S.disc);
+export const saveUsers = (g = S.gen) => mayWrite(g) && put('users:' + ukey(), S.users);
+/** The config holds the token and YOUR login (S.home), never the profile on screen: a visit must not become the next start's profile. */
+export const saveConfig = () => put('config', {token: S.token, user: S.home});
 
 /* Commit messages and release notes are large (hundreds of MB for a big star list), so they are stored in HISTORY_SHARDS
    small records, `history:<user>:<n>` holding {<repo id>: record}, and a save rewrites only the shards whose repos

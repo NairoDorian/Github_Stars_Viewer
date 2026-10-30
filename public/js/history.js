@@ -117,7 +117,7 @@ export const needsHistory = r => {
   const h = S.history[rkey(r)];
   return !h || !h.done || h.pushed !== r.pushed || Date.now() - h.at > HISTORY_MAX_AGE + spread(r);
 };
-const blank = () => ({head: null, tail: null, c: [], rel: [], relN: -1, relTop: '', relAt: 0, done: false, capped: false, at: 0, pushed: null, ro: ''});
+const blank = () => ({head: null, tail: null, c: [], rel: [], relN: -1, relTop: '', relAt: 0, done: false, capped: false, at: 0, pushed: null, ro: optFlags(histOpts())});   // ro: not '', or reconcile() would rewrite every new record once
 const set = (k, patch) => { S.history[k] = {...(S.history[k] || blank()), ...patch}; markHistory(k); };
 
 /** GraphQL commit node → stored entry. Messages are trimmed and capped so the cache stays small. */
@@ -308,7 +308,9 @@ function planStage(checks) {
     const needRel = !rec || !sameReleases(rec, c) || now - (rec.relAt || rec.at || 0) > RELEASES_MAX_AGE + spread(r);
     const job = {r, k, c, failed: false, needRel, relDone: false,
       needNew: !!c.head && (!rec || rec.head !== c.head), needOld: !!c.head && !!rec && rec.head === c.head && !rec.done};
-    if (!c.head && !rec?.done) set(k, {head: null, tail: null, c: [], done: true});   // empty repository
+    // Empty repository. Never when commits are stored: one check that comes back without a branch head (a GitHub hiccup)
+    // must not wipe a repo's index.
+    if (!c.head && !rec?.done && !rec?.c?.length) set(k, {head: null, tail: null, c: [], done: true});
     if (job.needRel || job.needNew || job.needOld) { jobs.push(job); continue; }
     Object.assign(S.history[k], {at: now, pushed: r.pushed, relTop: c.relTop});   // relTop: upgrades a key from before updatedAt
     markHistory(k);
@@ -473,6 +475,7 @@ export async function syncHistory(g, repos, {force = false} = {}) {
   if (!S.token) return {summary: 'commits & releases need a token'};
   const run = newRun(g);
   reconcile(run.o);   // options changed since the records were written? apply what can be applied locally
+  repos = repos.filter(r => !r.gone);   // a repo GitHub no longer shows can't be indexed: its stored index stays
   const todo = force ? repos : repos.filter(needsHistory);
   if (!todo.length) return {summary: 'commits & releases up to date (0 requests)'};
 

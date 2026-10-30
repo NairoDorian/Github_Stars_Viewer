@@ -21,6 +21,9 @@ No build step and no dependencies. The same code runs online (GitHub Pages) or l
 - **Filters & export** by language, topic and owner with live cross-filtered counts, expandable lists, removable active-filter pills, and one-click `.md` / `.json` export of your current matches.
 - **Toolbar groups:** *Search in*, *Index*, *View* and *Data*, with how many repos are indexed next to each search option.
 - **Live progress for every step.** A panel under the toolbar lists the steps of whatever is running (pull the star list → update repo details → download READMEs → check commits & releases → fetch release notes → fetch commit messages), announced up front as "waiting", each with its own bar, percentage, counts, speed, elapsed time and an estimate of the time left. Commit messages are weighted by how much of each repo is stored, so the bar moves page by page rather than repo by repo. It redraws every 60 ms and ticks twice a second, **■ Cancel** marks the running steps as stopped, and the panel hides itself a few seconds after the job ends.
+- **👥 Users: everyone behind your stars.** One big list of every user (and organization) that owns a repo in your stars, with how many of your stars they own, **how many repos they starred themselves**, their followers, and two links per row: **★ Stars on GitHub ↗** (their star list on github.com) and **👁 Visit** (their stars in this app, see below). Sort any column, filter by name, show people or organizations only. Clicking the number of your stars filters the main list to that user. With a token one GraphQL call counts 50 users (about 22 calls for 1,100 users), fetched when you open the panel and refreshed weekly; without a token each user costs one request of the 60 per hour, so counting is manual (up to 25 shown users per click, or one with its *count* link). Organizations can't star anything and are never asked.
+- **👁 Visit: explore anyone's stars without saving them.** Click *Visit* on a user, type another name and click **Load stars**, or open `?user=<you>&visit=<them>` (`?visit=<them>` alone works too; naming yourself lets the page compare). Their stars load with the usual cards, search, filters, sorting and Discover, but **nothing of them is saved**: no file in `data/`, nothing in IndexedDB, not in the config. The 💾 box shows *Not saved while visiting* and is locked, a banner says so, and leaving (**← Back**, the browser's Back button, 🗑 Clear cache, closing the tab) throws it all away. A visit downloads only the star list plus last commit / last release (one cheap call per 10 repos); READMEs and the commit index still work during a visit, kept in memory only. **Practical for finding new repos:** every tile of a visit says **★ starred by you** or offers a **☆ Star** button that stars it on your own account (token with starring rights needed); the banner counts how many of their repos you haven't starred yet, **Only repos I haven't starred** hides the rest, and the search understands `is:new` (not starred by you) and `is:mine`. Your stars come from the profile you visited from, your stored copy, or GitHub. Your own profile (and the token) are untouched; **★ Make this my profile** in the banner turns a visit into your profile.
+- **Removed, private or hidden repos are kept, unstarred ones are forgotten.** When a repo of your cache is missing from the star list, the app asks GitHub whether it still exists, by its numeric id (so renames, transfers and a name taken over by another repo can't mislead it; GraphQL clears 40 repos per call when it plainly finds them, REST is always the judge, without a token up to 50 requests). It exists: you unstarred it, so it disappears from the list and the cache. GitHub answers *not found*, *unavailable for legal reasons* or *access blocked* (deleted, made private or hidden, taken down): its **local copy is kept**, shown dashed with *🚫 Removed, private or hidden on GitHub*, no longer refreshed or indexed, searchable with `is:removed`; it is checked again at most once a day and becomes a normal repo again if it returns to your list. A repo that can't be verified (rate limit, network) is kept and asked about again at the next check.
 - **Hide forks** in both your starred repos and Discover suggestions with one persistent toolbar toggle. Existing cached suggestions are filtered immediately; when too few non-forks remain, Discover searches for more and skips fork-specific sources. The toggle uses GitHub's fork designation.
 - **Activity charts** on every card:
   - **Commits:** last 12 months per 2 weeks, counted on GitHub, with the total per year.
@@ -68,15 +71,17 @@ The token is only ever sent to `api.github.com`. Where it's stored depends on ho
 |---|---|---|
 | How | open the link above | double-click `start.bat` (Windows) or run `node server.js --open` |
 | **💾 Keep cache** ON stores stars, READMEs, commits & releases, suggestions and your token in… | this browser (IndexedDB) | JSON files in the **`data/`** folder next to the app |
-| Needs | a browser | [Node.js](https://nodejs.org) 18+ (nothing to install from npm) |
+| Needs | a browser | [Node.js](https://nodejs.org) 20+ (nothing to install from npm) |
 
 ### The cache
 
 - **💾 Keep cache is OFF by default** everywhere: nothing is stored, the data (and your token) live in the open tab only. Switch it on and a **cookie** remembers the choice for next time. Switching it on loads what is already stored for the profile (stored data wins), or saves what this tab has if nothing is stored yet. Switching it off leaves files in `data/` untouched; online it erases the browser copy. Either way the open tab keeps everything it has, so loading the profile again doesn't start from nothing.
 - **🗑 Clear cache** (two clicks) deletes *all* stored data: the `data/` files (through the local server), this browser's IndexedDB, the app's preferences and the token, and empties the open tab.
-- **Format.** One JSON file (or IndexedDB record) per kind and profile: `config`, `stars:<user>`, `readmes:<user>`, `discover:<user>`, `starcurves`, and the commit / release index in 256 shards `history:<user>:<0-255>`. The local server gzip-compresses files of 64 KB or more (about 3x smaller; it reads plain files too); IndexedDB keeps uncompressed copies.
+- **Format.** One JSON file (or IndexedDB record) per kind and profile: `config`, `stars:<user>`, `readmes:<user>`, `discover:<user>`, `users:<user>`, `starcurves`, and the commit / release index in 256 shards `history:<user>:<0-255>`. The local server gzip-compresses files of 64 KB or more (about 3x smaller; it reads plain files too); IndexedDB keeps uncompressed copies.
+- **Visits are never stored.** While you visit someone, every cache key except the config lives in a memory map that is emptied when the visit ends (`store.js`: one rule in `get()` / `put()`, the only door to storage). A visit doesn't even read a copy of that profile saved earlier. The config keeps *your* login, so a visited profile never becomes the next start's profile. As a second guard, keys of a visited profile are refused for the rest of the session unless you adopt it. Nothing is saved either while a profile is still being read, so a click during loading can't write the old profile's data under the new name.
 - **Never overwrites what it couldn't read.** If a stored file can't be read (server hiccup, damaged file, a file another program keeps locked), the app treats it as unreadable instead of "empty" and refuses to save over it until a reload reads it successfully, so a bad moment can't wipe a good cache. Likewise, toolbar jobs only start once a profile's cache has been read completely, so a click while it loads can't save half-loaded data.
 - **Bounded size.** Discover results older than 30 days (and all but the newest 40) and star charts nobody looked at for 60 days are dropped when the cache is saved.
+- **Unstarred repos are forgotten carefully.** A repo missing from one star-list check leaves your list at once, but its README and commit index are dropped only when a second check in a row agrees: the pages are fetched in parallel, and one glitch must not delete an index that cost many requests.
 - **Updates replace, never duplicate.** The star list is rebuilt from fresh pages; a README entry is replaced when its hash changed; commit messages never change, so only new ones are added (a walk from the new head down to the first stored commit; a rewritten history replaces them); a repo's releases are replaced as a whole when their count, newest release (tag, created, updated) changed or after 30 days. Every walk can stop at any point and continue later from what is stored.
 
 ### Running locally
@@ -96,7 +101,9 @@ Cache files of 64 KB or more are stored gzip-compressed (about 3x smaller), and 
 
 The local server listens on `127.0.0.1` only (the data folder can be moved with the `STARS_DATA` environment variable). It refuses requests from other websites, including DNS-rebinding tricks, so no web page can read your cached token, and no site can show the app inside a frame to trick clicks into it. It writes cache files atomically, so they can't be corrupted.
 
-Run `npm run check` to syntax-check and run unit tests for the server and all browser modules on Windows, macOS or Linux. `node scripts/e2e.mjs` runs an optional end-to-end test in your installed Chrome against a fake GitHub and an in-memory cache (needs Playwright: `npm i --no-save playwright`); it never touches your real cache.
+The local server also removes temp files that a crash left behind in `data/`.
+
+Run `npm run check` to syntax-check and run unit tests for the server and all browser modules on Windows, macOS or Linux. `npm run e2e` (`node scripts/e2e.mjs`) runs an optional end-to-end test in your installed Chrome against a fake GitHub and an in-memory cache (needs Playwright: `npm i --no-save playwright`); it never touches your real cache.
 
 ## Project layout
 
@@ -105,9 +112,9 @@ public/            the app (this folder is what GitHub Pages publishes)
   index.html       markup
   app.css          styles (dark/light follows your OS)
   js/
-    main.js        boot, loading a user, toolbar wiring
+    main.js        boot, loading a profile (yours or a visit), toolbar wiring
     state.js       shared state & cancellation generation
-    store.js       cache backends: ./data via server.js · IndexedDB · memory
+    store.js       cache backends: ./data via server.js · IndexedDB · memory · visit memory
     github.js      GitHub REST/GraphQL client (retries, rate limits, cancellation)
     sync.js        keeping the cache in sync with GitHub, cheaply
     history.js     every commit message and release note of every star, fetched incrementally
@@ -117,6 +124,7 @@ public/            the app (this folder is what GitHub Pages publishes)
     sort.js        shared repository sorting comparators
     starhistory.js lazy star-history.com chart loader & SVG curve parser
     discover.js    themes, suggestions, star/unstar buttons
+    users.js       the 👥 Users panel: owners of your stars, their own star counts, Visit links
     token.js       the 🔑 token panel
     util.js        helpers
 scripts/
@@ -126,7 +134,9 @@ scripts/
   test-readme.mjs  README fetching: never trimmed, replaced when changed, legacy cut ones repaired
   test-store.mjs   the 💾 Keep cache toggle (cookie), saving everything, clearing everything
   test-progress.mjs the progress panel
-  test-sync.mjs      the star list: conditional pages, unstarred / renamed repos, failed pages
+  test-sync.mjs      the star list: conditional pages, unstarred / renamed repos, failed pages, the light check of a visit
+  test-users.mjs     the Users list: owners, sorting, filtering, GraphQL / REST star counts
+  test-visit.mjs     Visit mode: nothing but the config is ever written, leaving forgets everything
   e2e.mjs          optional browser test (Playwright) against fakes
 server.js          local server: serves public/ and stores the cache in data/
 start.bat          Windows launcher

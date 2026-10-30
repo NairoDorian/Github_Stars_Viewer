@@ -170,7 +170,9 @@ test('a key that could not be read is never overwritten by what this tab holds; 
   globalThis.fetch = async (url, init) => failing && (init?.method || 'GET') === 'GET'
     ? {ok: false, status: 500, headers: new Headers(), json: async () => ({})} : serverFetch(url, init);
 
-  assert.equal(await store.get('readmes:someone'), null, 'a failed read looks like "nothing stored"...');
+  const warn = console.warn;
+  console.warn = () => {};   // the failed read is logged on purpose (store.js); the test output stays readable
+  try { assert.equal(await store.get('readmes:someone'), null, 'a failed read looks like "nothing stored"...'); } finally { console.warn = warn; }
   assert.equal(store.isUnreadable('readmes:someone'), true, '...but is remembered as a failure');
   assert.equal(await store.put('readmes:someone', {}), false, 'so the near-empty copy of this tab is refused');
   assert.deepEqual(JSON.parse(srv.files.get('readmes:someone')), {1: {t: 'precious'}}, 'and the stored data is untouched');

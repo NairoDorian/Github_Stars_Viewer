@@ -2,10 +2,10 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<!-- This page holds a GitHub token: scripts run only from this site (plus the file:// notice below, by its hash: update the
+<!-- This page holds a GitHub token: scripts run only from this site (plus the inline notice / frame guard below, by its hash: update the
      hash if that script changes, scripts/test.mjs checks it), and data can only go to GitHub's API, star-history.com and
      the local cache server. Images: avatars only. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-k1A5qNFUqVrpB1hNfK1c+he6YCBpVuq3ZwnrhZcYW4g='; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://*.githubusercontent.com; connect-src 'self' https://api.github.com https://api.star-history.com; object-src 'none'; base-uri 'none'; form-action 'self'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-5KCpAtCWlk/RXuCLk7Rcll5Jg/DD4ozuGQCgkIiHDOo='; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://*.githubusercontent.com; connect-src 'self' https://api.github.com https://api.star-history.com; object-src 'none'; base-uri 'none'; form-action 'self'">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Stars Viewer</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='14' fill='%23e3b341'%3E%E2%98%85%3C/text%3E%3C/svg%3E">
@@ -17,9 +17,13 @@
   <h1>★ Stars Viewer</h1>
   <input id="user" placeholder="GitHub username or profile URL" size="28" aria-label="GitHub user">
   <button class="primary" id="load">Load stars</button>
+  <button id="visit" title="Browse this user's stars without saving anything about them (nothing is written to disk or to this browser)">👁 Visit</button>
   <input id="q" type="search" placeholder="Search name, about, topics, &quot;exact phrase&quot;, -exclude, lang:rust, stars:>1000…  (/ to focus)" title="Supports &quot;exact phrases&quot;, -excluded terms, and qualifiers: lang:, owner:, topic:, is:active, is:archived, is:fork, stars:>1000, stars:>=1k, stars:10..500" aria-label="Search">
   <select id="sort" aria-label="Sort"></select><!-- options come from SORT_OPTIONS in js/sort.js (filled by initList) -->
 </header>
+
+<!-- Shown while someone else's stars are on screen (filled in by main.js showVisit()). -->
+<div id="visitBanner" class="banner visit" role="status" hidden></div>
 
 <!-- Shown only when the page is opened as a file (browsers don't run JS modules from file://). -->
 <div id="fileWarning" class="banner" hidden>
@@ -28,7 +32,8 @@
   or locally: double-click <code>start.bat</code> (or run <code>node server.js</code>) and open
   <a href="http://localhost:8787">http://localhost:8787</a>.
 </div>
-<script>if (location.protocol === 'file:') document.getElementById('fileWarning').hidden = false;</script>
+<script>if (location.protocol === 'file:') document.getElementById('fileWarning').hidden = false;
+if (self !== top) document.documentElement.hidden = true;   // framed by another site: invisible, so no click can be tricked into it</script>
 
 <div class="bar">
   <div class="grp" role="group" aria-label="Search in">
@@ -49,6 +54,7 @@
   <div class="grp" role="group" aria-label="View">
     <span class="grp-label">View</span>
     <label title="Hide repositories that GitHub marks as forks in your stars and Discover suggestions"><input type="checkbox" id="hideForks"> Hide forks</label>
+    <button id="toggleUsers" aria-controls="usersPanel" aria-expanded="false" title="Everyone who owns a repo in your stars, with how many repos they starred themselves">👥 Users</button>
     <button id="toggleInsights">🧭 Discover &amp; suggestions</button>
     <button id="toggleFacets" aria-controls="facets" title="Hide or show the Languages / Topics / Owners filters">◧ Hide filters</button>
   </div>
@@ -110,6 +116,19 @@
     </div>
     <p id="limit" class="muted"></p>
   </div>
+</section>
+
+<section id="usersPanel" aria-label="Users of your starred repos">
+  <div class="users-head"><h3>Users</h3> <span id="usersSummary" class="muted small"></span></div>
+  <div class="users-controls">
+    <input id="usersFilter" type="search" placeholder="Filter users…" aria-label="Filter users">
+    <select id="usersType" aria-label="Type of user"><option value="all">Everyone</option><option value="person">People</option><option value="org">Organizations</option></select>
+    <button id="usersFetch"></button>
+    <span id="usersNote" class="muted small" role="status"></span>
+  </div>
+  <p class="muted small">Everyone who owns a repo in your stars. <b>In your stars</b> filters the list below to that user; <b>👁 Visit</b> browses their stars here without saving anything about them.</p>
+  <div id="usersTable"></div>
+  <button id="usersMore" hidden></button>
 </section>
 
 <section id="insights"></section>
