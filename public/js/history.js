@@ -36,7 +36,8 @@ import {S, rkey, bumpIndex} from './state.js';
 import {$, DAY, status, secs, pool, chunks, sleep} from './util.js';
 import {plan, start, report, finish} from './progress.js';
 import {gqlRepos, isFatalError, needToken, parseLast} from './github.js';
-import {saveHistory, saveStars, markHistory} from './store.js';
+import {saveHistory, saveStars, markHistory, historyDirty} from './store.js';
+import {debug, info, warn, error, names} from './log.js';
 import {render, prepareHistorySearch} from './list.js';
 
 export const DEFAULT_OPTS = {mentions: true, links: false, notes: 6_000, commits: 10_000};
@@ -173,7 +174,10 @@ export function reconcile(o = histOpts()) {
     }
     if (Object.keys(patch).length) { S.history[k] = {...rec, ...patch}; markHistory(k); }
   }
-  if (out.stripped || out.refetch || out.trimmed || out.restart) bumpIndex();
+  if (out.stripped || out.refetch || out.trimmed || out.restart) {
+    info('history', `options applied to the stored records: ${out.stripped} had their release notes stripped / cut locally (no download) · ${out.refetch} marked to download release notes again · ${out.trimmed} cut to the commit limit · ${out.restart} will be walked again (the limit went up)`);
+    bumpIndex();
+  }
   return out;
 }
 
@@ -218,13 +222,18 @@ const jobRepo = t => { const r = (t.job || t.item.job).r; return [r.owner, r.nam
 /** Stops the run on token / rate-limit errors; any other error is the caller's to handle. */
 const fatalOnly = (run, e) => isFatalError(e) && (run.fatal = e);
 /** Puts a failed work item back in the queue; after 3 failures `giveUp` decides (the repo is left for the next check). */
-const retry = (t, queue, giveUp) => { if ((t.tries = (t.tries || 0) + 1) < 3) queue.push(t); else giveUp(t); };
+const retry = (t, queue, giveUp) => {
+  const repo = jobRepo(t).join('/');
+  if ((t.tries = (t.tries || 0) + 1) < 3) { warn('history', `${repo}: no usable answer, trying again (attempt ${t.tries + 1} of 3)`); queue.push(t); }
+  else { warn('history', `${repo}: gave up after 3 attempts: what is stored is kept, the next check tries again`); giveUp(t); }
+};
 
 /** Saves progress at most every SAVE_EVERY ms (always when asked): stopping or closing the tab loses seconds, not minutes. */
 async function flush(run, always = false) {
   if (run.g !== S.gen || (!always && Date.now() - run.lastSave < SAVE_EVERY)) return;
   run.lastSave = Date.now();
-  run.beforeSave?.();   // walks that keep commits aside while pages arrive write them into their records first
+  run.beforeSave?.();
+  if (historyDirty()) debug('history', `saving progress (${historyDirty()} shard(s) changed since the last save)`);   // walks that keep commits aside while pages arrive write them into their records first
   bumpIndex();
   await saveHistory(run.g);
 }
@@ -233,13 +242,14 @@ async function flush(run, always = false) {
  * gqlRepos with patience for GitHub's secondary rate limit ("slow down"): wait, allow fewer parallel requests for the rest
  * of the run, try again. Primary limits and bad tokens are not retried here (they end the run).
  */
-async function gqlRun(run, items, fields, nameOf) {
+async function gqlRun(run, items, fields, nameOf, what) {
   for (let attempt = 0; ; attempt++) {
-    try { return await gqlRepos(items, fields, nameOf); }
+    try { return await gqlRepos(items, fields, nameOf, what); }
     catch (e) {
       if (!e.secondary || attempt >= 3 || halted(run)) throw e;
       run.slotCap = Math.max(1, Math.floor(Math.min(run.slotCap, 8) / 2));
       const wait = TUNING.slowDownMs * (attempt + 1);
+      warn('history', `GitHub asked to slow down (secondary rate limit): waiting ${Math.round(wait / 1000)} s, then continuing with at most ${run.slotCap} parallel request(s) (attempt ${attempt + 1} of 3)`);
       status(`GitHub asked to slow down: waiting ${Math.round(wait / 1000)} s, then continuing with fewer parallel requests…`);
       for (let waited = 0; waited < wait && !halted(run); waited += 500) await sleep(Math.min(500, wait - waited));   // Cancel ends the wait
       if (halted(run)) throw e;
@@ -275,14 +285,19 @@ async function checkStage(run, todo) {
   const checks = new Map();
   let checked = 0, tiles = 0;
   start('check', todo.length);
+  info('history', `check: asking about ${todo.length.toLocaleString()} repos (branch head, 5 newest releases, release count): ${Math.ceil(todo.length / 40)} cheap GraphQL calls of 40, ${CHECK_PARALLEL} at a time`);
   await pool(chunks(todo, 40), CHECK_PARALLEL, async batch => {
     if (halted(run)) return;
     let data;
-    try { data = await gqlRun(run, batch, CHECK); }
-    catch (e) { if (!fatalOnly(run, e)) run.skipped += batch.length; return; }
+    try { data = await gqlRun(run, batch, CHECK, undefined, `check of ${batch.length} repos`); }
+    catch (e) {
+      warn('history', `check: a batch of ${batch.length} repos failed (${e.message}): ${isFatalError(e) ? 'the run ends, progress is kept' : 'skipped, retried at the next check'}`);
+      if (!fatalOnly(run, e)) run.skipped += batch.length;
+      return;
+    }
     batch.forEach((r, j) => {
       const d = data['r' + j];
-      if (!d) { run.skipped++; return; }   // GitHub omitted it (private, deleted, timeout): retried next check
+      if (!d) { run.skipped++; debug('history', `check: ${r.full} came back empty (private, deleted or timed out): retried next check`); return; }   // GitHub omitted it (private, deleted, timeout): retried next check
       const top = d.releases?.nodes?.[0], head = d.defaultBranchRef?.target?.oid || null;
       checks.set(r, {head, relN: d.releases?.totalCount || 0, relTop: top ? `${top.tagName}|${top.createdAt}|${top.updatedAt || ''}` : ''});
       const last = parseLast({lastCommit: d.defaultBranchRef, releases: d.releases, latestRelease: d.latestRelease});
@@ -290,12 +305,14 @@ async function checkStage(run, todo) {
       if (TILE_FIELDS.some(f => (r[f] ?? null) !== last[f])) { Object.assign(r, last); tiles++; }
     });
     checked += batch.length;
+    debug('history', `check: ${checked}/${todo.length} repos${tiles ? ', ' + tiles + ' tile(s) refreshed so far' : ''}`);
     if (run.g === S.gen) {
       status(`Checking commits & releases ${checked}/${todo.length}…`);
       report('check', checked, todo.length, `${checked.toLocaleString()} of ${todo.length.toLocaleString()} repos`);
     }
   });
   if (checked === todo.length) finish('check');
+  info('history', `check done: ${checked.toLocaleString()} of ${todo.length.toLocaleString()} repos answered, ${tiles} last-commit / last-release tile(s) changed, ${run.skipped} skipped`);
   if (tiles && run.g === S.gen) await saveStars(run.g);
   return checks;
 }
@@ -315,6 +332,8 @@ function planStage(checks) {
     Object.assign(S.history[k], {at: now, pushed: r.pushed, relTop: c.relTop});   // relTop: upgrades a key from before updatedAt
     markHistory(k);
   }
+  info('history', `plan: ${checks.size.toLocaleString()} repos checked · ${checks.size - jobs.length} up to date (nothing to download) · ${jobs.filter(j => j.needRel).length} need their releases fetched · ${jobs.filter(j => j.needNew).length} have new commits · ${jobs.filter(j => j.needOld).length} continue an unfinished walk`);
+  if (jobs.length) debug('history', `to update: ${names(jobs.map(j => j.r.full), 10)}`);
   return jobs;
 }
 
@@ -328,27 +347,38 @@ async function releaseStage(run, jobs) {
   const queue = jobs.filter(j => j.needRel).map(job => ({job, after: null, nodes: []}));
   const total = queue.length, giveUp = t => { t.job.failed = true; };
   let done = 0;
-  if (total) start('releases', total); else finish('releases', 'no release list changed');
+  if (total) { start('releases', total); info('history', `releases: ${total.toLocaleString()} repo(s) have a changed release list: fetching every release (25 per page, ${RELEASE_BATCH} repos per call, ${RELEASE_PARALLEL} calls at a time)`); }
+  else { finish('releases', 'no release list changed'); info('history', 'releases: no release list changed, nothing to download'); }
   await pump(run, queue, {parallel: RELEASE_PARALLEL, batch: RELEASE_BATCH}, async batch => {
     let data;
-    try { data = await gqlRun(run, batch, page, jobRepo); }
-    catch (e) { if (!fatalOnly(run, e)) for (const t of batch) retry(t, queue, giveUp); return; }
+    try { data = await gqlRun(run, batch, page, jobRepo, `releases of ${batch.length} repos`); }
+    catch (e) {
+      warn('history', `releases: a call for ${batch.length} repos failed (${e.message})${isFatalError(e) ? ': the run ends, progress is kept' : ''}`);
+      if (!fatalOnly(run, e)) for (const t of batch) retry(t, queue, giveUp);
+      return;
+    }
     if (run.g !== S.gen) return;
     batch.forEach((t, j) => {
       const rel = data['r' + j]?.releases;
       if (!rel) return retry(t, queue, giveUp);
       t.tries = 0;
       t.nodes.push(...rel.nodes.filter(n => !n.isDraft));
+      if (Math.floor(t.nodes.length / 250) > (t.logged || 0)) {   // a repo with a thousand releases is fetched one page after the other
+        t.logged = Math.floor(t.nodes.length / 250);
+        info('history', `releases ${t.job.r.full}: ${t.nodes.length.toLocaleString()} fetched so far (25 per page, one page after the other: GitHub's cursor needs the previous page)`);
+      }
       if (rel.pageInfo.hasNextPage && t.nodes.length < MAX_RELEASES) { t.after = rel.pageInfo.endCursor; queue.push(t); return; }
       set(t.job.k, {rel: t.nodes.slice(0, MAX_RELEASES).map(n => toRelease(n, run.o)), relN: t.job.c.relN, relTop: t.job.c.relTop, relAt: Date.now(), ro: flags});
       t.job.relDone = true;
       done++;
+      debug('history', `releases ${t.job.r.full}: ${Math.min(t.nodes.length, MAX_RELEASES)} release(s) stored (drafts skipped; notes ${run.o.mentions ? 'without @mentions' : 'with @mentions'}, ${run.o.links ? 'without links' : 'with links'}, ≤ ${run.o.notes || 'no limit'} characters)`);
     });
     status(`Fetching release notes… ${done}/${total} repos`);
     report('releases', done, total, `${done.toLocaleString()} of ${total.toLocaleString()} repos`);
     await flush(run);
   });
   if (total && done === total) finish('releases');
+  if (total) info('history', `releases: ${done}/${total} repo(s) complete${done < total ? ', ' + (total - done) + ' unfinished (cancel, rate limit or failures): looked at again next time' : ''}`);
   return total - done;
 }
 
@@ -390,9 +420,12 @@ async function commitStage(run, jobs) {
   const items = jobs.filter(j => j.needNew || j.needOld).map(newWalker), queue = items.map(firstTask);
   const total = items.length, t0 = Date.now(), c0 = historyTotals().commits;
   let finished = 0;
-  if (total) start('commits', total); else finish('commits', 'no new commits');
+  if (total) {
+    start('commits', total);
+    info('history', `commits: ${total.toLocaleString()} repo(s) to walk · ${items.filter(w => w.kind === 'join').length} add new commits on top of the stored ones, ${items.filter(w => w.kind === 'bulk').length} walk from a start or continue an unfinished walk · 100 commits per page, ${COMMIT_BATCH} pages per call, ${COMMIT_PARALLEL} calls at a time · limit ${lim(run.o.commits) === Infinity ? 'none: every commit' : lim(run.o.commits).toLocaleString() + ' per repo'}`);
+  } else { finish('commits', 'no new commits'); info('history', 'commits: no new commits anywhere, nothing to download'); }
   const finishWalk = w => { if (!w.over) { w.over = true; finished++; } };
-  const abandon = t => { const w = t.item; w.dead = true; w.job.failed = true; w.pages?.clear(); syncRecord(w); };
+  const abandon = t => { const w = t.item; w.dead = true; w.job.failed = true; w.pages?.clear(); syncRecord(w); warn('history', `commits ${w.job.r.full}: abandoned for now; the ${(S.history[w.k]?.c?.length || 0).toLocaleString()} commits already stored are kept`); };
   run.beforeSave = () => items.forEach(syncRecord);
 
   /** Moves the contiguous pages that have arrived into the walker's collected commits; finishes it when done or capped. */
@@ -408,7 +441,10 @@ async function commitStage(run, jobs) {
       w.next = w.count;
       if (!pg.hasNext || w.count >= w.want) { w.done = true; w.capped = pg.hasNext && w.count >= w.want; }
     }
-    if (w.done) { w.pages.clear(); syncRecord(w); finishWalk(w); }
+    if (w.done) {
+      w.pages.clear(); syncRecord(w); finishWalk(w);
+      info('history', `commits ${w.job.r.full}: complete, ${w.count.toLocaleString()} commit messages stored${w.capped ? ' (stopped at the limit; more exist)' : ''}`);
+    }
   };
 
   const bulkPage = (t, h) => {
@@ -418,12 +454,14 @@ async function commitStage(run, jobs) {
     // The offset trick is trusted only while GitHub's own cursor for this page equals the one we would build for it.
     const cursorOk = !t.seq && h.pageInfo.endCursor === `${w.base} ${t.off + nodes.length - 1}`;
     if (t.first) {
-      if (t.off > 0 && !cursorOk) { w.gen++; queue.push(seqTask(w)); return; }   // resumed with a cursor we built and GitHub didn't confirm
+      if (t.off > 0 && !cursorOk) { warn('history', `commits ${w.job.r.full}: GitHub did not confirm the cursor to resume from: going one page at a time from the last stored commit`); w.gen++; queue.push(seqTask(w)); return; }   // resumed with a cursor we built and GitHub didn't confirm
       w.total = h.totalCount ?? null;
       w.fast = cursorOk && w.total != null;   // without a count there is no end to queue pages up to ("no limit" would never stop)
       w.want = w.fast ? Math.min(w.total, lim(run.o.commits)) : lim(run.o.commits);
+      debug('history', `commits ${w.job.r.full}: ${w.total == null ? 'GitHub gave no count' : w.total.toLocaleString() + ' commits on GitHub'} → ${w.fast ? 'fetching ' + Math.ceil((w.want - t.off) / COMMIT_PAGE) + ' page(s), in parallel by offset cursor' : 'one page at a time (no usable cursor)'}${Number.isFinite(w.want) ? ', wanted ' + w.want.toLocaleString() : ''}`);
       if (w.fast) for (let off = t.off + COMMIT_PAGE; off < w.want; off += COMMIT_PAGE) queue.push({item: w, oid: w.base, after: `${w.base} ${off - 1}`, off, gen: w.gen});
     } else if (!t.seq && !cursorOk) {   // a parallel page disagreed about offsets: distrust them all, go on one page at a time
+      warn('history', `commits ${w.job.r.full}: a parallel page disagreed about its offset: all offsets distrusted, continuing one page at a time (still exact)`);
       w.fast = false; w.gen++; w.pages.clear();
       queue.push(seqTask(w));
       return;
@@ -435,6 +473,7 @@ async function commitStage(run, jobs) {
 
   const joinPage = (t, h) => {
     const w = t.item, next = advance(w, h.nodes, h.pageInfo.hasNextPage);
+    (next === 'more' ? debug : info)('history', `commits ${w.job.r.full}: ${next === 'more' ? 'the stored commits were not reached yet: next page' : next === 'resume' ? w.fresh.length + ' new commit(s) added; joined the stored history, which is unfinished: continuing below it' : w.fresh.length + ' new commit(s) added on top of the stored ones'}`);
     if (next === 'more') queue.push({item: w, oid: w.from, after: null});
     else if (next === 'resume') { startBulk(w, w.head, S.history[w.k].c.length); queue.push(firstTask(w)); }
     else finishWalk(w);
@@ -445,8 +484,12 @@ async function commitStage(run, jobs) {
     const live = batch.filter(t => !t.item.dead && (t.gen == null || t.gen === t.item.gen));
     if (!live.length) return;
     let data;
-    try { data = await gqlRun(run, live, commitPage, jobRepo); }
-    catch (e) { if (!fatalOnly(run, e)) for (const t of live) retry(t, queue, abandon); return; }
+    try { data = await gqlRun(run, live, commitPage, jobRepo, `commit pages of ${live.length} repos`); }
+    catch (e) {
+      warn('history', `commits: a call for ${live.length} page(s) failed (${e.message})${isFatalError(e) ? ': the run ends, progress is kept' : ''}`);
+      if (!fatalOnly(run, e)) for (const t of live) retry(t, queue, abandon);
+      return;
+    }
     if (run.g !== S.gen) return;
     live.forEach((t, j) => {
       const h = data['r' + j]?.object?.history;
@@ -457,12 +500,13 @@ async function commitStage(run, jobs) {
     const pending = items.reduce((n, w) => n + (w.acc?.length || 0), 0), commits = historyTotals().commits + pending;
     const rate = Math.round((commits - c0) / Math.max(1, (Date.now() - t0) / 1000));
     report('commits', items.reduce((n, w) => n + fractionOf(w), 0), total,
-      `${finished.toLocaleString()} of ${total.toLocaleString()} repos · ${commits.toLocaleString()} commits · ${rate.toLocaleString()}/s`);
-    status(`Indexing commit messages… ${finished}/${total} repos done · ${commits.toLocaleString()} commits indexed · ${rate.toLocaleString()} commits/s`);
+      `${finished.toLocaleString()} of ${total.toLocaleString()} repos · ${commits.toLocaleString()} commits (+${(commits - c0).toLocaleString()} new) · ${rate.toLocaleString()}/s`);
+    status(`Indexing commit messages… ${finished}/${total} repos done · ${commits.toLocaleString()} commits indexed (+${(commits - c0).toLocaleString()} new this run) · ${rate.toLocaleString()} new commits/s`);
     await flush(run);
   });
   items.forEach(syncRecord);   // a halted walk keeps the commits it already has (the next run continues below them)
   if (total && finished === total) finish('commits');
+  info('history', `commits: ${finished}/${total} repo(s) complete${finished < total ? ', ' + (total - finished) + ' unfinished: the next run continues exactly where they stopped' : ''}`);
   return items.filter(w => !w.over).length;
 }
 
@@ -477,7 +521,8 @@ export async function syncHistory(g, repos, {force = false} = {}) {
   reconcile(run.o);   // options changed since the records were written? apply what can be applied locally
   repos = repos.filter(r => !r.gone);   // a repo GitHub no longer shows can't be indexed: its stored index stays
   const todo = force ? repos : repos.filter(needsHistory);
-  if (!todo.length) return {summary: 'commits & releases up to date (0 requests)'};
+  info('history', `commits & releases: ${todo.length.toLocaleString()} of ${repos.length.toLocaleString()} repos to check${force ? ' (forced: the toolbar button checks every repo)' : ' (pushed since the last check, unfinished, or older than a week)'} · options: notes ${run.o.notes ? '≤ ' + run.o.notes.toLocaleString() + ' characters' : 'whole'}, commits ${run.o.commits ? '≤ ' + run.o.commits.toLocaleString() + ' per repo' : 'all'}, @mentions ${run.o.mentions ? 'stripped' : 'kept'}, links ${run.o.links ? 'stripped' : 'kept'}`);
+  if (!todo.length) { info('history', 'everything is up to date (0 requests)'); return {summary: 'commits & releases up to date (0 requests)'}; }
 
   const checks = await checkStage(run, todo);
   if (g !== S.gen) return {summary: ''};
@@ -495,6 +540,7 @@ export async function syncHistory(g, repos, {force = false} = {}) {
   }
   await flush(run, true);
   const t = historyTotals(), skipped = run.skipped + failed;
+  info('history', `run ${run.fatal ? 'stopped: ' + run.fatal.message : S.stop ? 'stopped by Cancel' : 'finished'} · ${jobs.length} repo(s) updated · ${skipped} skipped or failed · the index now holds ${t.commits.toLocaleString()} commit messages and ${t.releases.toLocaleString()} releases in ${t.repos.toLocaleString()} repos`);
   return {summary: `🔎 ${t.commits.toLocaleString()} commit messages and ${t.releases.toLocaleString()} releases indexed in ${t.repos} repos` +
     (jobs.length ? ` (${jobs.length} updated)` : ' (all up to date)') +
     (skipped ? ` · ${skipped} skipped (GitHub omitted results or timed out; retried next check)` : '') +
@@ -505,6 +551,7 @@ export async function syncHistory(g, repos, {force = false} = {}) {
 /** Toolbar button: index (or re-check) commits and releases of every starred repo, then turn on the search option. */
 export async function indexHistory(g) {
   if (!S.token) { needToken(); return status('⚠ Commits & releases need a token (GraphQL). Add one in the 🔑 panel.'); }
+  info('history', 'Index commits & releases: every commit message and release note of every star (resumes where a cancelled run stopped)');
   const t0 = performance.now();
   status('Checking commits & releases…');
   plan([['check'], ['releases'], ['commits']]);

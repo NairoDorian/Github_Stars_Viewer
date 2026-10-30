@@ -1,4 +1,5 @@
 // Small shared helpers: DOM, formatting, safe HTML, async concurrency.
+import {log} from './log.js';
 
 export const $ = sel => document.querySelector(sel);
 export const DAY = 864e5;
@@ -47,8 +48,16 @@ export const when = d => fmtDate(d, {dateStyle: 'medium', timeStyle: 'short'});
 /** Elapsed time since a performance.now() mark, e.g. "2.4s". */
 export const secs = t0 => ((performance.now() - t0) / 1000).toFixed(1) + 's';
 
-/** Status line under the toolbar. */
-export const status = text => { $('#status').textContent = text; };
+// Progress texts ("Checked 30/200…") repeat with changing numbers: those reach the activity log once per two seconds.
+let lastStatus = {key: '', at: 0, text: ''};
+/** Status line under the toolbar (also written to the activity log). */
+export const status = text => {
+  $('#status').textContent = text;
+  const key = String(text).replace(/\d[\d,.]*/g, '#'), now = Date.now();
+  if (!text || text === lastStatus.text || (key === lastStatus.key && now - lastStatus.at < 2000)) return;
+  lastStatus = {key, at: now, text};
+  log('status', text, /^⚠/.test(text) ? 'warn' : 'info');
+};
 
 /** Waits ms, or less if `signal` aborts. The abort listener is removed either way: a generation's signal lives through
  *  thousands of sleeps during a long index run. */

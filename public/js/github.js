@@ -1,6 +1,7 @@
 // GitHub API access: REST + GraphQL, with retries, rate-limit handling and data mapping.
 import {S, genSignal} from './state.js';
 import {DAY, sleep, pool, chunks} from './util.js';
+import {debug, info, warn, error, names} from './log.js';
 
 const API = 'https://api.github.com';
 
@@ -18,21 +19,27 @@ export const needToken = () => window.dispatchEvent(new CustomEvent('need-token'
  * fetch() with retries for transient failures: network errors, 5xx, and GitHub's secondary rate limit
  * (403/429 with Retry-After ≤ 60s). Returns the Response; callers decide what other statuses mean.
  */
-export async function ghFetch(url, init = {}, tries = 3) {
+export async function ghFetch(url, init = {}, tries = 3, what = '') {
   const sig = init.signal === undefined ? genSignal() : init.signal;
+  const label = `${init.method || 'GET'} ${String(url).replace(API, '')}${what ? ' (' + what + ')' : ''}`;   // never the headers: they carry the token
   for (let i = 0; ; i++) {
     let r;
+    const t0 = Date.now();
     try { r = await fetch(url.startsWith('http') ? url : API + url, sig ? {...init, signal: sig} : init); }
     catch (e) {
-      if (sig?.aborted) throw e;
-      if (i >= tries - 1) throw new Error('Network error (offline, or GitHub timed out or cut the answer)');
+      if (sig?.aborted) { debug('http', `${label} cancelled (another profile was loaded, or Cancel)`); throw e; }
+      if (i >= tries - 1) { error('http', `${label} failed after ${tries} tries: ${e.message || 'network error'}`); throw new Error('Network error (offline, or GitHub timed out or cut the answer)'); }
+      warn('http', `${label}: network error (${e.message || 'no answer'}), try ${i + 2} of ${tries} in ${500 * 2 ** i} ms`);
       await sleep(500 * 2 ** i, sig);
       if (sig?.aborted) throw new DOMException('Aborted', 'AbortError');
       continue;
     }
     const retryAfter = Number(r.headers.get('retry-after')) || 0;
     const transient = r.status >= 500 || ((r.status === 403 || r.status === 429) && retryAfter > 0 && retryAfter <= 60);
+    (r.status >= 500 || r.status === 401 || r.status === 403 || r.status === 429 ? warn : debug)('http',
+      `${label} → ${r.status}${r.status === 304 ? ' not modified (free)' : ''} in ${Date.now() - t0} ms${i ? ', try ' + (i + 1) : ''}${rateNote(r)}${retryAfter ? ', retry-after ' + retryAfter + ' s' : ''}`);
     if (transient && i < tries - 1) {
+      warn('http', `${label}: GitHub answered ${r.status}; waiting ${retryAfter ? retryAfter + ' s' : 500 * 2 ** i + ' ms'}, then trying again (try ${i + 2} of ${tries})`);
       await sleep(retryAfter ? retryAfter * 1000 : 500 * 2 ** i, sig);
       if (sig?.aborted) throw new DOMException('Aborted', 'AbortError');
       continue;
@@ -40,6 +47,14 @@ export async function ghFetch(url, init = {}, tries = 3) {
     return r;
   }
 }
+
+/** " · core budget 4,870/5,000 left" from GitHub's rate-limit headers (one budget per kind: core, graphql, search). */
+const rateNote = r => {
+  const left = r.headers?.get?.('x-ratelimit-remaining');
+  if (left == null) return '';
+  const limit = r.headers.get('x-ratelimit-limit'), kind = r.headers.get('x-ratelimit-resource') || 'api';
+  return ` · ${kind} budget ${Number(left).toLocaleString()}${limit ? '/' + Number(limit).toLocaleString() : ''} left`;
+};
 
 /** " (resets 14:05)" from a rate-limited response, when GitHub says when. */
 const resetNote = r => { const t = r.headers.get('x-ratelimit-reset'); return t ? ` (resets ${new Date(t * 1000).toLocaleTimeString()})` : ''; };
@@ -59,16 +74,18 @@ export async function gh(path, extraHeaders) {
 /** GraphQL query → data. Partial results (some repos missing/private) come back as null entries, not errors.
  *  Errors that make every further request pointless carry `fatal` (bad token, used-up budget); GitHub's "slow down"
  *  carries `secondary`: callers may wait and retry (see isFatalError). */
-export async function gql(query) {
-  const r = await ghFetch('/graphql', {method: 'POST', headers: headers(), body: JSON.stringify({query})});
-  if (r.status === 401) { needToken(); throw Object.assign(new Error('Token rejected by GitHub. Update it in the 🔑 panel.'), {fatal: true}); }
+export async function gql(query, what = '') {
+  const r = await ghFetch('/graphql', {method: 'POST', headers: headers(), body: JSON.stringify({query})}, 3, what);
+  if (r.status === 401) { error('graphql', 'GitHub rejected the token (401)'); needToken(); throw Object.assign(new Error('Token rejected by GitHub. Update it in the 🔑 panel.'), {fatal: true}); }
   if (r.status === 403 || r.status === 429) {
     if (r.headers.get('x-ratelimit-remaining') === '0') throw Object.assign(new Error('GraphQL rate limit reached' + resetNote(r)), {fatal: true});   // used up: ends the run
     // Still has budget: GitHub's secondary limit ("slow down", too many requests at once). Callers may wait and retry.
+    warn('graphql', 'GitHub asked to slow down (secondary rate limit)');
     throw Object.assign(new Error('GitHub asked to slow down (secondary limit)'), {secondary: true});
   }
   if (!r.ok) throw new Error('GraphQL ' + r.status);
   const body = await r.json();
+  if (body.data && body.errors?.length) debug('graphql', `answered with data and ${body.errors.length} error(s), e.g. ${body.errors[0].type || ''} ${body.errors[0].message}`);
   if (!body.data) {   // GitHub can also report limits inside a 200 answer
     const first = body.errors?.[0], msg = first?.message || 'no data';
     if (/secondary rate limit|abuse/i.test(msg)) throw Object.assign(new Error('GitHub asked to slow down (secondary limit)'), {secondary: true});
@@ -87,8 +104,12 @@ export const repoQ = (alias, owner, name, fields) =>
  * omits it: private, deleted, timed out). `fields` is a selection string, or a function (item, j) → selection;
  * `nameOf(item)` → [owner, name] (default: items are {owner, name} objects).
  */
-export const gqlRepos = (items, fields, nameOf = r => [r.owner, r.name]) =>
-  gql('query{' + items.map((it, j) => repoQ('r' + j, ...nameOf(it), typeof fields === 'function' ? fields(it, j) : fields)).join(' ') + '}');
+export async function gqlRepos(items, fields, nameOf = r => [r.owner, r.name], what = '') {
+  const data = await gql('query{' + items.map((it, j) => repoQ('r' + j, ...nameOf(it), typeof fields === 'function' ? fields(it, j) : fields)).join(' ') + '}', what || `${items.length} repositories`);
+  const empty = items.map((it, j) => data['r' + j] == null ? nameOf(it).join('/') : null).filter(Boolean);
+  if (empty.length) debug('graphql', `${empty.length} of ${items.length} repositories came back empty (private, deleted, or GitHub timed out): ${names(empty)}`);
+  return data;
+}
 
 /** "owner/name" → [owner, name], for gqlRepos over lists of full names. */
 export const splitFull = full => full.split('/');
@@ -111,7 +132,9 @@ export const mapStar = ({starred_at, repo: x}) => ({
 export async function ghSearch(q, perPage = 50, page = 1) {
   if (perPage * (page - 1) >= 1000) return [];   // the page starts beyond result 1000 (a page that ends past it still has some)
   const r = await gh(`/search/repositories?q=${encodeURIComponent(q)}&sort=stars&order=desc&per_page=${perPage}&page=${page}`);
-  return r.ok ? (await r.json()).items || [] : [];
+  const items = r.ok ? (await r.json()).items || [] : [];
+  info('search', `"${q}" page ${page}: ${items.length} repositories`);
+  return items;
 }
 
 /**

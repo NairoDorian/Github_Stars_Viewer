@@ -71,7 +71,23 @@ if (self !== top) document.documentElement.hidden = true;   // framed by another
   </div>
 </div>
 
-<div id="lanes" hidden role="group" aria-label="Progress of the running task"></div>
+<div id="runPanel">
+  <div id="lanes" hidden role="group" aria-label="Progress of the running task"></div>
+  <section id="console" aria-label="Activity log">
+    <div class="con-head">
+      <button id="conToggle" class="caret" aria-expanded="true" aria-controls="conBody" title="Collapse or expand the log">▾</button>
+      <b>Activity log</b> <span id="conCount" class="muted small"></span>
+      <span class="con-actions">
+        <label title="Show the fine detail too: every request, every cache read and write, every decision about a repo"><input type="checkbox" id="conDebug" checked> detail</label>
+        <label title="Scroll along with new lines (scroll up to stop, back down to resume)"><input type="checkbox" id="conFollow" checked> follow</label>
+        <button id="conCopy" title="Copy the whole log as text">Copy</button>
+        <button id="conSave" title="Save the whole log as a .txt file">Save</button>
+        <button id="conClear" title="Empty the log">Clear</button>
+      </span>
+    </div>
+    <div id="conBody" role="log" aria-live="off" tabindex="0"></div>
+  </section>
+</div>
 
 <section id="histOpts" hidden aria-label="Commit and release index options">
   <h3>Commit &amp; release index options</h3>

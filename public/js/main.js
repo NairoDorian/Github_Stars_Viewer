@@ -21,6 +21,7 @@
 // panel's 👁 Visit button and ?visit=<login> all start a visit; "★ Make this my profile" turns a visit into your profile.
 import {S, ukey, nextGen, bumpIndex, isMine, mineOf} from './state.js';
 import {starredOf} from './github.js';
+import {initLog, LOG, info, warn, debug} from './log.js';
 import {$, ago, esc, status} from './util.js';
 import {get, peek, saveConfig, initStore, setPersist, persisting, isUnreadable, clearAll, saveAll, loadHistory, forgetHistoryDirty, setVisit, adoptProfile, CACHE_VERSION} from './store.js';
 import {task, waitIdle, sync, enrich, indexReadmes, migrateReadmes} from './sync.js';
@@ -51,8 +52,9 @@ async function loadMine(g) {
   let repos = (await peek('stars:' + S.home.toLowerCase()))?.repos;
   if (g !== S.gen || S.mine) return;
   if (!repos?.length) {
-    try { repos = await starredOf(S.home); } catch (e) { return status('⚠ Could not read your own stars to mark them here: ' + e.message); }
-  }
+    info('visit', `reading your own stars (${S.home}) from GitHub to mark which of these you already starred`);
+    try { repos = await starredOf(S.home); } catch (e) { warn('visit', `could not read your own stars: ${e.message}`); return status('⚠ Could not read your own stars to mark them here: ' + e.message); }
+  } else info('visit', `your own ${repos.length.toLocaleString()} stars come from your stored copy: used to mark what you already starred`);
   if (g !== S.gen) return;
   S.mine = mineOf(repos);
   window.dispatchEvent(new CustomEvent('mine-changed'));
@@ -89,14 +91,18 @@ function showVisit() {
 /** Shows the cached data instantly, then checks GitHub for changes in the background.
  *  `login`: the profile (default: the box). `visit`: true = browse without saving; undefined = a visit unless it is your own
  *  profile (or you have none yet). `push`: add a browser-history entry, so the Back button returns to the previous profile. */
-async function load({login, visit, push = false} = {}) {
+async function load({login, visit, push = false, why = ''} = {}) {
   const u = parseUser(login ?? $('#user').value);
   if (!u) return status('⚠ Enter a GitHub username or profile URL.');
   const isHome = !!S.home && u.toLowerCase() === S.home.toLowerCase();
   const visiting = !isHome && (visit ?? !!S.home);
+  info('load', `▶ loading ${u}: ${visiting ? 'a VISIT, nothing about them is saved' : isHome ? 'your own profile' : 'taking it as your profile (once GitHub answers)'}${why ? ' · ' + why : ''}`);
   const prevUser = S.user.toLowerCase();
   // Coming from your own loaded profile: those stars are the "already starred by you" set of the visit.
-  if (visiting && !S.visit && prevUser === S.home.toLowerCase() && S.repos.length) S.mine = mineOf(S.repos);
+  if (visiting && !S.visit && prevUser === S.home.toLowerCase() && S.repos.length) {
+    S.mine = mineOf(S.repos);
+    info('visit', `your own ${S.repos.length.toLocaleString()} stars are kept aside to mark what you already starred`);
+  }
   if (!visiting) { S.mine = null; S.onlyNew = false; }
   const g = nextGen();          // running jobs see the new generation and abort without saving
   if (visiting && !S.mine) loadMine(g);
@@ -127,6 +133,7 @@ async function load({login, visit, push = false} = {}) {
     S.history = {};
     S.users = {};
     S.disc = disc || {dismissed: [], results: {}};
+    info('load', `cache of ${u}: ${stars ? S.repos.length.toLocaleString() + ' stars saved ' + ago(stars.at) + ' (format v' + (stars.v || 1) + ((stars.v || 0) < CACHE_VERSION ? ', older: page ETags dropped, the list is downloaded once more' : '') + ')' : visiting ? 'nothing is read for a visit' : isUnreadable('stars:' + ukey()) ? 'the star list could not be read (kept untouched)' : 'no star list saved yet'} · ${disc ? Object.keys(disc.results || {}).length + ' Discover result(s), ' + (disc.dismissed || []).length + ' dismissed' : 'no Discover data'}`);
     closeDiscover();
     render();   // stars on screen now; the large README cache loads right after
     const newer = stars?.v > CACHE_VERSION ? ' (⚠ written by a newer version of the app)' : '';
@@ -140,6 +147,7 @@ async function load({login, visit, push = false} = {}) {
     S.readmes = readmes || {};
     S.history = commitHistory || {};
     S.users = users || {};
+    info('load', `cache of ${u}: ${Object.keys(S.readmes).length.toLocaleString()} READMEs · ${Object.keys(S.history).length.toLocaleString()} repos indexed for commits & releases · ${Object.keys(S.users).length.toLocaleString()} user star counts`);
     await reconcileStored(g);   // stored release notes follow the strip / length options
     bumpIndex();
     migrateReadmes();
@@ -156,7 +164,7 @@ async function load({login, visit, push = false} = {}) {
   await task(sync);
   if (g !== S.gen) return;
   // The first profile that GitHub really answered for becomes yours: a typo is never remembered as the next start's profile.
-  if (!visiting && !S.home && S.repos.length) { S.home = u; saveConfig(); }
+  if (!visiting && !S.home && S.repos.length) { S.home = u; saveConfig(); info('load', `${u} answered: it is now your profile (remembered as the cache setting says)`); }
   showVisit();
   renderUsers();
 }
@@ -165,12 +173,13 @@ async function load({login, visit, push = false} = {}) {
  *  loaded (stored data wins, like switching 💾 on); otherwise what this visit downloaded is kept. */
 async function adopt() {
   const u = S.user;
+  info('visit', `★ ${u} becomes your profile`);
   setVisit('');
   adoptProfile(u);
   S.home = u;
   history.replaceState(null, '', profileURL(u, false));
   await saveConfig();
-  if (persisting() && (await get('stars:' + ukey()) || isUnreadable('stars:' + ukey()))) return load({login: u, visit: false});
+  if (persisting() && (await get('stars:' + ukey()) || isUnreadable('stars:' + ukey()))) return load({login: u, visit: false, why: 'you adopted this profile and a saved copy of it exists'});
   while (S.loading) await S.loading;
   if (persisting()) await saveAll();
   showVisit();
@@ -198,7 +207,7 @@ function initCacheToggle({serverUp, persistOn}) {
       status('💾 Cache found: loading it…');
       const stored = await get('config');
       if (stored?.token && !S.token) setToken(stored.token);
-      return load({login: S.user, visit: false});   // the profile on screen, not whatever is typed in the box
+      return load({login: S.user, visit: false, why: 'Keep cache switched on and a saved copy exists'});   // the profile on screen, not whatever is typed in the box
     }
     await saveAll();
     status('💾 Cache on: everything fetched so far was saved, reloads will be instant.');
@@ -211,6 +220,7 @@ async function clearEverything() {
   S.loading = null;     // a profile being read is abandoned: this tab is about to be empty, which is consistent
   forgetStarCharts();   // neither does a pending star-chart save
   setVisit('');         // a visit ends with everything else
+  info('app', '🗑 clearing everything: stored files, IndexedDB, preferences, this tab and the token');
   const {files} = await clearAll();
   Object.assign(S, {home: '', repos: [], starPages: [], readmes: {}, history: {}, users: {}, disc: {dismissed: [], results: {}}, starCurves: {}});
   setToken('', {save: false});
@@ -247,6 +257,9 @@ function initClearButton() {
 
 // ---- boot ----
 if (location.protocol !== 'file:') {   // ES modules can't run from file://; index.html shows a notice instead
+  initLog();
+  LOG.devtools = true;   // the log is mirrored to the browser's DevTools console too
+  info('app', `Stars Viewer started · ${navigator.userAgent}`);
   initCacheToggle(await initStore());
   initClearButton();
   initList();
@@ -256,13 +269,14 @@ if (location.protocol !== 'file:') {   // ES modules can't run from file://; ind
   const params = new URLSearchParams(location.search), asked = params.get('visit');
   S.home = parseUser(String(config.user || '')) || (asked ? parseUser(params.get('user') || '') : '');   // ?user=<you>&visit=<them> names you when nothing is stored
   S.starCurves = (await get('starcurves')) || {};
+  info('app', `config: ${S.home ? 'your profile is ' + S.home : 'no profile saved yet'} · token ${config.token ? 'found' : 'not set'} · ${Object.keys(S.starCurves).length.toLocaleString()} star-history charts cached`);
   initToken(config.token || '');
   initHistOpts();
   $('#user').value = asked || params.get('user') || S.home || 'NairoDorian';
 
-  $('#load').onclick = () => load({push: true});
-  $('#visit').onclick = () => load({visit: true, push: true});
-  $('#user').onkeydown = e => { if (e.key === 'Enter') load({push: true}); };
+  $('#load').onclick = () => load({push: true, why: '“Load stars” clicked'});
+  $('#visit').onclick = () => load({visit: true, push: true, why: '“Visit” clicked'});
+  $('#user').onkeydown = e => { if (e.key === 'Enter') load({push: true, why: 'Enter pressed in the user box'}); };
   $('#refresh').onclick = () => task(sync);
   $('#enrich').onclick = () => task(enrich);
   $('#indexReadme').onclick = () => task(indexReadmes);
@@ -271,15 +285,15 @@ if (location.protocol !== 'file:') {   // ES modules can't run from file://; ind
   $('#visitBanner').onclick = e => {
     const act = e.target.closest('[data-visit-act]')?.dataset.visitAct;
     if (act === 'adopt') adopt();
-    else if (act === 'back') load({login: S.home, visit: false, push: true});
+    else if (act === 'back') load({login: S.home, visit: false, push: true, why: '“Back to ' + S.home + '” clicked'});
   };
   $('#visitBanner').onchange = e => { if (e.target.id === 'onlyNew') { S.onlyNew = e.target.checked; render(); } };
   window.addEventListener('mine-changed', () => { showVisit(); render(); });   // your stars are known, or you just starred one
-  window.addEventListener('visit-user', e => load({login: e.detail, visit: true, push: true}));   // 👁 Visit in the Users panel
+  window.addEventListener('visit-user', e => load({login: e.detail, visit: true, push: true, why: '“Visit” clicked in the Users panel'}));   // 👁 Visit in the Users panel
   window.addEventListener('popstate', () => {   // the browser's Back / Forward between profiles
     const p = new URLSearchParams(location.search), visit = p.get('visit'), want = visit || p.get('user') || S.home;
     if (visit && !S.home) S.home = parseUser(p.get('user') || '');
-    if (want) load({login: want, visit: visit ? true : undefined});
+    if (want) load({login: want, visit: visit ? true : undefined, why: 'the browser’s Back / Forward button'});
   });
-  load({visit: asked ? true : undefined});
+  load({visit: asked ? true : undefined, why: 'page opened'});
 }

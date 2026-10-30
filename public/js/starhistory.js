@@ -9,6 +9,7 @@
    list.js redraw the matching cards. */
 import {S} from './state.js';
 import {put} from './store.js';
+import {debug, warn} from './log.js';
 
 const TTL = 7 * 864e5, FAIL_TTL = 864e5, CONCURRENCY = 4;
 const key = full => full.toLowerCase();
@@ -208,7 +209,8 @@ export async function loadCurve(full) {
     if (mine !== epoch) return;
   }
   if (ok) failedAt.delete(k);
-  else failedAt.set(k, Date.now());   // still failing: fall back to local star history for 5 min before retrying
+  else failedAt.set(k, Date.now());
+  (ok ? debug : warn)('charts', `star history of ${full}: ${ok ? (S.starCurves[k]?.pts ? S.starCurves[k].pts.length + ' points read from star-history.com' : 'no chart available for it (cached for a day)') : 'could not be loaded after 4 tries, falling back to this app\'s own samples for 5 minutes'}`);   // still failing: fall back to local star history for 5 min before retrying
   window.dispatchEvent(new CustomEvent('star-curve', {detail: k}));
   if (ok) saveTimer ??= setTimeout(() => { saveTimer = null; pruneCurves(); put('starcurves', S.starCurves); }, 2500);   // batch cache writes
 }

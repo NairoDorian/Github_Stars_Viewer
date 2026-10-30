@@ -139,6 +139,16 @@ try {
   assert.match(alpha, /last commit .*ago/); assert.match(alpha, /last release v1\.0/);
   assert.match(beta, /last release v2\.0-rc1 pre-release/, 'newest by date is the pre-release, flagged');
   assert.match(gamma, /no releases/);
+  // ---- the activity log beside the progress bars ----
+  const logText = async () => page.locator('#conBody').innerText();
+  const firstLog = await logText();
+  for (const re of [/Stars Viewer started/, /storage: the local server is running · Keep cache is ON → files in the data\/ folder/, /▶ sync for e2etest/,
+    /star list page 1: 3 repos downloaded/, /compared with the cache: 3 repos on GitHub · 3 new/, /new stars: acme\/alpha/, /POST \/graphql \(details of 3 repos, full\) → 200/, /✓ Update repo details/])
+    assert.match(firstLog, re, 'the log tells: ' + re);
+  assert.ok(!firstLog.includes('ghp_fake') && !firstLog.includes('Bearer'), 'the token is never in the log');
+  const box = await page.locator('#console').boundingBox(), lanes = await page.locator('#lanes').boundingBox().catch(() => null);
+  if (lanes) assert.ok(box.x > lanes.x, 'the log is to the right of the progress bars');
+  step('activity log: every request, decision and step, no token', `${(firstLog.match(/\n/g) || []).length + 1} lines`);
   step('tiles show last commit and last release', 'beta → ' + beta.match(/last release \S+( pre-release)?/)[0]);
 
   // ---- Users: every owner of your stars, how many repos they starred; Visit browses them without saving ----
@@ -207,7 +217,8 @@ try {
   await waitStatus(/Indexing commit messages/, 20000);
   await until(() => (document.querySelector('.lane[data-lane="commits"] progress')?.value ?? 0) > 0, null, 5000);   // the commit bar has moved
   if (process.env.E2E_LANES) await page.screenshot({path: process.env.E2E_LANES});   // optional: what the panel looks like mid-run
-  assert.match(await page.locator('.lane[data-lane="commits"] .lane-text').innerText(), /\d+% · .*repos · .*commits · .*\/s · elapsed/, 'with its numbers');
+  assert.match(await logText(), /check: asking about 3 repos[\s\S]*plan: 3 repos checked[\s\S]*commits: 3 repo\(s\) to walk/, 'the index run explains itself in the log');
+  assert.match(await page.locator('.lane[data-lane="commits"] .lane-text').innerText(), /\d+% · .*repos · .*commits \(\+[\d,]+ new\) · .*\/s · elapsed/, 'with its numbers');
   await page.click('#cancelTask');
   await waitStatus(/stopped, progress saved/, 40000);
   await page.waitForSelector('.lane.stopped[data-lane="commits"]', {timeout: 10000});

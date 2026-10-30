@@ -177,3 +177,25 @@ details summary{cursor:pointer;color:var(--accent);margin:8px 0}
 .banner.visit label{display:inline-flex;align-items:center;gap:6px;color:var(--text);white-space:nowrap}
 .card.gone{border-style:dashed;opacity:.85}
 .gone-note{color:var(--star);font-size:12px}
+
+.gone-tag,.gone-chip{color:var(--star);border:1px solid var(--star);background:transparent}
+.gone-tag{padding:0 6px;font-size:10px;margin-left:4px}
+
+/* ---- activity log (right of the progress bars) ---- */
+#runPanel{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;margin:0 16px 12px}
+#runPanel #lanes{flex:1 1 520px;min-width:0;margin:0}
+#console{flex:1 1 420px;min-width:0;background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.con-head{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:6px 10px;border-bottom:1px solid var(--border);font-size:12px}
+.con-head .caret{padding:0 6px;border:0;background:none}
+.con-actions{margin-left:auto;display:inline-flex;flex-wrap:wrap;align-items:center;gap:6px 10px}
+.con-actions label{display:inline-flex;align-items:center;gap:4px;color:var(--muted)}
+.con-actions button{padding:1px 8px;font-size:11px}
+#conBody{height:230px;overflow:auto;padding:4px 10px;font:11px/1.45 ui-monospace,SFMono-Regular,Consolas,Menlo,monospace}
+#console.collapsed #conBody{display:none}#console.collapsed .con-head{border-bottom:0}
+.ln{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--muted)}
+.ln time{opacity:.7}
+.ln b{color:var(--accent);font-weight:600;display:inline-block;min-width:6.5ch}
+.ln.info{color:var(--text)}
+.ln.warn{color:var(--star)}
+.ln.error{color:#d1242f;font-weight:600}
+@media (max-width:700px){#runPanel #lanes,#console{flex-basis:100%}}

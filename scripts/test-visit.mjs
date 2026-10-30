@@ -193,3 +193,28 @@ test('while visiting, tiles say whether you starred them and offer ☆ Star for 
   assert.ok(match(gone, parseQuery('is:removed'), false));
   assert.equal(match(a, parseQuery('is:removed'), false), null);
 });
+
+test('removed or hidden repos get a clickable tag, a Status facet and a "show only" filter', async () => {
+  const {render, showOnlyRemoved, card} = await import('../public/js/list.js');
+  reset();
+  const repo = (id, extra = {}) => ({id, full: `o/r${id}`, name: 'r' + id, owner: 'o', url: `https://github.com/o/r${id}`, topics: [], stars: 1, about: '', ...extra});
+  S.repos = [repo(1), repo(2, {gone: {at: Date.now()}}), repo(3, {gone: {at: Date.now()}})];
+  try {
+    assert.ok(card(S.repos[1]).includes('data-gone="1"') && card(S.repos[1]).includes('removed / private'), 'a tag on the card');
+    assert.ok(!card(S.repos[0]).includes('removed / private'));
+    render();
+    assert.match(els['#count'].innerHTML, /🚫 2 removed or hidden/, 'a chip says how many');
+    assert.match(els['#facets'].innerHTML, /Status[\s\S]*Removed or hidden[\s\S]*>2</, 'and so does the sidebar');
+    assert.equal((els['#list'].innerHTML.match(/class="card/g) || []).length, 3);
+    showOnlyRemoved(true);
+    assert.equal((els['#list'].innerHTML.match(/class="card/g) || []).length, 2, 'only the removed ones');
+    assert.ok(!els['#list'].innerHTML.includes('o/r1"'));
+    assert.match(els['#count'].innerHTML, /Status: removed or hidden ✕/, 'a pill to remove the filter');
+    assert.match(els['#count'].innerHTML, /2 of 3 repos \(filtered\)/);
+    showOnlyRemoved(false);
+    assert.equal((els['#list'].innerHTML.match(/class="card/g) || []).length, 3);
+    S.repos = [repo(1)];
+    render();
+    assert.ok(!/removed or hidden/.test(els['#count'].innerHTML + els['#facets'].innerHTML), 'nothing removed: no chip, no facet');
+  } finally { S.repos = []; showOnlyRemoved(false); }
+});

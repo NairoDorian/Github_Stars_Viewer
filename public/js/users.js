@@ -10,6 +10,7 @@ import {S} from './state.js';
 import {$, DAY, esc, ago, pool} from './util.js';
 import {ownerStats, starredCount, isFatalError} from './github.js';
 import {saveUsers} from './store.js';
+import {debug, info, warn} from './log.js';
 
 const MAX_AGE = 7 * DAY, PAGE = 100, REST_BATCH = 25;
 
@@ -127,12 +128,14 @@ async function runCount(logins) {
   const halted = () => run.stop || g !== S.gen;
   const progress = () => { note = `Counting… ${run.done.toLocaleString()} of ${run.total.toLocaleString()} users`; renderUsers(); };
   progress();
+  info('users', `counting what ${logins.length.toLocaleString()} user(s) starred: ${S.token ? 'GraphQL, 50 users per call, 3 calls at a time' : 'REST, one request per user, 4 at a time (60 requests an hour without a token)'}`);
   try {
     if (S.token) {
       const {failed} = await ownerStats(logins, batch => {
         if (g !== S.gen) return;
         for (const [key, r] of batch) record(key, r);
         run.done += batch.size;
+        debug('users', `answer for ${batch.size} users: ${[...batch.values()].filter(Boolean).length} found, ${[...batch.values()].filter(v => !v).length} unknown to GitHub`);
         progress();
       }, halted);
       run.failed += failed;
@@ -145,6 +148,7 @@ async function runCount(logins) {
           if (g !== S.gen) return;
           left = r.remaining;
           record(login, r.missing ? null : {stars: r.stars});
+          debug('users', `${login}: ${r.missing ? 'not found' : r.stars.toLocaleString() + ' starred'}`);
         } catch (e) {
           if (isFatalError(e)) { run.fatal = e; run.stop = true; } else run.failed++;
         }
@@ -159,6 +163,7 @@ async function runCount(logins) {
   await saveUsers(g);
   note = `Counted ${run.done.toLocaleString()} users` + (run.failed ? ` · ${run.failed} failed, try again` : '') + (run.stop && !run.fatal ? ' · stopped, what was counted is kept' : '') +
     (run.left != null ? ` · ${run.left} requests left this hour` : '') + (run.fatal ? ` · ⚠ ${run.fatal.message}` : '');
+  info('users', note);
   renderUsers();
 }
 

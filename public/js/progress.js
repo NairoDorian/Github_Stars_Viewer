@@ -8,6 +8,7 @@
 //   stopAll(stopped)          end the job: running steps become done / stopped      settle()   hide the panel soon
 //   reset()                   hide the panel now
 import {$, esc} from './util.js';
+import {debug, info} from './log.js';
 
 /** Default names of the steps; callers may pass their own label to start(). */
 const LABELS = {stars: 'Pull the star list', details: 'Update repo details', readmes: 'Download READMEs',
@@ -66,11 +67,13 @@ const lane = (id, label) => {
 export function plan(list) {
   lanes.clear();
   for (const [id, label] of list) lane(id, label);
+  info('steps', `plan: ${[...lanes.values()].map(l => l.label).join(' → ')}`);
   touch();
 }
 export function start(id, total = 0, label) {
   const l = lane(id, label);
-  Object.assign(l, {state: 'running', done: 0, total, detail: '', t0: clock(), t1: 0});
+  Object.assign(l, {state: 'running', done: 0, total, detail: '', t0: clock(), t1: 0, bucket: undefined});
+  info('steps', '▶ ' + l.label + (total ? ', ' + total.toLocaleString() + ' to do' : ''));
   touch();
 }
 export function report(id, done, total, detail) {
@@ -79,6 +82,8 @@ export function report(id, done, total, detail) {
   l.done = done;
   if (total != null) l.total = total;
   if (detail != null) l.detail = detail;
+  const bucket = l.total > 0 ? Math.floor(l.done / l.total * 10) : -1;   // one line per 10 %, the panel shows the rest
+  if (bucket >= 0 && bucket !== l.bucket) { l.bucket = bucket; debug('steps', l.label + ': ' + bucket * 10 + ' %' + (l.detail ? ' · ' + l.detail : '')); }
   touch();
 }
 export function finish(id, note) {
@@ -87,14 +92,18 @@ export function finish(id, note) {
   Object.assign(l, {state: 'done', t1: clock()});
   l.done = l.total || l.done;
   if (note != null) l.detail = note;
+  info('steps', '✓ ' + l.label + (l.detail ? ': ' + l.detail : '') + ' (' + duration((l.t1 - l.t0) / 1000) + ')');
   touch();
 }
 /** The job is over: steps that were running are done (or stopped by Cancel); steps that never started disappear. */
 export function stopAll(stopped = false) {
   for (const [id, l] of [...lanes]) {
-    if (l.state === 'running') Object.assign(l, {state: stopped ? 'stopped' : 'done', t1: clock()});
-    else if (l.state === 'waiting') lanes.delete(id);
+    if (l.state === 'running') {
+      Object.assign(l, {state: stopped ? 'stopped' : 'done', t1: clock()});
+      info('steps', (stopped ? '■ ' : '• ') + l.label + ': ended at ' + (l.total ? l.done.toLocaleString() + ' of ' + l.total.toLocaleString() : l.done.toLocaleString()) + (stopped ? ' (Cancel: progress is kept, the next run continues)' : ' (anything left is retried at the next check)'));
+    } else if (l.state === 'waiting') { lanes.delete(id); debug('steps', l.label + ': not needed this time'); }
   }
+  info('steps', stopped ? '■ stopped by Cancel: what was done is kept, the next run continues from there' : 'job finished');
   touch();
 }
 /** Hides the panel now. */

@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 const el = {hidden: true, innerHTML: ''};
-Object.defineProperty(globalThis, 'document', {value: {querySelector: () => el}, configurable: true});
+Object.defineProperty(globalThis, 'document', {value: {querySelector: sel => sel === '#lanes' ? el : {textContent: '', innerHTML: '', hidden: false}}, configurable: true});   // other elements (status line, activity log) are not the lanes
 const {plan, start, report, finish, stopAll, reset, settle, duration, eta} = await import('../public/js/progress.js');
 const later = () => new Promise(r => setTimeout(r, 120));   // the panel redraws at most every 60 ms
 const rows = () => [...el.innerHTML.matchAll(/<div class="lane (\w+)" data-lane="(\w+)">(.*?)<\/div>/g)].map(m => ({state: m[1], id: m[2], html: m[3]}));

@@ -161,3 +161,28 @@ test('refreshing the tiles when no README is indexed never shows a README step',
     assert.equal(await store.get('readmes:tilesonly'), null);
   } finally { globalThis.fetch = realFetch; delete globalThis.document; S.user = ''; S.token = ''; S.readmes = {}; S.repos = []; }
 });
+
+test('a details call that fails (a big query timing out) is asked again as two smaller calls, not skipped', async () => {
+  const els = {};
+  globalThis.document = {querySelector: sel => (els[sel] ??= {value: '', checked: false, textContent: '', innerHTML: '', hidden: false})};
+  const realFetch = globalThis.fetch;
+  try {
+    const names = 'abcdefgh'.split('');
+    const files = await hashed(Object.fromEntries(names.map(n => ['o/' + n, {text: '# ' + n}])));
+    fakeGitHub(files);
+    const inner = globalThis.fetch, sizes = [];
+    globalThis.fetch = async (url, init) => {   // GitHub drops any call that asks about more than 4 repos at once
+      if (String(url).endsWith('/graphql')) {
+        const n = (JSON.parse(init.body).query.match(/r\d+:repository/g) || []).length;
+        sizes.push(n);
+        if (n > 4) throw new TypeError('NetworkError when attempting to fetch resource.');
+      }
+      return inner(url, init);
+    };
+    S.token = 'tok'; S.readmes = {}; S.history = {}; S.user = 'splitter';
+    S.repos = names.map((n, i) => repo(900 + i, 'o/' + n));
+    await enrich(nextGen());
+    assert.deepEqual(sizes.filter(n => n <= 4), [4, 4], 'asked again as two halves of 4');
+    assert.ok(S.repos.every(r => r.enrichedAt), 'every repo was refreshed: nothing was skipped');
+  } finally { globalThis.fetch = realFetch; delete globalThis.document; S.user = ''; S.token = ''; S.readmes = {}; S.repos = []; }
+});

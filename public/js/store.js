@@ -15,6 +15,7 @@
 // get() / put(), the only door to storage.
 import {S, ukey} from './state.js';
 import {status} from './util.js';
+import {debug, info, warn, error, bytes} from './log.js';
 
 export const CACHE_VERSION = 2;   // bump if the stored shape changes, and migrate in main.js load(). 2: repos carry ownerType, so older star lists are downloaded once more (their page ETags are dropped)
 const CACHE_COOKIE = 'starsViewerCache';   // "1" = keep the cache, "0" = don't; remembered for a year
@@ -25,6 +26,11 @@ const mem = new Map();   // memory mode: the whole cache; browser mode: a copy o
 // Keys whose stored copy could NOT be read (server hiccup, corrupt file, IndexedDB error). get() answers null for them like for
 // "nothing stored", so this tab would build a near-empty replacement; put() refuses to overwrite the real file with it.
 const unreadable = new Set();
+/** Shards of the commit index are logged as a group (writeHistory), not one line each. */
+const quiet = key => /^history:[^:]+:\d+$/.test(key);
+/** "found" / "nothing stored" for a read. The old single-file commit index is expected to be absent: it lives in 256 shards now. */
+const found = (key, v) => v != null ? 'found' : /^history:[^:]+$/.test(key) ? 'nothing stored (normal: the commit index lives in 256 shards, this key only held an older single-file copy)' : 'nothing stored';
+const where = () => mode === 'server' ? 'the data/ folder' : mode === 'browser' ? 'IndexedDB' : 'memory';
 const visitMem = new Map();
 const visited = new Set();   // logins (lower-cased) visited in this tab and not adopted since: put() refuses their keys, whatever happens
 /** The login a profile key belongs to (stars:<user>, history:<user>:<n>…), or null for shared keys (config, starcurves). */
@@ -33,8 +39,13 @@ const keyUser = key => key.match(/^(?:stars|readmes|discover|users|history):([^:
 /** Starts, switches or (with '') ends a visit. A visit never inherits the previous visit's data. */
 export function setVisit(login) {
   login = login || '';
-  if (login.toLowerCase() !== S.visit.toLowerCase()) visitMem.clear();
+  const was = S.visit;
+  if (login.toLowerCase() !== was.toLowerCase()) {
+    if (visitMem.size) debug('visit', `forgot ${visitMem.size} item(s) kept in memory for ${was}`);
+    visitMem.clear();
+  }
   S.visit = login;
+  if (login !== was) info('visit', login ? `visiting ${login}: what is downloaded stays in memory, nothing is written to disk or to this browser` : `the visit of ${was} ended: its data was forgotten`);
   if (login) visited.add(login.toLowerCase());
 }
 /** The profile is wanted as a normal, saved one (loaded as your own, or adopted from a visit): its keys may be written again. */
@@ -86,6 +97,7 @@ export async function initStore() {
   serverUp = await hasServer();
   persistOn = persistWanted();
   mode = !persistOn ? 'memory' : serverUp ? 'server' : 'browser';
+  info('store', `storage: ${serverUp ? 'the local server is running' : 'no local server (online copy)'} · Keep cache is ${persistOn ? 'ON' : 'OFF'} → ${mode === 'server' ? 'files in the data/ folder' : mode === 'browser' ? 'IndexedDB in this browser' : 'memory only, nothing is written'}`);
   return {mode, serverUp, persistOn};
 }
 
@@ -100,6 +112,7 @@ export async function setPersist(on) {
   writeCookie(CACHE_COOKIE, on ? '1' : '0');
   try { localStorage.removeItem(OLD_FLAG); } catch {}
   persistOn = on;
+  info('store', `Keep cache switched ${on ? 'ON: ' + (serverUp ? 'files in the data/ folder' : 'IndexedDB in this browser') : 'OFF: this tab keeps its data in memory'}`);
   unreadable.clear();   // read failures belong to the backend that was in use
   if (on) { mode = serverUp ? 'server' : 'browser'; return; }
   if (mode === 'browser') {
@@ -125,6 +138,7 @@ export async function clearAll() {
   }
   try { (await dbp)?.close(); } catch {}
   dbp = null;
+  info('store', `cleared: ${files} file(s) deleted from the data folder, memory emptied, IndexedDB and preferences removed`);
   await new Promise(done => {
     try { const q = indexedDB.deleteDatabase('stars-viewer'); q.onsuccess = q.onerror = q.onblocked = () => done(); } catch { done(); }
   });
@@ -145,7 +159,11 @@ export async function saveAll(g = S.gen) {
 }
 
 export async function get(key) {
-  if (S.visit && keyUser(key) !== null) return visitMem.get(key) ?? null;   // a visit reads nothing stored, not even a copy of that profile saved earlier
+  if (S.visit && keyUser(key) !== null) {   // a visit reads nothing stored, not even a copy of that profile saved earlier
+    const v = visitMem.get(key) ?? null;
+    if (!quiet(key)) debug('visit', `read ${key} from visit memory: ${v == null ? 'nothing yet' : 'found'} (nothing is read from disk during a visit)`);
+    return v;
+  }
   return readStored(key);
 }
 
@@ -154,7 +172,11 @@ export const peek = key => readStored(key);
 
 async function readStored(key) {
   try {
-    if (mode === 'memory') return mem.get(key) ?? null;
+    if (mode === 'memory') {
+      const v = mem.get(key) ?? null;
+      if (!quiet(key)) debug('store', `read ${key} from memory: ${found(key, v)}`);
+      return v;
+    }
     let v;
     if (mode === 'browser') {
       v = (await idb('readonly', s => s.get(key))) ?? null;
@@ -165,8 +187,14 @@ async function readStored(key) {
       v = await r.json();
     }
     unreadable.delete(key);
+    if (!quiet(key)) debug('store', `read ${key} from ${where()}: ${found(key, v)}`);
     return v;
-  } catch (e) { console.warn('cache read failed', key, e); unreadable.add(key); return null; }
+  } catch (e) {
+    console.warn('cache read failed', key, e);
+    error('store', `could not read ${key} from ${where()}: ${e.message}. It is kept as it is and never overwritten until a reload reads it`);
+    unreadable.add(key);
+    return null;
+  }
 }
 
 /** Was this key's stored copy unreadable the last time it was read? (Writing it is refused, see put.) */
@@ -176,25 +204,34 @@ export const isUnreadable = key => unreadable.has(key);
 export const forgetHistoryDirty = () => { dirtyShards.clear(); };
 
 export async function put(key, value) {
-  if (S.visit && key !== 'config') { visitMem.set(key, value); return true; }   // kept for this visit only
+  if (S.visit && key !== 'config') {   // kept for this visit only
+    visitMem.set(key, value);
+    if (!quiet(key)) debug('visit', `${key}: kept in visit memory only, NOT saved`);
+    return true;
+  }
   const owner = keyUser(key);
   if (owner !== null && visited.has(owner)) {
     status(`⚠ ${owner}'s data is not saved: you only visited. Use "★ Make this my profile" to keep it.`);
+    warn('visit', `refused to write ${key}: ${owner} was only visited`);
     return false;
   }
   if (unreadable.has(key)) {
     status(`⚠ "${key}" could not be read, so the stored copy is kept as it is and not overwritten. Reload the page to try again.`);
+    warn('store', `refused to write ${key}: its stored copy could not be read, so it is kept untouched`);
     return false;
   }
   try {
     if (mode !== 'server') mem.set(key, value);   // kept for online tabs (also lets the browser cache be switched on/off later)
     if (mode === 'browser') await idb('readwrite', s => s.put(value, key));
     else if (mode === 'server') {
-      const r = await fetch('/cache/' + encodeURIComponent(key), {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(value)});
+      const body = JSON.stringify(value), t0 = Date.now();
+      const r = await fetch('/cache/' + encodeURIComponent(key), {method: 'PUT', headers: {'Content-Type': 'application/json'}, body});
       if (!r.ok) throw new Error('server returned ' + r.status);
-    }
+      if (!quiet(key)) debug('store', `wrote ${key} to the data/ folder: ${bytes(body.length)} (the server compresses big files) in ${Date.now() - t0} ms`);
+    } else if (!quiet(key)) debug('store', `${key}: kept in ${where()}${mode === 'memory' ? ' (Keep cache is off: nothing is written)' : ''}`);
     return true;
   } catch (e) {
+    error('store', `could not save ${key} to ${where()}: ${e.message}`);
     status(`⚠ Could not save "${key}": ${e.message}` + (mode === 'server' ? '. Is server.js running?' : ''));
     return false;
   }
@@ -236,6 +273,7 @@ async function writeHistory(g, history) {
   if (g !== S.gen) return false;
   const user = ukey(), todo = [...dirtyShards];
   dirtyShards.clear();
+  if (todo.length) debug('store', `commit index: writing ${todo.length} changed shard(s) of ${HISTORY_SHARDS} to ${where()}`);
   const shards = new Map(todo.map(i => [i, {}]));
   for (const [k, rec] of Object.entries(history)) { const shard = shards.get(shardOf(k)); if (shard) shard[k] = rec; }
   let ok = true;
@@ -243,6 +281,7 @@ async function writeHistory(g, history) {
     if (g !== S.gen) return false;   // another profile now: the rest belongs to the old one and is never written for the new one
     if (!(await put(`history:${user}:${i}`, data))) { dirtyShards.add(i); ok = false; }
   }
+  if (todo.length && !ok) warn('store', 'commit index: some shards could not be saved; they stay marked and are written by the next save');
   return ok;
 }
 
@@ -253,6 +292,7 @@ export async function loadHistory(g = S.gen) {
   const [legacy, ...parts] = await Promise.all([get('history:' + user), ...Array.from({length: HISTORY_SHARDS}, (_, i) => get(`history:${user}:${i}`))]);
   for (const part of parts) if (part) Object.assign(out, part);
   if (g !== S.gen) return null;
+  info('store', `commit index: ${Object.keys(out).length.toLocaleString()} repos read from its ${HISTORY_SHARDS} shards${legacy ? ' (+ an older single-file copy, being split into shards)' : ''}`);
   if (legacy && typeof legacy === 'object') {   // an older version wrote it last: it wins, then it is retired
     Object.assign(out, legacy);
     markAllHistory();

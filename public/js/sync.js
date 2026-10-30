@@ -21,6 +21,7 @@ import {$, DAY, status, secs, pool, chunks} from './util.js';
 import {plan, start, report, finish, stopAll, settle} from './progress.js';
 import {gh, ghFetch, headers, gqlRepos, isFatalError, mapStar, gitSha, needToken, LANG_FIELDS, LAST_FIELDS, parseLast, languageShares, activityFields, parseActivity, recordStars} from './github.js';
 import {saveStars, saveReadmes, saveHistory, saveUsers, markHistory} from './store.js';
+import {debug, info, warn, error, names} from './log.js';
 import {render} from './list.js';
 import {syncHistory} from './history.js';
 
@@ -60,7 +61,12 @@ async function withLock(fn) {
   const locks = globalThis.navigator?.locks;
   if (!locks) return fn();
   return locks.request('stars-viewer:' + ukey(), {ifAvailable: true}, lock => {
-    if (!lock) { status('⚠ Another tab or window is already syncing this profile. Reload this tab when it has finished to see its progress.'); return; }
+    if (!lock) {
+      warn('task', `another tab or window already holds the lock of ${S.user}: this job does not run (two tabs would overwrite each other's cache)`);
+      status('⚠ Another tab or window is already syncing this profile. Reload this tab when it has finished to see its progress.');
+      return;
+    }
+    debug('task', `lock of ${S.user} taken: no other tab syncs this profile`);
     return fn();
   });
 }
@@ -71,15 +77,22 @@ async function withLock(fn) {
  *  A job of an earlier generation (the profile was loaded again) is stopping, but may still hold the profile's lock: the
  *  new job starts once it has ended, instead of finding the lock taken and reporting another tab. */
 export function task(job) {
-  if (S.loading) { status('⏳ Still reading the cached data, try again in a moment'); return Promise.resolve(); }
-  if (running && runningGen === S.gen) { status('⏳ Busy with another task, please wait'); return running; }
+  if (S.loading) { warn('task', `${job.name || 'job'} not started: the cached data of ${S.user} is still being read`); status('⏳ Still reading the cached data, try again in a moment'); return Promise.resolve(); }
+  if (running && runningGen === S.gen) { warn('task', `${job.name || 'job'} not started: another task is still running`); status('⏳ Busy with another task, please wait'); return running; }
   const g = S.gen, cancel = $('#cancelTask'), previous = running || Promise.resolve();
   runningGen = g;
   S.stop = false;
   if (cancel) cancel.hidden = false;
+  const started = Date.now();
+  info('task', `▶ ${job.name || 'job'} for ${S.user}${S.visit ? ' (a visit: nothing is saved)' : ''} · generation ${g} · token ${S.token ? 'set' : 'not set'} · ${S.repos.length.toLocaleString()} repos on screen`);
   const p = previous.then(() => g === S.gen ? withLock(() => job(g)) : undefined)
-    .catch(e => { if (g === S.gen && e?.name !== 'AbortError') status('⚠ ' + e.message); })
+    .catch(e => {
+      if (e?.name === 'AbortError') debug('task', `${job.name || 'job'} cancelled: its requests were aborted`);
+      else error('task', `${job.name || 'job'} failed: ${e?.message || e}`);
+      if (g === S.gen && e?.name !== 'AbortError') status('⚠ ' + e.message);
+    })
     .finally(() => {
+      info('task', `■ ${job.name || 'job'} ${S.stop ? 'stopped by Cancel' : g !== S.gen ? 'ended (another profile was loaded)' : 'ended'} after ${((Date.now() - started) / 1000).toFixed(1)} s`);
       if (running !== p) return;
       stopAll(S.stop);   // steps still running are marked done, or stopped if Cancel was clicked
       settle();          // the finished panel stays readable for a few seconds
@@ -125,7 +138,11 @@ const recentlyChecked = r => !!r.gone && Date.now() - (r.gone.checked ?? 0) < DA
 async function checkMissing(g, missing) {
   const out = new Map();
   for (const r of missing) if (recentlyChecked(r)) out.set(r, 'gone');   // verified in the last day: not asked again at every check
-  let todo = missing.filter(r => !out.has(r)).slice(0, S.token ? Infinity : MISSING_CHECKS_WITHOUT_TOKEN), stop = false;
+  const unasked = missing.filter(r => !out.has(r));
+  let todo = unasked.slice(0, S.token ? Infinity : MISSING_CHECKS_WITHOUT_TOKEN), stop = false;
+  if (missing.length) info('sync', `${missing.length} cached repo(s) are not in your star list any more (${names(missing.map(r => r.full), 8)}): ${unasked.length ? 'asking GitHub whether each still exists (' + (S.token ? 'GraphQL first, then REST by id as the judge' : 'REST by id, no token: at most ' + MISSING_CHECKS_WITHOUT_TOKEN) + ')' : 'all were verified as removed less than a day ago, so GitHub is not asked again'}`);
+  if (out.size && unasked.length) debug('sync', `${out.size} of them were verified as removed less than a day ago: not asked again`);
+  if (todo.length < unasked.length) warn('sync', `${unasked.length - todo.length} repo(s) are not checked this time (without a token the budget is 60 requests an hour); they stay in the list and are asked again next time`);
   if (S.token && todo.length) {
     const rest = [];
     await pool(chunks(todo, 40), 4, async batch => {
@@ -135,6 +152,7 @@ async function checkMissing(g, missing) {
       batch.forEach((r, j) => { const d = data['r' + j]; if (d && (r.id == null || d.databaseId === r.id)) out.set(r, 'unstarred'); else rest.push(r); });
     });
     todo = rest;
+    info('sync', `GraphQL found ${todo.length === 0 ? 'all' : (unasked.length - rest.length) + ' of ' + unasked.length} of them: they exist, so they were unstarred${rest.length ? '. ' + rest.length + ' came back empty or with another id: asking REST by id' : ''}`);
   }
   await pool(todo, 6, async r => {
     if (stop || g !== S.gen) return;
@@ -148,7 +166,9 @@ async function checkMissing(g, missing) {
         if (res.status === 429 || res.headers.get('x-ratelimit-remaining') === '0' || res.headers.get('retry-after')) stop = true;   // budget used up: the rest waits
         else if (/blocked|disabled|taken down|dmca/i.test((await res.json().catch(() => ({}))).message || '')) out.set(r, 'gone');
       }
-    } catch { /* offline or aborted: unknown, kept, asked again next time */ }
+      const v = out.get(r);
+      info('sync', `${r.full} (id ${r.id ?? 'unknown'}): GitHub answered ${res.status} → ${v === 'gone' ? 'REMOVED, private or hidden: the local copy is kept' : v === 'unstarred' ? 'it still exists, so it was unstarred: forgotten' : 'cannot tell yet (kept, asked again next time)'}`);
+    } catch (e) { debug('sync', `${r.full}: could not be checked (${e?.message || 'offline or aborted'}); kept, asked again next time`); }
   });
   return out;
 }
@@ -167,11 +187,16 @@ async function fetchStarPages(g) {
     if (r.status === 404) throw new Error(`User "${user}" not found`);
     if (r.status === 304) {
       const items = old.ids.map(id => cachedById.get(id));
-      if (items.every(Boolean)) return {etag: old.etag, ids: old.ids, items: items.map(x => ({...x})), last: 0, hit: true};
+      if (items.every(Boolean)) {
+        debug('sync', `star list page ${p}: 304 not modified, ${items.length} repos rebuilt from the cache (free: costs no rate limit)`);
+        return {etag: old.etag, ids: old.ids, items: items.map(x => ({...x})), last: 0, hit: true};
+      }
+      warn('sync', `star list page ${p}: 304, but the cache lacks some of its repos: downloading the page for real`);
       return fetchPage(p, false);   // cache doesn't have every repo of that page: fetch it for real
     }
     const items = (await r.json()).map(mapStar);
     const last = Number(r.headers.get('Link')?.match(/[?&]page=(\d+)>; rel="last"/)?.[1] || 0);
+    debug('sync', `star list page ${p}: ${items.length} repos downloaded${last ? ' · GitHub says the list has ' + last + ' pages' : ''}${useEtag && old?.etag ? ' · its ETag changed' : ''}`);
     return {etag: r.headers.get('ETag'), ids: items.map(x => x.id), items, last, hit: false};
   };
   const first = await fetchPage(1);
@@ -187,6 +212,7 @@ async function fetchStarPages(g) {
   // Unstarring shrinks the list, but an unchanged first page (304) carries no page count: the cache's old last pages
   // then come back empty. Drop them, or they would be requested again on every check.
   while (pages.length > 1 && !pages.at(-1).items.length) pages.pop();
+  info('sync', `star list: ${pages.length} page(s), ${pages.reduce((n, p) => n + p.items.length, 0).toLocaleString()} repos, ${pages.filter(p => p.hit).length} page(s) unchanged (304)`);
   return pages;
 }
 
@@ -199,6 +225,7 @@ let gone = {user: '', keys: new Set()};
 export async function sync(g) {
   const t0 = performance.now(), lite = !!S.visit;
   status('Checking GitHub (all pages in parallel)…');
+  info('sync', `checking ${S.user}'s stars (${lite ? 'light check, a visit' : 'full check'}) · cache: ${S.repos.length.toLocaleString()} repos, ${Object.keys(S.readmes).length.toLocaleString()} READMEs, ${Object.keys(S.history).length.toLocaleString()} repos indexed for commits & releases · token ${S.token ? 'set' : 'not set'}`);
   // The steps of this job, shown up front: what exists in the cache decides which later steps will run.
   const indexed = S.token && Object.keys(S.history).length > 0;
   plan([['stars'], (S.token || S.repos.some(r => r.enrichedAt)) && ['details'], Object.keys(S.readmes).length > 0 && ['readmes'],
@@ -214,17 +241,22 @@ export async function sync(g) {
   const byId = new Map(S.repos.filter(r => r.id).map(r => [r.id, r]));
   const byFull = new Map(S.repos.map(r => [r.full, r]));
   let added = 0, changed = 0, renamed = 0;
+  const addedNames = [], changedNames = [], renames = [];
   for (const r of fresh.values()) {
     const o = byId.get(r.id) || byFull.get(r.full);
-    if (!o) { added++; continue; }
-    if (o.full !== r.full) renamed++;
-    if (o.pushed !== r.pushed) changed++;
+    if (!o) { added++; addedNames.push(r.full); continue; }
+    if (o.full !== r.full) { renamed++; renames.push(`${o.full} → ${r.full}`); }
+    if (o.pushed !== r.pushed) { changed++; changedNames.push(r.full); }
     for (const f of DETAIL_FIELDS) r[f] = o[f];
     r.starHist = o.starHist;   // keep details; needsEnrich() decides if they're still valid
     const oldKey = rkey(o), newKey = rkey(r);      // old caches had no id: re-key the README entry
     if (oldKey !== newKey && S.readmes[oldKey]) { S.readmes[newKey] = S.readmes[oldKey]; delete S.readmes[oldKey]; }
     if (oldKey !== newKey && S.history[oldKey]) { S.history[newKey] = S.history[oldKey]; delete S.history[oldKey]; markHistory(oldKey); markHistory(newKey); }
   }
+  info('sync', `compared with the cache: ${fresh.size.toLocaleString()} repos on GitHub · ${added} new · ${changed} pushed since the last check · ${renamed} renamed`);
+  if (added) info('sync', `new stars: ${names(addedNames, 12)}`);
+  if (renamed) info('sync', `renamed on GitHub: ${names(renames, 12)}`);
+  if (changed) debug('sync', `pushed since the last check: ${names(changedNames, 12)}`);
   const freshFulls = new Set([...fresh.values()].map(r => r.full));
   // Repos of the cache that the star list no longer has: unstarred (it still exists: forget it), or deleted / made private /
   // hidden by GitHub (it can't be listed any more: keep the local copy, marked). See checkMissing.
@@ -233,6 +265,7 @@ export async function sync(g) {
   if (g !== S.gen) return;
   const kept = missing.filter(r => verdict.get(r) !== 'unstarred').map(r => verdict.get(r) === 'gone' ? {...r, gone: {at: r.gone?.at ?? Date.now(), checked: recentlyChecked(r) ? r.gone.checked : Date.now()}} : r);
   const removed = missing.length - kept.length, hidden = kept.filter(r => r.gone).length, unverified = missing.filter(r => !verdict.has(r)).length;
+  if (missing.length) info('sync', `not in the list any more: ${removed} unstarred (forgotten) · ${hidden} removed or private (local copy kept) · ${unverified} not verified (kept)`);
   const hadEnrich = S.repos.some(r => r.enrichedAt || r.commitAt);
   const hadReadmes = Object.keys(S.readmes).length > 0;
   const hadHistory = Object.keys(S.history).length > 0;
@@ -246,16 +279,19 @@ export async function sync(g) {
   const confirmed = orphans.filter(k => gone.keys.has(k));   // missing from the previous check too: really unstarred
   for (const k of confirmed) { delete S.readmes[k]; if (S.history[k]) { delete S.history[k]; markHistory(k); } }
   gone.keys = new Set(orphans.filter(k => !confirmed.includes(k)));
+  if (orphans.length) info('sync', `${orphans.length - confirmed.length} README / commit index entr(ies) belong to repos missing from the list for the first time: kept until a second check agrees · ${confirmed.length} were missing twice in a row: dropped`);
   // Counts of users you no longer star anything from.
   const owners = new Set(S.repos.map(r => r.owner.toLowerCase()));
   const staleUsers = Object.keys(S.users).filter(k => !owners.has(k));
   for (const k of staleUsers) delete S.users[k];
+  if (staleUsers.length) debug('sync', `dropped the star counts of ${staleUsers.length} user(s) you no longer star anything from`);
   bumpIndex();
   await saveStars(g);
   if (confirmed.length) await saveReadmes(g);
   if (staleUsers.length) await saveUsers(g);
   await saveHistory(g);   // writes only the shards that changed
   if (g !== S.gen) return;   // a profile change may happen while a large cache file is being written
+  debug('sync', `star list saved (${S.repos.length.toLocaleString()} repos, ${S.starPages.length} page ETags)`);
 
   const diff = [added && `+${added} new`, changed && `${changed} with new commits`, renamed && `${renamed} renamed`,
     removed && `−${removed} unstarred`, hidden && `${hidden} removed or private (kept)`, unverified && `${unverified} not verified (kept, checked again next time)`].filter(Boolean).join(' · ') || 'list up to date';
@@ -280,10 +316,14 @@ export async function sync(g) {
 /** Refreshes details of repos that need it. Returns {summary}. `lite`: only last commit and last release (a visit's check). */
 async function refreshDetails(g, {wantReadmes, wantEnrich, lite = false}) {
   const live = S.repos.filter(r => !r.gone);   // a repo GitHub no longer shows can't be refreshed: its local copy stays as it is
-  if (!S.token) return wantReadmes ? restReadmes(g, live.filter(needsReadme)) : {summary: 'add a token for releases'};
+  if (!S.token) {
+    info('sync', wantReadmes ? `no token: READMEs are checked over REST, one request per repo (an unchanged one answers 304 for free)` : 'no token: last commit, last release, languages and charts need one, so they are skipped');
+    return wantReadmes ? restReadmes(g, live.filter(needsReadme)) : {summary: 'add a token for releases'};
+  }
   const stale = lite ? needsLite : needsEnrich;
   const todo = live.filter(r => (wantEnrich && stale(r)) || (wantReadmes && needsReadme(r)));
   if (!todo.length) {
+    info('sync', `details: all ${live.length.toLocaleString()} repos are up to date (0 requests)`);
     finish('details', 'all up to date');
     if (wantReadmes) finish('readmes', 'all up to date');   // READMEs not indexed: there is no such step to finish
     return {summary: 'details up to date (0 requests)'};
@@ -298,33 +338,39 @@ async function refreshDetails(g, {wantReadmes, wantEnrich, lite = false}) {
   const batches = [...chunks(full, 10).map(items => ({items, isFull: true})), ...chunks(light, 10).map(items => ({items, isFull: false}))];
   const download = [], viaRest = [];
   let checked = 0, same = 0, skipped = 0, fatal = null;
+  info('sync', `details: ${todo.length.toLocaleString()} of ${live.length.toLocaleString()} repos need a refresh · ${full.length} ${lite ? 'last commit + last release only (a visit)' : 'full (tiles, languages, 12-month chart)'} · ${light.length} README hash only · ${batches.length} GraphQL calls of 10 repos, 6 at a time`);
 
   await pool(batches, 6, async ({items: batch, isFull}) => {
     if (fatal || S.stop || g !== S.gen) return;
     let data;
-    try { data = await gqlRepos(batch, isFull ? fullFields : readmeFields); }
-    catch (e) {   // auth/rate limit: stop; anything else (timeout…): skip this batch, it's retried next check
-      if (isFatalError(e)) fatal = e; else skipped += batch.length;
+    try { data = await gqlRepos(batch, isFull ? fullFields : readmeFields, undefined, `details of ${batch.length} repos, ${isFull ? (lite ? 'tiles' : 'full') : 'README hash'}`); }
+    catch (e) {   // auth/rate limit: stop; anything else (a big query that times out…): ask again as two smaller calls; a small batch is skipped, retried next check
+      const split = !isFatalError(e) && batch.length > 3 && g === S.gen && !S.stop;
+      warn('sync', `details: a batch of ${batch.length} repos failed (${e.message}): ${isFatalError(e) ? 'this ends the run, progress is kept' : split ? 'asking again as two smaller calls (a big query can time out)' : 'skipped, retried at the next check'}`);
+      if (isFatalError(e)) fatal = e;
+      else if (split) { const half = Math.ceil(batch.length / 2); batches.push({items: batch.slice(0, half), isFull}, {items: batch.slice(half), isFull}); }
+      else skipped += batch.length;
       return;
     }
     const now = Date.now();
     for (const [j, r] of batch.entries()) {
       if (g !== S.gen) return;   // never write an old profile's results into the newly loaded profile
       const d = data['r' + j];
-      if (!d) { skipped++; continue; }   // GraphQL may omit one repo; keep its old details and retry later
+      if (!d) { skipped++; debug('sync', `${r.full}: GitHub returned nothing for it (private, deleted or timed out): old details kept, retried next check`); continue; }   // GraphQL may omit one repo; keep its old details and retry later
       if (isFull) Object.assign(r, parseLast(d), lite ? {liteAt: now, enrichedPushed: r.pushed}
         : {langs: languageShares(d.languages), activity: parseActivity(d, now0), enrichedAt: now, enrichedPushed: r.pushed});
       if (!wantReadmes || !needsReadme(r)) continue;
       const k = rkey(r), c = S.readmes[k];
       const hit = README_NAMES.map((path, i) => d['m' + i]?.oid && {path, oid: d['m' + i].oid}).find(Boolean);   // a directory named README has no oid
-      if (!hit) { viaRest.push(r); continue; }
+      if (!hit) { viaRest.push(r); debug('readmes', `${r.full}: no README at the usual names (README.md, readme.md…): asking the REST endpoint`); continue; }
       const sameSha = c && !readmeCut(c) && (c.sha === hit.oid || (!c.sha && c.t && await gitSha(c.t) === hit.oid));
       if (g !== S.gen) return;
       if (sameSha) {
         Object.assign(c, {sha: hit.oid, path: hit.path, whole: true, at: now, pushed: r.pushed}); same++;
-      } else download.push({r, ...hit});
+      } else { download.push({r, ...hit}); debug('readmes', `${r.full}: README changed (${hit.path}, hash ${hit.oid.slice(0, 7)}${c?.sha ? ', was ' + c.sha.slice(0, 7) : ', not stored yet'}): will download`); }
     }
     checked += batch.length;
+    debug('sync', `details: ${checked}/${todo.length} repos checked (${names(batch.map(r => r.full), 3)})`);
     if (g === S.gen) {
       status(`Checked ${checked}/${todo.length} changed repos…`);
       report('details', checked, todo.length, `${checked.toLocaleString()} of ${todo.length.toLocaleString()} repos`);
@@ -335,20 +381,23 @@ async function refreshDetails(g, {wantReadmes, wantEnrich, lite = false}) {
   await saveStars(g);
 
   let got = 0;
+  if (wantReadmes) info('readmes', `${same.toLocaleString()} README(s) unchanged (same git hash: no download) · ${download.length} changed · ${viaRest.length} without a standard name`);
   if (wantReadmes) { if (download.length) start('readmes', download.length); else finish('readmes', 'all unchanged'); }
   await pool(chunks(download, 10), 8, async batch => {
     if (fatal || S.stop || g !== S.gen) return;
     let data;
     try { data = await gqlRepos(batch, x => `object(expression:${JSON.stringify('HEAD:' + x.path)}){...on Blob{text isTruncated}}`, x => [x.r.owner, x.r.name]); }
     catch (e) {
+      warn('readmes', `download of ${batch.length} READMEs failed (${e.message}): ${isFatalError(e) ? 'run ends, progress kept' : 'trying each over REST'}`);
       if (isFatalError(e)) fatal = e; else for (const x of batch) viaRest.push(x.r);
       return;
     }
     if (g !== S.gen) return;
     batch.forEach((x, j) => {
       const blob = data['r' + j]?.object;
-      if (blob?.text == null || blob.isTruncated) { viaRest.push(x.r); return; }   // binary, or GraphQL cut it: REST returns the whole file
+      if (blob?.text == null || blob.isTruncated) { viaRest.push(x.r); debug('readmes', `${x.r.full}: ${x.path} ${blob?.text == null ? 'is binary or empty' : 'was cut by GraphQL'}: fetching the whole file over REST`); return; }   // binary, or GraphQL cut it: REST returns the whole file
       S.readmes[rkey(x.r)] = readmeRecord(x.r, {t: blob.text, sha: x.oid, path: x.path});
+      info('readmes', `${x.r.full}: downloaded ${x.path}, ${blob.text.length.toLocaleString()} characters (never trimmed)`);
       got++;
     });
     if (g === S.gen) {
@@ -383,12 +432,13 @@ async function restReadmes(g, todo, quiet = false, base = 0) {
     try {
       const res = await gh(`/repos/${r.full}/readme`, {Accept: 'application/vnd.github.raw', ...(c?.etag && !readmeCut(c) ? {'If-None-Match': c.etag} : {})});
       if (g !== S.gen) return;
-      if (res.status === 304) { Object.assign(c, {whole: true, at: Date.now(), pushed: r.pushed}); same++; }
-      else if (res.status === 404) S.readmes[k] = readmeRecord(r, {});   // repo has no README
+      if (res.status === 304) { Object.assign(c, {whole: true, at: Date.now(), pushed: r.pushed}); same++; debug('readmes', `${r.full}: README unchanged (304)`); }
+      else if (res.status === 404) { S.readmes[k] = readmeRecord(r, {}); debug('readmes', `${r.full}: the repo has no README`); }   // repo has no README
       else {
         const text = await res.text();
         if (g !== S.gen) return;
         S.readmes[k] = readmeRecord(r, {t: text, etag: res.headers.get('ETag')}); got++;
+        info('readmes', `${r.full}: downloaded over REST, ${text.length.toLocaleString()} characters`);
       }
     } catch (e) { if (isFatalError(e)) fatal = e; else failed++; }   // transient: retried next time
     if (g === S.gen) {
@@ -405,6 +455,7 @@ async function restReadmes(g, todo, quiet = false, base = 0) {
 
 // ---- toolbar actions ----
 export async function enrich(g) {
+  info('sync', 'Refresh latest tiles: last commit, last release, languages and the 12-month chart of every repo that needs it');
   if (!S.token) { needToken(); return status('⚠ Releases/commits need a token (GraphQL). Add one in the 🔑 panel.'); }
   const t0 = performance.now(), wantReadmes = Object.keys(S.readmes).length > 0;
   plan([['details'], wantReadmes && ['readmes']].filter(Boolean));
@@ -413,6 +464,7 @@ export async function enrich(g) {
 }
 
 export async function indexReadmes(g) {
+  info('readmes', `Index READMEs: ${S.repos.length.toLocaleString()} repos, a README is downloaded only when its git hash changed`);
   const t0 = performance.now();
   plan([S.token && ['details', 'Check repos & README versions'], ['readmes']].filter(Boolean));
   const {summary} = await refreshDetails(g, {wantReadmes: true, wantEnrich: !!S.token});

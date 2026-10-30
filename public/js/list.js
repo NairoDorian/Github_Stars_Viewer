@@ -8,9 +8,10 @@ import {$, esc, escRe, fmtN, fmtDate, ago, when, safeUrl, tally, status} from '.
 import {activityNow, starGains, ACTIVITY_SPAN, ACTIVITY_BUCKETS, setStar, whoAmI, needToken} from './github.js';
 import {drawableCurve, starsAt, watchStarCharts} from './starhistory.js';
 import {sortRepos, SORT_OPTIONS} from './sort.js';
+import {debug, info, warn} from './log.js';
 
 const PAGE = 200;   // cards rendered per step; more load automatically when you reach the end (or via Show more)
-const filters = {lang: null, topic: null, owner: null};
+const filters = {lang: null, topic: null, owner: null, gone: false};   // gone: only the repos GitHub no longer shows (removed, private or hidden)
 let limit = PAGE;
 
 // Lower-cased searchable text per repo object: name, about, topics and languages. Repo objects are replaced on every
@@ -294,6 +295,7 @@ async function starVisited(full, btn) {
     if (code >= 300) throw new Error('GitHub ' + code);
     const repo = S.repos.find(r => r.full.toLowerCase() === full.toLowerCase());
     if (S.mine) { S.mine.names.add(full.toLowerCase()); if (repo?.id != null) S.mine.ids.add(repo.id); }
+    info('stars', `★ ${full} starred from ${S.visit}'s list (GitHub answered ${code}); it joins your own list the next time it is loaded`);
     status(`★ Starred ${full} on GitHub. It joins your stars the next time your own list is loaded.`);
     window.dispatchEvent(new CustomEvent('mine-changed'));   // main.js redraws the banner and the tiles
   } catch (e) {
@@ -311,7 +313,7 @@ export function card(r, {snips = [], re = null, suggestion = false, reasons = []
   const tag = suggestion ? 'li' : 'div';
   const shownTopics = pickTopics(r.topics || [], re);
   return `<${tag} class="card${suggestion ? ' suggestion-card' : ''}${r.gone ? ' gone' : ''}">
-    <div class="owner">${avatar ? `<img src="${esc(avatar)}" loading="lazy" alt="">` : ''}<span class="chip" tabindex="0" role="button" data-owner="${esc(r.owner)}">${hl(r.owner, re)}</span>${r.archived ? ' · archived' : ''}${r.fork ? ' · fork' : ''}</div>
+    <div class="owner">${avatar ? `<img src="${esc(avatar)}" loading="lazy" alt="">` : ''}<span class="chip" tabindex="0" role="button" data-owner="${esc(r.owner)}">${hl(r.owner, re)}</span>${r.archived ? ' · archived' : ''}${r.fork ? ' · fork' : ''}${r.gone ? ' <span class="chip gone-tag" tabindex="0" role="button" data-gone="1" title="Deleted, made private or hidden on GitHub. Click to see all such repos">🚫 removed / private</span>' : ''}</div>
     <a href="${esc(safeUrl(r.url))}" target="_blank" rel="noopener">${hl(r.name, re)}</a>
     ${r.gone ? `<div class="gone-note" title="GitHub no longer shows this repository: it was deleted, made private or hidden. You still starred it, so this local copy is kept. It is not updated any more.">🚫 Removed, private or hidden on GitHub · local copy from ${esc(ago(r.gone.at))}</div>` : ''}
     <p class="desc">${r.about ? hl(r.about, re) : '<span class="muted">No description</span>'}</p>
@@ -334,9 +336,13 @@ export function card(r, {snips = [], re = null, suggestion = false, reasons = []
   </${tag}>`;
 }
 
+/** Shows only the repos GitHub no longer shows (deleted, private, hidden), or all again. */
+export function showOnlyRemoved(on) { filters.gone = !!on; info('list', on ? 'showing only the repos that were removed, made private or hidden on GitHub' : 'showing all repos again'); limit = PAGE; render(); }
+
 /** Resets active facet filters and pagination when switching GitHub users. */
 export function resetFilters() {
   filters.lang = filters.topic = filters.owner = null;
+  filters.gone = false;
   limit = PAGE;
   shown.clear();
 }
@@ -371,6 +377,7 @@ export function render() {
   const out = [], forLang = [], forTopic = [], forOwner = [];
   for (const r of S.repos) {
     if (S.hideForks && r.fork) continue;
+    if (filters.gone && !r.gone) continue;   // "🚫 removed or hidden": only the repos kept as a local copy
     if (S.visit && S.onlyNew && isMine(r) === true) continue;   // visiting: only what you have not starred yet
     const okLang = !filters.lang || r.lang === filters.lang;
     const okTopic = !filters.topic || r.topics.includes(filters.topic);
@@ -390,9 +397,12 @@ export function render() {
   const pills = [['lang', 'Language'], ['topic', 'Topic'], ['owner', 'Owner']]
     .filter(([k]) => filters[k])
     .map(([k, label]) => `<button class="chip filter-pill" data-${k}="${esc(filters[k])}" title="Remove ${label.toLowerCase()} filter">${label}: ${esc(filters[k])} ✕</button>`);
+  if (filters.gone) pills.push('<button class="chip filter-pill" data-gone="1" title="Show all repos again">Status: removed or hidden ✕</button>');
+  const nGone = S.repos.filter(r => r.gone).length;
+  const goneChip = nGone && !filters.gone ? `<button class="chip gone-chip" data-gone="1" title="Show only the repos that were deleted, made private or hidden on GitHub (kept here as a local copy). Search: is:removed">🚫 ${nGone} removed or hidden</button>` : '';
   const filtered = S.hideForks || (S.visit && S.onlyNew) || pills.length > 0 || q.hasQuery;
   const exportBtns = out.length ? `<span class="export-actions"><button class="clear-filters" data-export="md" title="Export shown repos as Markdown">⬇ .md</button><button class="clear-filters" data-export="json" title="Export shown repos as JSON">⬇ .json</button></span>` : '';
-  $('#count').innerHTML = `<span>${out.length} of ${S.repos.length} repos${filtered ? ' (filtered)' : ''}</span>` +
+  $('#count').innerHTML = `<span>${out.length} of ${S.repos.length} repos${filtered ? ' (filtered)' : ''}</span>` + (goneChip ? ' ' + goneChip : '') +
     (pills.length ? ` <span class="active-filters">${pills.join('')}<button class="clear-filters" data-clear-filters title="Clear active filters">Clear</button></span>` : '') + exportBtns;
   $('#list').innerHTML = out.slice(0, limit).map(x => card(x.r, {snips: x.snips, re})).join('');
   moreButton();
@@ -418,7 +428,7 @@ function indexCounts() {
 // Each facet group is cross-filtered by the active search and the other two facets, so counts reflect real matches.
 let facetsKey = null;
 function renderFacets({forLang, forTopic, forOwner}, queryKey) {
-  const k = [S.repos, S.hideForks, filters.lang, filters.topic, filters.owner, queryKey, S.indexVer];   // indexVer: README / history text changed
+  const k = [S.repos, S.hideForks, filters.lang, filters.topic, filters.owner, filters.gone, queryKey, S.indexVer];   // indexVer: README / history text changed
   if (facetsKey && k.every((v, i) => v === facetsKey[i])) return;
   facetsKey = k;
   const row = (kind, active, [v, c]) =>
@@ -433,7 +443,9 @@ function renderFacets({forLang, forTopic, forOwner}, queryKey) {
     return `<h3>${title}</h3>` + top.map(x => row(kind, active, x)).join('') +
       (more.length ? `<details><summary class="small">Show ${more.length} more</summary>${more.map(x => row(kind, active, x)).join('')}</details>` : '');
   };
-  $('#facets').innerHTML = block('Languages', 'lang', tally(forLang, r => r.lang), 15) +
+  const nGone = S.repos.filter(r => r.gone).length;   // the Status block exists only when there is something to show
+  const status = nGone || filters.gone ? `<h3>Status</h3><div class="facet ${filters.gone ? 'on' : ''}" tabindex="0" role="button" data-gone="1" title="Repos that were deleted, made private or hidden on GitHub: your local copy is kept"><span>🚫 Removed or hidden</span><span class="muted">${nGone}</span></div>` : '';
+  $('#facets').innerHTML = status + block('Languages', 'lang', tally(forLang, r => r.lang), 15) +
     block('Topics', 'topic', tally(forTopic, r => r.topics), 30) +
     block('Owners', 'owner', tally(forOwner, r => r.owner).filter(([v, c]) => c > 1 || v === filters.owner), 15);
 }
@@ -456,6 +468,7 @@ function exportMatches(fmt) {
   const repos = shownMatches.map(x => x.r);
   if (!repos.length) return;
   const user = S.user || 'github', body = exportText(repos, fmt, user);
+  info('export', `${repos.length.toLocaleString()} repos exported as ${fmt === 'json' ? 'JSON' : 'Markdown'} (${body.length.toLocaleString()} characters)`);
   const url = URL.createObjectURL(new Blob([body], {type: fmt === 'json' ? 'application/json' : 'text/markdown;charset=utf-8'}));
   const a = Object.assign(document.createElement('a'), {href: url, download: `stars-${user.toLowerCase()}.${fmt}`});
   document.body.append(a); a.click(); a.remove();
@@ -558,8 +571,10 @@ export function initList() {
   document.addEventListener('click', e => {
     const exp = e.target.closest('[data-export]');
     if (exp) { exportMatches(exp.dataset.export); return; }
+    if (e.target.closest('[data-gone]')) { showOnlyRemoved(!filters.gone); return; }   // the chip, the facet, the pill and the tag on a card all toggle it
     if (e.target.closest('[data-clear-filters]')) {
       filters.lang = filters.topic = filters.owner = null;
+      filters.gone = false;
       limit = PAGE; render();
       return;
     }

@@ -3,6 +3,7 @@ import {S} from './state.js';
 import {$} from './util.js';
 import {ghFetch, headers, forgetMe} from './github.js';
 import {saveConfig} from './store.js';
+import {info, warn} from './log.js';
 
 const PANEL_STATE = 'tokenPanelOpen';   // localStorage: remembered open/closed state (a UI preference only)
 
@@ -18,6 +19,7 @@ async function checkToken() {
     const r = await ghFetch('/rate_limit', {headers: headers(), signal: null});
     if (token !== S.token) return;   // a slower check for the previous token must not overwrite the new status
     if (r.status === 401) {
+      warn('token', 'GitHub rejected the token (401): copied fully? expired?');
       summary.textContent = '· ⚠ token rejected';
       limit.textContent = '⚠ Token rejected: check it was copied fully and hasn\'t expired.';
       return;
@@ -26,6 +28,8 @@ async function checkToken() {
     const {resources: {core, graphql}} = await r.json();
     if (token !== S.token) return;
     const scopes = r.headers.get('X-OAuth-Scopes');   // classic tokens only; null for fine-grained tokens
+    info('token', S.token ? `token accepted · ${scopes == null ? 'fine-grained token' : 'classic token, scopes: ' + (scopes || 'none')} · REST budget ${core.remaining.toLocaleString()}/${core.limit.toLocaleString()} (resets ${new Date(core.reset * 1000).toLocaleTimeString()})${graphql ? ' · GraphQL budget ' + graphql.remaining.toLocaleString() + '/' + graphql.limit.toLocaleString() : ''}`
+      : `no token · REST budget ${core.remaining}/${core.limit} per hour (resets ${new Date(core.reset * 1000).toLocaleTimeString()})`);
     const star = !S.token ? '' : scopes == null ? ' · fine-grained' : canStar(scopes) ? ' · ★ can star' : ' · read-only (add "public_repo" to star)';
     summary.textContent = S.token ? '· ✅ set' + star : '· not set (60 requests/hour)';
     limit.textContent = `${S.token ? '✅ Token OK' + star : 'No token'} · REST: ${core.remaining}/${core.limit} left ` +
@@ -61,6 +65,7 @@ export function setToken(value, {save = true} = {}) {
     return;
   }
   S.token = token;
+  info('token', token ? 'token set (it is only ever sent to api.github.com)' : 'token removed');
   $('#token').value = S.token;
   $('#tokenBtn').textContent = S.token ? '🔑 Token' : '🔑 Add token';
   forgetMe();

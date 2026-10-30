@@ -6,6 +6,7 @@ import {ghFetch, headers} from './github.js';
 import {saveHistory, markAllHistory} from './store.js';
 import {render} from './list.js';
 import {waitIdle} from './sync.js';
+import {info} from './log.js';
 import {histOpts, setHistOpts, forgetHistOpts, reconcile, historyTotals} from './history.js';
 
 const OPEN_PREF = 'starsViewer.histOptsOpen';   // localStorage: panel open?
@@ -59,6 +60,7 @@ function fill() {
 }
 
 async function change(patch) {
+  info('history', `option changed: ${JSON.stringify(patch)}`);
   setHistOpts(patch);
   summary();
   const note = $('#optNote');
@@ -120,6 +122,7 @@ export function initHistOpts() {
     if (S.loading) return status('⏳ Still reading the cached data, try again in a moment');   // the load would bring the index back
     await waitIdle();
     const g = S.gen;
+    info('history', `commit & release index cleared: ${Object.keys(S.history).length.toLocaleString()} repos' records deleted`);
     S.history = {};
     markAllHistory();
     await saveHistory(g);

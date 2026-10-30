@@ -14,6 +14,7 @@ import {S, ukey, rkey, readmeText, readmeLower, starredSet, starredIds} from './
 import {$, DAY, esc, escRe, ago, status, tally} from './util.js';
 import {gh, ghSearch, repoMeta, repoCardDetails, repoSortDetails, mapStar, whoAmI, setStar, needToken, isFatalError} from './github.js';
 import {saveDisc, saveStars} from './store.js';
+import {debug, info, warn} from './log.js';
 import {render, searchFor, card} from './list.js';
 import {watchStarCharts} from './starhistory.js';
 import {SORT_OPTIONS, sortRepos} from './sort.js';
@@ -197,6 +198,7 @@ async function explore(id, {force = false, depth = 0}, run) {
     S.disc.results[id] = {...(old || {}), ...result, items, at: old?.at || Date.now(), depth, forkPolicy,
       sortDatesAt: depth ? null : undefined,   // a deeper page adds candidates that need dates too
       exhausted: depth >= MAX_DEPTH || !result.items.length || !!result.note?.some(n => /rate limited|token rejected/i.test(n))};
+    info('discover', `${id}: ${items.length.toLocaleString()} candidate(s) in total${depth ? ' (round ' + (depth + 1) + ' added ' + result.items.length + ')' : ''}${result.note?.length ? ' · notes: ' + result.note.join('; ') : ''}`);
     pruneResults(id);
     await saveDisc(g);
     updated = true;
@@ -235,9 +237,11 @@ function exploreTheme(id, keys, members, opts = {}) {
     const step = async (label, fn) => {
       if (fatal || !alive()) return;
       progress(depth ? `Finding more suggestions (round ${page})… ${label}` : label);
+      info('discover', `${id}: ${label.replace(/…$/, '')}`);
       try { await fn(); } catch (e) {
         if (e?.name === 'AbortError') return;
         note.push(`${label.replace(/…$/, '')}: ${e.message}`);
+        warn('discover', `${label.replace(/…$/, '')} failed: ${e.message}`);
         fatal = isFatalError(e);
       }
     };
@@ -574,10 +578,12 @@ async function starSuggestion(full, btn) {
     const me = await whoAmI();
     if (g !== S.gen || user !== ukey() || token !== S.token) throw new Error('Profile or token changed; try again.');
     if (me.toLowerCase() !== user) throw new Error(`You're viewing ${S.user}'s stars. Starring only works on your own list (${me}).`);
+    info('stars', `starring ${full} on GitHub as ${me}`);
     const code = await setStar(full, true);
     if (code === 403 || code === 404) { needToken(); throw new Error('Your token can read but not star. Grant "Starring: Read and write" (fine-grained) or "public_repo" (classic) in the 🔑 panel.'); }
     if (code >= 300) throw new Error('GitHub ' + code);
     starred = true;
+    info('stars', `★ ${full} starred (GitHub answered ${code})`);
     lastStarred = full;
     if (g !== S.gen || user !== ukey()) return status(`★ Starred ${full} on GitHub. Reload ${user}'s stars to see it here.`);
     // Prefer fresh REST metadata, but keep the successful star visible even if that follow-up request fails.
@@ -617,7 +623,9 @@ async function unstarSuggestion(full, btn) {
   const g = S.gen;
   btn.disabled = true;
   try {
+    info('stars', `unstarring ${full} on GitHub`);
     const code = await setStar(full, false);
+    info('stars', `${full}: GitHub answered ${code}`);
     if (code >= 300 && code !== 404) throw new Error('GitHub ' + code);
     if (lastStarred === full) lastStarred = null;
     if (g !== S.gen) return;
@@ -667,7 +675,7 @@ export function initDiscover() {
       t.classList.add('on');
       exploreTheme(th.id, th.keys, th.members);
     } else if (d.dismiss) {
-      if (!S.disc.dismissed.includes(d.dismiss)) S.disc.dismissed.push(d.dismiss);
+      if (!S.disc.dismissed.includes(d.dismiss)) { S.disc.dismissed.push(d.dismiss); info('discover', `dismissed ${d.dismiss}: it is never suggested again`); }
       showResults(current);   // the next suggestion takes its place
       await saveDisc();
     } else if (d.undismiss !== undefined) {

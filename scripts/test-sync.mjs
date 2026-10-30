@@ -18,6 +18,7 @@ globalThis.CustomEvent ??= class extends Event { constructor(type, init) { super
 
 const {S, nextGen} = await import('../public/js/state.js');
 const {sync, task} = await import('../public/js/sync.js');
+const {text: logText} = await import('../public/js/log.js');
 
 const PUSHED = '2026-01-01T00:00:00Z';
 /** A REST "starred" item (star+json media type). */
@@ -245,12 +246,21 @@ test('a repo that left the star list: still online = unstarred and forgotten; de
     assert.equal(by(2).about, 'repo 2', 'with the cached details');
     assert.equal(S.repos.some(r => r.id === 1), true);
     assert.match(els['#status'].textContent, /2 removed or private \(kept\)/);
+    // ...and the activity log tells exactly what was decided about each repo, and why
+    const story = logText();
+    assert.match(story, /3 cached repo\(s\) are not in your star list any more \(.*\): asking GitHub whether each still exists/);
+    assert.match(story, /acme\/repo2 \(id 2\): GitHub answered 404 → REMOVED, private or hidden: the local copy is kept/);
+    assert.match(story, /acme\/repo4 \(id 4\): GitHub answered 403 → cannot tell yet \(kept, asked again next time\)/);
+    assert.match(story, /not in the list any more: 0 unstarred \(forgotten\) · 2 removed or private \(local copy kept\) · 1 not verified \(kept\)/);
+    assert.match(story, /star list: 1 page\(s\), 1 repos, 0 page\(s\) unchanged \(304\)/);
+    assert.match(story, /compared with the cache: 1 repos on GitHub · 0 new/);
     assert.match(els['#status'].textContent, /1 not verified/);
     assert.equal(S.readmes['2'].t, 'readme two', 'their README and commit index stay');
     assert.equal(S.history['3'].c.length, 1);
     assert.equal(by(2).starred, '2026-01-01T00:00:00Z');
 
     // The next check does not ask again about a repo verified a moment ago; the one that could not be verified is asked again.
+    // (The log says so honestly: it does not claim to ask about repos it skips.)
     const again = fakeStarList([star(1)], {repoStatus: {'acme/repo2': 404, 'acme/repo3': {id: 999}, 'acme/repo4': 403}});
     await sync(g);
     assert.deepEqual(again.repoCalls, ['acme/repo4'], 'only the unverified one');
