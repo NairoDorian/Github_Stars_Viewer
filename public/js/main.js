@@ -119,7 +119,9 @@ async function load({login, visit, push = false, why = ''} = {}) {
   S.user = u;
   $('#user').value = u;
   const url = profileURL(u, visiting);
-  history[push && location.search !== url ? 'pushState' : 'replaceState'](null, '', url);
+  const pushed = push && location.search !== url;
+  history[pushed ? 'pushState' : 'replaceState'](null, '', url);
+  info('nav', `address bar → ${location.href} (${pushed ? 'a new browser-history entry: the Back button returns to the previous page' : 'the same history entry, rewritten'})`);
   showVisit();
 
   try {
@@ -259,7 +261,7 @@ function initClearButton() {
 if (location.protocol !== 'file:') {   // ES modules can't run from file://; index.html shows a notice instead
   initLog();
   LOG.devtools = true;   // the log is mirrored to the browser's DevTools console too
-  info('app', `Stars Viewer started · ${navigator.userAgent}`);
+  info('app', `Stars Viewer started at ${location.href} · ${navigator.userAgent}`);
   initCacheToggle(await initStore());
   initClearButton();
   initList();
@@ -291,6 +293,7 @@ if (location.protocol !== 'file:') {   // ES modules can't run from file://; ind
   window.addEventListener('mine-changed', () => { showVisit(); render(); });   // your stars are known, or you just starred one
   window.addEventListener('visit-user', e => load({login: e.detail, visit: true, push: true, why: '“Visit” clicked in the Users panel'}));   // 👁 Visit in the Users panel
   window.addEventListener('popstate', () => {   // the browser's Back / Forward between profiles
+    info('nav', `the browser went Back / Forward to ${location.href}`);
     const p = new URLSearchParams(location.search), visit = p.get('visit'), want = visit || p.get('user') || S.home;
     if (visit && !S.home) S.home = parseUser(p.get('user') || '');
     if (want) load({login: want, visit: visit ? true : undefined, why: 'the browser’s Back / Forward button'});

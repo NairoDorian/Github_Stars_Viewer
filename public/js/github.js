@@ -1,7 +1,7 @@
 // GitHub API access: REST + GraphQL, with retries, rate-limit handling and data mapping.
 import {S, genSignal} from './state.js';
 import {DAY, sleep, pool, chunks} from './util.js';
-import {debug, info, warn, error, names} from './log.js';
+import {debug, info, warn, error, names, reqId} from './log.js';
 
 const API = 'https://api.github.com';
 
@@ -19,17 +19,47 @@ export const needToken = () => window.dispatchEvent(new CustomEvent('need-token'
  * fetch() with retries for transient failures: network errors, 5xx, and GitHub's secondary rate limit
  * (403/429 with Retry-After ≤ 60s). Returns the Response; callers decide what other statuses mean.
  */
+/** What a GraphQL query asks for, in words: "2 repositories [a/b, c/d] for: last commit, languages". */
+const ASKS = [['lastCommit', 'last commit'], ['releases(first:5', 'the 5 newest releases'], ['releases(first:25', 'every release with its notes'],
+  ['languages(', 'languages'], ['history(since', '12-month commit activity'], ['history(first:100', 'commit messages (100 per page)'],
+  ['HEAD:', 'README hash or text'], ['databaseId', 'the repo id'], ['starredRepositories', 'how many repos they starred'], ['issues(states', 'open issues and pull requests']];
+export function summarizeQuery(query) {
+  const targets = [...query.matchAll(/owner:"([^"]+)",name:"([^"]+)"/g)].map(m => m[1] + '/' + m[2]);
+  const users = [...query.matchAll(/repositoryOwner\(login:"([^"]+)"/g)].map(m => m[1]);
+  const list = users.length ? users : targets, asks = ASKS.filter(([needle]) => query.includes(needle)).map(([, text]) => text);
+  return `${list.length} ${users.length ? 'user(s)' : 'repositories'} [${names(list, 3)}]${asks.length ? ' for: ' + asks.join(', ') : ''}`;
+}
+
+/** " · budget resets 17:22:52 · the list has 24 pages · ETag … · 412 bytes · GitHub request id …": what else the answer says. */
+const answerNote = r => {
+  const get = k => r.headers?.get?.(k), bits = [];
+  if (get('x-ratelimit-reset')) bits.push('budget resets ' + new Date(get('x-ratelimit-reset') * 1000).toLocaleTimeString());
+  const last = get('link')?.match(/[?&]page=(\d+)>; rel="last"/)?.[1];
+  if (last) bits.push('the list has ' + last + ' pages');
+  if (get('etag')) bits.push('ETag ' + get('etag').slice(0, 26));
+  if (get('content-length')) bits.push(Number(get('content-length')).toLocaleString() + ' bytes');
+  if (get('x-github-request-id')) bits.push('GitHub request id ' + get('x-github-request-id'));
+  return bits.length ? ' · ' + bits.join(' · ') : '';
+};
+
 export async function ghFetch(url, init = {}, tries = 3, what = '') {
   const sig = init.signal === undefined ? genSignal() : init.signal;
-  const label = `${init.method || 'GET'} ${String(url).replace(API, '')}${what ? ' (' + what + ')' : ''}`;   // never the headers: they carry the token
+  const full = String(url).startsWith('http') ? String(url) : API + url, method = init.method || 'GET', id = reqId();
+  const label = `${method} ${full.replace(API, '')}${what ? ' (' + what + ')' : ''}`;   // never the headers: they carry the token
+  let detail = '';
+  if (full.endsWith('/graphql') && typeof init.body === 'string') { try { detail = ` · ${init.body.length.toLocaleString()} bytes · asks ${summarizeQuery(JSON.parse(init.body).query)}`; } catch {} }
+  const h = init.headers || {};
+  const how = [h['If-None-Match'] && `conditional: If-None-Match ${h['If-None-Match']} (a 304 answer is free)`, h.Accept?.includes('star+json') && 'with the date of each star',
+    h.Accept?.includes('raw') && 'raw file text', h.Authorization ? 'token attached (never logged)' : 'no token: anonymous, 60 requests an hour'].filter(Boolean);
   for (let i = 0; ; i++) {
     let r;
     const t0 = Date.now();
-    try { r = await fetch(url.startsWith('http') ? url : API + url, sig ? {...init, signal: sig} : init); }
+    debug('http', `#${id} → ${method} ${full}${what ? ' (' + what + ')' : ''}${detail} · ${how.join(' · ')}${i ? ' · try ' + (i + 1) + ' of ' + tries : ''}`);
+    try { r = await fetch(full, sig ? {...init, signal: sig} : init); }
     catch (e) {
-      if (sig?.aborted) { debug('http', `${label} cancelled (another profile was loaded, or Cancel)`); throw e; }
-      if (i >= tries - 1) { error('http', `${label} failed after ${tries} tries: ${e.message || 'network error'}`); throw new Error('Network error (offline, or GitHub timed out or cut the answer)'); }
-      warn('http', `${label}: network error (${e.message || 'no answer'}), try ${i + 2} of ${tries} in ${500 * 2 ** i} ms`);
+      if (sig?.aborted) { debug('http', `#${id} ← ${label} cancelled (another profile was loaded, or Cancel)`); throw e; }
+      if (i >= tries - 1) { error('http', `#${id} ← ${label} failed after ${tries} tries: ${e.message || 'network error'}`); throw new Error('Network error (offline, or GitHub timed out or cut the answer)'); }
+      warn('http', `#${id} ← ${label}: network error (${e.message || 'no answer'}) after ${Date.now() - t0} ms, try ${i + 2} of ${tries} in ${500 * 2 ** i} ms`);
       await sleep(500 * 2 ** i, sig);
       if (sig?.aborted) throw new DOMException('Aborted', 'AbortError');
       continue;
@@ -37,9 +67,9 @@ export async function ghFetch(url, init = {}, tries = 3, what = '') {
     const retryAfter = Number(r.headers.get('retry-after')) || 0;
     const transient = r.status >= 500 || ((r.status === 403 || r.status === 429) && retryAfter > 0 && retryAfter <= 60);
     (r.status >= 500 || r.status === 401 || r.status === 403 || r.status === 429 ? warn : debug)('http',
-      `${label} → ${r.status}${r.status === 304 ? ' not modified (free)' : ''} in ${Date.now() - t0} ms${i ? ', try ' + (i + 1) : ''}${rateNote(r)}${retryAfter ? ', retry-after ' + retryAfter + ' s' : ''}`);
+      `#${id} ← ${label} → ${r.status}${r.status === 304 ? ' not modified (free)' : ''} in ${Date.now() - t0} ms${i ? ', try ' + (i + 1) : ''}${rateNote(r)}${retryAfter ? ', retry-after ' + retryAfter + ' s' : ''}${answerNote(r)}`);
     if (transient && i < tries - 1) {
-      warn('http', `${label}: GitHub answered ${r.status}; waiting ${retryAfter ? retryAfter + ' s' : 500 * 2 ** i + ' ms'}, then trying again (try ${i + 2} of ${tries})`);
+      warn('http', `#${id}: GitHub answered ${r.status}; waiting ${retryAfter ? retryAfter + ' s' : 500 * 2 ** i + ' ms'}, then trying again (try ${i + 2} of ${tries})`);
       await sleep(retryAfter ? retryAfter * 1000 : 500 * 2 ** i, sig);
       if (sig?.aborted) throw new DOMException('Aborted', 'AbortError');
       continue;
@@ -107,6 +137,7 @@ export const repoQ = (alias, owner, name, fields) =>
 export async function gqlRepos(items, fields, nameOf = r => [r.owner, r.name], what = '') {
   const data = await gql('query{' + items.map((it, j) => repoQ('r' + j, ...nameOf(it), typeof fields === 'function' ? fields(it, j) : fields)).join(' ') + '}', what || `${items.length} repositories`);
   const empty = items.map((it, j) => data['r' + j] == null ? nameOf(it).join('/') : null).filter(Boolean);
+  debug('graphql', `answer: ${items.length - empty.length} of ${items.length} repositories returned data`);
   if (empty.length) debug('graphql', `${empty.length} of ${items.length} repositories came back empty (private, deleted, or GitHub timed out): ${names(empty)}`);
   return data;
 }

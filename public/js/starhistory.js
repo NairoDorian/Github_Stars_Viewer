@@ -9,7 +9,7 @@
    list.js redraw the matching cards. */
 import {S} from './state.js';
 import {put} from './store.js';
-import {debug, warn} from './log.js';
+import {debug, warn, reqId} from './log.js';
 
 const TTL = 7 * 864e5, FAIL_TTL = 864e5, CONCURRENCY = 4;
 const key = full => full.toLowerCase();
@@ -201,7 +201,10 @@ export async function loadCurve(full) {
   let ok = false;   // not "is there a curve in the cache": a stale one may be there while every retry failed
   for (let attempt = 0; attempt < 4 && !ok; attempt++) {
     let r = null, text = null;
-    try { r = await fetch(url, {signal: AbortSignal.timeout?.(TUNING.timeoutMs)}); if (r.ok) text = await r.text(); } catch {}
+    const id = reqId(), t0 = Date.now();
+    debug('http', `#${id} → GET ${url} (star history of ${full}, try ${attempt + 1} of 4) · external site, no token sent`);
+    try { r = await fetch(url, {signal: AbortSignal.timeout?.(TUNING.timeoutMs)}); if (r.ok) text = await r.text(); } catch (e) { warn('http', `#${id} ← GET ${url} failed after ${Date.now() - t0} ms: ${e.message || 'no answer'}`); }
+    if (r) debug('http', `#${id} ← GET ${url} → ${r.status} in ${Date.now() - t0} ms${text ? ' · ' + text.length.toLocaleString() + ' characters of SVG' : ''}`);
     if (mine !== epoch) return;   // "Clear cache" happened meanwhile: don't bring the wiped data back
     if (text !== null) { S.starCurves[k] = {v: PARSER, at: Date.now(), pts: parseStarHistorySvg(text)}; ok = true; }
     else if (r?.status === 404) { S.starCurves[k] = {v: PARSER, at: Date.now(), pts: null}; ok = true; }

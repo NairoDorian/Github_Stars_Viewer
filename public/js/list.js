@@ -369,6 +369,7 @@ function showMore() {
 }
 
 export function render() {
+  const t0 = performance.now();
   const rawQ = $('#q').value;
   const q = parseQuery(rawQ);
   const re = q.inc.length ? new RegExp(q.inc.map(escRe).join('|'), 'gi') : null;
@@ -407,6 +408,7 @@ export function render() {
   $('#list').innerHTML = out.slice(0, limit).map(x => card(x.r, {snips: x.snips, re})).join('');
   moreButton();
   indexCounts();
+  debug('list', `showing ${Math.min(out.length, limit)} of ${out.length} matches (${S.repos.length.toLocaleString()} repos) in ${Math.round(performance.now() - t0)} ms · sort ${$('#sort').value || 'default'}${rawQ.trim() ? ' · search “' + rawQ.trim() + '”' + (inReadme ? ' + READMEs' : '') + (inHistory ? ' + commits & releases' : '') : ''}${filters.lang ? ' · language ' + filters.lang : ''}${filters.topic ? ' · topic ' + filters.topic : ''}${filters.owner ? ' · owner ' + filters.owner : ''}${filters.gone ? ' · only removed/hidden' : ''}${S.hideForks ? ' · forks hidden' : ''}`);
   renderFacets({forLang, forTopic, forOwner}, `${rawQ.trim().toLowerCase()}\0${inReadme ? 1 : 0}${inHistory ? 1 : 0}`);
   watchStarCharts($('#list'));
 }

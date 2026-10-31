@@ -67,13 +67,13 @@ const lane = (id, label) => {
 export function plan(list) {
   lanes.clear();
   for (const [id, label] of list) lane(id, label);
-  info('steps', `plan: ${[...lanes.values()].map(l => l.label).join(' → ')}`);
+  info('steps', `plan: ${[...lanes.values()].map((l, i) => (i + 1) + ' ' + l.label).join(' → ')}`);
   touch();
 }
 export function start(id, total = 0, label) {
   const l = lane(id, label);
   Object.assign(l, {state: 'running', done: 0, total, detail: '', t0: clock(), t1: 0, bucket: undefined});
-  info('steps', '▶ ' + l.label + (total ? ', ' + total.toLocaleString() + ' to do' : ''));
+  info('steps', '▶ step ' + ([...lanes.keys()].indexOf(id) + 1) + ' of ' + lanes.size + ': ' + l.label + (total ? ', ' + total.toLocaleString() + ' to do' : ''));
   touch();
 }
 export function report(id, done, total, detail) {

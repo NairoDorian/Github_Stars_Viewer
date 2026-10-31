@@ -371,7 +371,7 @@ async function releaseStage(run, jobs) {
       set(t.job.k, {rel: t.nodes.slice(0, MAX_RELEASES).map(n => toRelease(n, run.o)), relN: t.job.c.relN, relTop: t.job.c.relTop, relAt: Date.now(), ro: flags});
       t.job.relDone = true;
       done++;
-      debug('history', `releases ${t.job.r.full}: ${Math.min(t.nodes.length, MAX_RELEASES)} release(s) stored (drafts skipped; notes ${run.o.mentions ? 'without @mentions' : 'with @mentions'}, ${run.o.links ? 'without links' : 'with links'}, ≤ ${run.o.notes || 'no limit'} characters)`);
+      debug('history', `releases ${t.job.r.full}: ${Math.min(t.nodes.length, MAX_RELEASES)} release(s) stored (drafts skipped; notes ${run.o.mentions ? 'without @mentions' : 'with @mentions'}, ${run.o.links ? 'without links' : 'with links'}, ≤ ${run.o.notes || 'no limit'} characters) · https://github.com/${t.job.r.full}/releases`);
     });
     status(`Fetching release notes… ${done}/${total} repos`);
     report('releases', done, total, `${done.toLocaleString()} of ${total.toLocaleString()} repos`);
@@ -443,7 +443,7 @@ async function commitStage(run, jobs) {
     }
     if (w.done) {
       w.pages.clear(); syncRecord(w); finishWalk(w);
-      info('history', `commits ${w.job.r.full}: complete, ${w.count.toLocaleString()} commit messages stored${w.capped ? ' (stopped at the limit; more exist)' : ''}`);
+      info('history', `commits ${w.job.r.full}: complete, ${w.count.toLocaleString()} commit messages stored${w.capped ? ' (stopped at the limit; more exist)' : ''} · https://github.com/${w.job.r.full}/commits`);
     }
   };
 

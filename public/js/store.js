@@ -177,17 +177,19 @@ async function readStored(key) {
       if (!quiet(key)) debug('store', `read ${key} from memory: ${found(key, v)}`);
       return v;
     }
-    let v;
+    let v, via = '';
     if (mode === 'browser') {
       v = (await idb('readonly', s => s.get(key))) ?? null;
       if (v !== null) mem.set(key, v);
     } else {
+      const t0 = Date.now();
       const r = await fetch('/cache/' + encodeURIComponent(key), {cache: 'no-store'});
       if (!r.ok) throw new Error('server returned ' + r.status);   // a missing key is a 200 "null", so this is a real failure
       v = await r.json();
+      via = `  (GET /cache/${key} → ${r.status} in ${Date.now() - t0} ms${r.headers?.get?.('content-length') ? ', ' + bytes(Number(r.headers.get('content-length'))) : ''})`.replace('  (', ' (');
     }
     unreadable.delete(key);
-    if (!quiet(key)) debug('store', `read ${key} from ${where()}: ${found(key, v)}`);
+    if (!quiet(key)) debug('store', `read ${key} from ${where()}: ${found(key, v)}${via}`);
     return v;
   } catch (e) {
     console.warn('cache read failed', key, e);
@@ -227,7 +229,7 @@ export async function put(key, value) {
       const body = JSON.stringify(value), t0 = Date.now();
       const r = await fetch('/cache/' + encodeURIComponent(key), {method: 'PUT', headers: {'Content-Type': 'application/json'}, body});
       if (!r.ok) throw new Error('server returned ' + r.status);
-      if (!quiet(key)) debug('store', `wrote ${key} to the data/ folder: ${bytes(body.length)} (the server compresses big files) in ${Date.now() - t0} ms`);
+      if (!quiet(key)) debug('store', `wrote ${key} to the data/ folder (PUT /cache/${key} → ${r.status}): ${bytes(body.length)} (the server compresses big files) in ${Date.now() - t0} ms`);
     } else if (!quiet(key)) debug('store', `${key}: kept in ${where()}${mode === 'memory' ? ' (Keep cache is off: nothing is written)' : ''}`);
     return true;
   } catch (e) {

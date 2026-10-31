@@ -199,3 +199,5 @@ details summary{cursor:pointer;color:var(--accent);margin:8px 0}
 .ln.warn{color:var(--star)}
 .ln.error{color:#d1242f;font-weight:600}
 @media (max-width:700px){#runPanel #lanes,#console{flex-basis:100%}}
+
+.ln i{opacity:.55;font-style:normal;display:inline-block;min-width:6ch;text-align:right}

@@ -167,7 +167,7 @@ async function checkMissing(g, missing) {
         else if (/blocked|disabled|taken down|dmca/i.test((await res.json().catch(() => ({}))).message || '')) out.set(r, 'gone');
       }
       const v = out.get(r);
-      info('sync', `${r.full} (id ${r.id ?? 'unknown'}): GitHub answered ${res.status} → ${v === 'gone' ? 'REMOVED, private or hidden: the local copy is kept' : v === 'unstarred' ? 'it still exists, so it was unstarred: forgotten' : 'cannot tell yet (kept, asked again next time)'}`);
+      info('sync', `${r.full} (id ${r.id ?? 'unknown'}): GitHub answered ${res.status} → ${v === 'gone' ? 'REMOVED, private or hidden: the local copy is kept' : v === 'unstarred' ? 'it still exists, so it was unstarred: forgotten' : 'cannot tell yet (kept, asked again next time)'} · open: https://github.com/${r.full}`);
     } catch (e) { debug('sync', `${r.full}: could not be checked (${e?.message || 'offline or aborted'}); kept, asked again next time`); }
   });
   return out;
@@ -188,7 +188,7 @@ async function fetchStarPages(g) {
     if (r.status === 304) {
       const items = old.ids.map(id => cachedById.get(id));
       if (items.every(Boolean)) {
-        debug('sync', `star list page ${p}: 304 not modified, ${items.length} repos rebuilt from the cache (free: costs no rate limit)`);
+        debug('sync', `star list page ${p}: 304 not modified, ${items.length} repos rebuilt from the cache (free: costs no rate limit) · same page in a browser: https://github.com/${user}?tab=stars&page=${p}`);
         return {etag: old.etag, ids: old.ids, items: items.map(x => ({...x})), last: 0, hit: true};
       }
       warn('sync', `star list page ${p}: 304, but the cache lacks some of its repos: downloading the page for real`);
@@ -196,7 +196,7 @@ async function fetchStarPages(g) {
     }
     const items = (await r.json()).map(mapStar);
     const last = Number(r.headers.get('Link')?.match(/[?&]page=(\d+)>; rel="last"/)?.[1] || 0);
-    debug('sync', `star list page ${p}: ${items.length} repos downloaded${last ? ' · GitHub says the list has ' + last + ' pages' : ''}${useEtag && old?.etag ? ' · its ETag changed' : ''}`);
+    debug('sync', `star list page ${p}: ${items.length} repos downloaded${last ? ' · GitHub says the list has ' + last + ' pages' : ''}${useEtag && old?.etag ? ' · its ETag changed' : ''} · same page in a browser: https://github.com/${user}?tab=stars&page=${p}`);
     return {etag: r.headers.get('ETag'), ids: items.map(x => x.id), items, last, hit: false};
   };
   const first = await fetchPage(1);
@@ -227,15 +227,18 @@ export async function sync(g) {
   status('Checking GitHub (all pages in parallel)…');
   info('sync', `checking ${S.user}'s stars (${lite ? 'light check, a visit' : 'full check'}) · cache: ${S.repos.length.toLocaleString()} repos, ${Object.keys(S.readmes).length.toLocaleString()} READMEs, ${Object.keys(S.history).length.toLocaleString()} repos indexed for commits & releases · token ${S.token ? 'set' : 'not set'}`);
   // The steps of this job, shown up front: what exists in the cache decides which later steps will run.
+  const phase = (n, what) => info('sync', `── phase ${n} of 7: ${what} (${secs(t0)} since the start)`);
   const indexed = S.token && Object.keys(S.history).length > 0;
   plan([['stars'], (S.token || S.repos.some(r => r.enrichedAt)) && ['details'], Object.keys(S.readmes).length > 0 && ['readmes'],
     ...(indexed ? [['check'], ['releases'], ['commits']] : [])].filter(Boolean));
+  phase(1, `downloading the star list: every page at once, each conditional on its saved ETag (https://github.com/${S.user}?tab=stars)`);
   start('stars');
   const pages = await fetchStarPages(g);
   if (g !== S.gen) return;
   finish('stars', `${pages.length} page${pages.length === 1 ? '' : 's'}`);
   // Reached only when every page succeeded: a partial list never overwrites the cache.
 
+  phase(2, 'comparing the downloaded list with your cache: new, renamed, pushed');
   const fresh = new Map();
   for (const p of pages) for (const r of p.items) fresh.set(r.id, r);   // dedupes if the list shifted while paging
   const byId = new Map(S.repos.filter(r => r.id).map(r => [r.id, r]));
@@ -261,6 +264,7 @@ export async function sync(g) {
   // Repos of the cache that the star list no longer has: unstarred (it still exists: forget it), or deleted / made private /
   // hidden by GitHub (it can't be listed any more: keep the local copy, marked). See checkMissing.
   const missing = S.repos.filter(r => !(r.id ? fresh.has(r.id) : freshFulls.has(r.full)));
+  phase(3, `checking the ${missing.length} cached repo(s) that are not in the list any more${missing.length ? '' : ' (none)'}`);
   const verdict = await checkMissing(g, missing);
   if (g !== S.gen) return;
   const kept = missing.filter(r => verdict.get(r) !== 'unstarred').map(r => verdict.get(r) === 'gone' ? {...r, gone: {at: r.gone?.at ?? Date.now(), checked: recentlyChecked(r) ? r.gone.checked : Date.now()}} : r);
@@ -285,6 +289,7 @@ export async function sync(g) {
   const staleUsers = Object.keys(S.users).filter(k => !owners.has(k));
   for (const k of staleUsers) delete S.users[k];
   if (staleUsers.length) debug('sync', `dropped the star counts of ${staleUsers.length} user(s) you no longer star anything from`);
+  phase(4, 'saving the new star list, and dropping what is confirmed gone');
   bumpIndex();
   await saveStars(g);
   if (confirmed.length) await saveReadmes(g);
@@ -301,14 +306,17 @@ export async function sync(g) {
 
   // Details only for what's missing or stale. With a token the tiles' last commit / last release are always kept
   // current; READMEs only if they were indexed before.
+  phase(5, `refreshing details: ${lite ? 'last commit and last release' : 'last commit, last release, languages, 12-month chart'}${hadReadmes ? ', README hashes' : ''}${S.token ? '' : ' (no token: skipped)'}`);
   const wantEnrich = lite ? !!S.token : hadEnrich || !!S.token;
   const res = wantEnrich || hadReadmes ? await refreshDetails(g, {wantReadmes: hadReadmes, wantEnrich, lite}) : null;
   // Commit messages and release notes: only if they were indexed before (the toolbar button does the first full run).
   let hist = null;
   if (g === S.gen && hadHistory && S.token) {
+    phase(6, 'topping up the commit message and release note index (only what is new)');
     hist = await syncHistory(g, S.repos.filter(r => !r.gone));
     if (g === S.gen) { bumpIndex(); render(); }
   }
+  if (g === S.gen) phase(7, `done: ${S.repos.length.toLocaleString()} stars on screen${hadHistory && !S.token ? '; the index needs a token to be topped up' : ''}`);
   if (g === S.gen) status(`${S.repos.length} stars · ${diff} · ${res?.summary ? res.summary + ' · ' : ''}${hist?.summary ? hist.summary + ' · ' : ''}all checked in ${secs(t0)}`);
 }
 
@@ -397,7 +405,7 @@ async function refreshDetails(g, {wantReadmes, wantEnrich, lite = false}) {
       const blob = data['r' + j]?.object;
       if (blob?.text == null || blob.isTruncated) { viaRest.push(x.r); debug('readmes', `${x.r.full}: ${x.path} ${blob?.text == null ? 'is binary or empty' : 'was cut by GraphQL'}: fetching the whole file over REST`); return; }   // binary, or GraphQL cut it: REST returns the whole file
       S.readmes[rkey(x.r)] = readmeRecord(x.r, {t: blob.text, sha: x.oid, path: x.path});
-      info('readmes', `${x.r.full}: downloaded ${x.path}, ${blob.text.length.toLocaleString()} characters (never trimmed)`);
+      info('readmes', `${x.r.full}: downloaded ${x.path}, ${blob.text.length.toLocaleString()} characters (never trimmed) · https://github.com/${x.r.full}/blob/HEAD/${x.path}`);
       got++;
     });
     if (g === S.gen) {
@@ -438,7 +446,7 @@ async function restReadmes(g, todo, quiet = false, base = 0) {
         const text = await res.text();
         if (g !== S.gen) return;
         S.readmes[k] = readmeRecord(r, {t: text, etag: res.headers.get('ETag')}); got++;
-        info('readmes', `${r.full}: downloaded over REST, ${text.length.toLocaleString()} characters`);
+        info('readmes', `${r.full}: downloaded over REST, ${text.length.toLocaleString()} characters · https://github.com/${r.full}#readme`);
       }
     } catch (e) { if (isFatalError(e)) fatal = e; else failed++; }   // transient: retried next time
     if (g === S.gen) {

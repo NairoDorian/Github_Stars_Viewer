@@ -143,6 +143,10 @@ try {
   const logText = async () => page.locator('#conBody').innerText();
   const firstLog = await logText();
   for (const re of [/Stars Viewer started/, /storage: the local server is running · Keep cache is ON → files in the data\/ folder/, /▶ sync for e2etest/,
+    /── phase 1 of 7: downloading the star list/, /── phase 7 of 7: done: 3 stars on screen/, /address bar → http:\/\/localhost:\d+\/\?user=e2etest/,
+    /#\d+ → GET https:\/\/api\.github\.com\/users\/e2etest\/starred\?per_page=100&page=1 · with the date of each star · token attached \(never logged\)/,
+    /#\d+ ← GET \/users\/e2etest\/starred\?per_page=100&page=1 → 200 in \d+ ms/, /▶ step 1 of 2: Pull the star list/,
+    /POST https:\/\/api\.github\.com\/graphql \(details of 3 repos, full\) · [\d,]+ bytes · asks 3 repositories \[acme\/alpha, acme\/beta, acme\/gamma\] for: last commit, the 5 newest releases, languages, 12-month commit activity/,
     /star list page 1: 3 repos downloaded/, /compared with the cache: 3 repos on GitHub · 3 new/, /new stars: acme\/alpha/, /POST \/graphql \(details of 3 repos, full\) → 200/, /✓ Update repo details/])
     assert.match(firstLog, re, 'the log tells: ' + re);
   assert.ok(!firstLog.includes('ghp_fake') && !firstLog.includes('Bearer'), 'the token is never in the log');
@@ -186,6 +190,8 @@ try {
   assert.deepEqual(puts.filter(k => k !== 'config'), [], 'a visit wrote nothing but the config: ' + puts);
   assert.equal(JSON.parse(store.config).user, 'e2etest', 'the config still names your profile');
   if (process.env.E2E_VISIT) await page.screenshot({path: process.env.E2E_VISIT});   // optional: what a visit looks like
+  assert.match(await logText(), /🔗 followed inside the app \(the page is not reloaded\): http:\/\/localhost:\d+\/\?visit=acme · “👁 Visit” · in the Users panel/, 'the link you followed is in the log');
+  assert.match(await logText(), /address bar → http:\/\/localhost:\d+\/\?user=e2etest&visit=acme \(a new browser-history entry/);
   step('Visit: banner, cache box locked, tab title, ?visit= URL, and nothing written', await status());
   // acme is not the saved profile (e2etest): the stored copy of the profile is untouched, and Back returns to it
   await page.click('[data-visit-act="back"]');
@@ -218,6 +224,7 @@ try {
   await until(() => (document.querySelector('.lane[data-lane="commits"] progress')?.value ?? 0) > 0, null, 5000);   // the commit bar has moved
   if (process.env.E2E_LANES) await page.screenshot({path: process.env.E2E_LANES});   // optional: what the panel looks like mid-run
   assert.match(await logText(), /check: asking about 3 repos[\s\S]*plan: 3 repos checked[\s\S]*commits: 3 repo\(s\) to walk/, 'the index run explains itself in the log');
+  assert.match(await logText(), /🖱 clicked “Index commits & releases” \(#indexHistory\) · in the toolbar/, 'your click is in the log');
   assert.match(await page.locator('.lane[data-lane="commits"] .lane-text').innerText(), /\d+% · .*repos · .*commits \(\+[\d,]+ new\) · .*\/s · elapsed/, 'with its numbers');
   await page.click('#cancelTask');
   await waitStatus(/stopped, progress saved/, 40000);
