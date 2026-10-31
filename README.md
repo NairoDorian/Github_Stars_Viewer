@@ -139,13 +139,15 @@ scripts/
   test-progress.mjs the progress panel
   test-sync.mjs      the star list: conditional pages, unstarred / renamed repos, failed pages, the light check of a visit
   test-log.mjs       the activity log: format, ring buffer, escaping, request lines, no token
+  test-stamp.mjs     the deploy's version stamp on every file URL (no mix of old and new files in a browser's cache)
   test-users.mjs     the Users list: owners, sorting, filtering, GraphQL / REST star counts
   test-visit.mjs     Visit mode: nothing but the config is ever written, leaving forgets everything
   e2e.mjs          optional browser test (Playwright) against fakes
 server.js          local server: serves public/ and stores the cache in data/
 start.bat          Windows launcher
 data/              local cache (git-ignored: contains your token)
-.github/workflows/pages.yml   deploys public/ to GitHub Pages on every push to main
+.github/workflows/pages.yml   tests, then deploys public/ to GitHub Pages on every push to main (scripts/stamp.cjs puts the commit on every file URL first,
+                               so a browser's 10-minute cache can never mix files of two deploys)
 ```
 
 ## License

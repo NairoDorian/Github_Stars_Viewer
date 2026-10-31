@@ -37,8 +37,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+      - name: Stamp this deploy's version on every file URL   # a browser's 10-minute cache then can't mix files of two deploys
+        run: |
+          cp -r public dist
+          node scripts/stamp.cjs dist "${GITHUB_SHA::7}"
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: public
+          path: dist
       - id: deployment
         uses: actions/deploy-pages@v4

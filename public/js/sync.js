@@ -197,7 +197,8 @@ async function fetchStarPages(g) {
     const items = (await r.json()).map(mapStar);
     const last = Number(r.headers.get('Link')?.match(/[?&]page=(\d+)>; rel="last"/)?.[1] || 0);
     debug('sync', `star list page ${p}: ${items.length} repos downloaded${last ? ' · GitHub says the list has ' + last + ' pages' : ''}${useEtag && old?.etag ? ' · its ETag changed' : ''} · same page in a browser: https://github.com/${user}?tab=stars&page=${p}`);
-    return {etag: r.headers.get('ETag'), ids: items.map(x => x.id), items, last, hit: false};
+    const left = r.headers.get('x-ratelimit-remaining'), reset = r.headers.get('x-ratelimit-reset');
+    return {etag: r.headers.get('ETag'), ids: items.map(x => x.id), items, last, hit: false, left: left == null ? null : Number(left), reset: reset ? Number(reset) : 0};
   };
   const first = await fetchPage(1);
   if (g !== S.gen) return [];
@@ -206,7 +207,24 @@ async function fetchStarPages(g) {
   let got = 1;
   const shown = total => report('stars', got, total, `page ${got} of ${total}`);
   shown(lastPage);
-  await pool(Array.from({length: lastPage - 1}, (_, i) => i + 2), 10, async p => { pages[p - 1] = await fetchPage(p); got++; shown(lastPage); });
+  // Without a token (60 requests an hour) and without a cache to lean on, a long list can need more requests than are left:
+  // asking for all of it would burn the whole budget and show nothing. Take only as many pages as the budget allows (the newest
+  // stars come first) and put them on screen, read-only: a partial list is never saved (see showPartial).
+  const affordable = !S.token && !cachedPages.length && first.left != null && first.left < lastPage - 1 ? first.left + 1 : lastPage;
+  const rateError = total => {
+    const got = pages.filter(Boolean), n = got.reduce((a, p) => a + p.items.length, 0);
+    needToken();   // opens the token panel, like any other rate-limit error
+    return Object.assign(new Error(`Rate limited: without a token GitHub allows 60 requests an hour${first.left != null ? ` (${first.left} were left)` : ''}${first.reset ? `, resets ${new Date(first.reset * 1000).toLocaleTimeString()}` : ''}. Showing the ${n.toLocaleString()} newest of about ${(total * 100).toLocaleString()} stars: add a token to load them all`),
+      {fatal: true, partial: got});
+  };
+  if (affordable < lastPage) warn('sync', `no token and only ${first.left} request(s) left this hour, but the list has ${lastPage} pages: asking for the newest ${affordable} only, and showing them read-only (nothing is saved)`);
+  try { await pool(Array.from({length: affordable - 1}, (_, i) => i + 2), 10, async p => { pages[p - 1] = await fetchPage(p); got++; shown(lastPage); }); }
+  catch (e) {
+    // the budget ran out while the pages were coming (other tabs or sites share it)
+    if (!S.token && !cachedPages.length && /^Rate limited/.test(e.message)) throw rateError(lastPage);
+    throw e;
+  }
+  if (affordable < lastPage) throw rateError(lastPage);
   // The list may have grown beyond what the cache knew: continue while pages come back full.
   while (pages.at(-1).items.length === 100 && g === S.gen) { pages.push(await fetchPage(pages.length + 1)); got++; shown(Math.max(lastPage, got)); }
   // Unstarring shrinks the list, but an unchanged first page (304) carries no page count: the cache's old last pages
@@ -214,6 +232,14 @@ async function fetchStarPages(g) {
   while (pages.length > 1 && !pages.at(-1).items.length) pages.pop();
   info('sync', `star list: ${pages.length} page(s), ${pages.reduce((n, p) => n + p.items.length, 0).toLocaleString()} repos, ${pages.filter(p => p.hit).length} page(s) unchanged (304)`);
   return pages;
+}
+
+/** The pages a rate-limited first check did get, on screen and nowhere else: they are not saved, not counted as the star list
+ *  (no ETags), and only used when nothing is cached, so they can never replace or shrink a real cache. */
+function showPartial(pages) {
+  S.repos = [...new Map(pages.flatMap(p => p.items).map(r => [r.id, r])).values()];
+  info('sync', `rate limit: ${S.repos.length.toLocaleString()} repos from the ${pages.length} page(s) that arrived are shown, read-only; nothing is saved`);
+  render();
 }
 
 // A repo missing from ONE star-list check keeps its README and commit index. The pages are fetched in parallel, so a star
@@ -233,7 +259,9 @@ export async function sync(g) {
     ...(indexed ? [['check'], ['releases'], ['commits']] : [])].filter(Boolean));
   phase(1, `downloading the star list: every page at once, each conditional on its saved ETag (https://github.com/${S.user}?tab=stars)`);
   start('stars');
-  const pages = await fetchStarPages(g);
+  let pages;
+  try { pages = await fetchStarPages(g); }
+  catch (e) { if (e.partial?.length && g === S.gen && !S.repos.length) showPartial(e.partial); throw e; }
   if (g !== S.gen) return;
   finish('stars', `${pages.length} page${pages.length === 1 ? '' : 's'}`);
   // Reached only when every page succeeded: a partial list never overwrites the cache.

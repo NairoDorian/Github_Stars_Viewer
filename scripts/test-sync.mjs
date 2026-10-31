@@ -31,7 +31,7 @@ const star = (id, full = `acme/repo${id}`) => ({starred_at: '2026-01-01T00:00:00
  *  304 to a matching If-None-Match (without a Link header, like GitHub), and answers 403 "budget used up" for pages where
  *  fail(page) is true. Returns the log of requests. */
 const registry = new Map();   // every repo any list ever held: full name → id (they still exist online unless repoStatus says otherwise)
-function fakeStarList(list, {fail = () => false, repoStatus = {}} = {}) {
+function fakeStarList(list, {fail = () => false, repoStatus = {}, left = null} = {}) {
   const calls = [], repoCalls = [];
   for (const x of list) registry.set(x.repo.full_name, x.repo.id);
   globalThis.fetch = async (url, init = {}) => {
@@ -58,7 +58,8 @@ function fakeStarList(list, {fail = () => false, repoStatus = {}} = {}) {
     if (fail(page)) return {ok: false, status: 403, headers: new Headers({'x-ratelimit-remaining': '0'}), json: async () => ({})};
     if (init.headers?.['If-None-Match'] === etag) return {ok: false, status: 304, headers: new Headers({ETag: etag}), json: async () => []};
     const link = page === 1 && last > 1 ? {Link: `<https://api.github.com/users/x/starred?per_page=100&page=${last}>; rel="last"`} : {};
-    return {ok: true, status: 200, headers: new Headers({ETag: etag, ...link}), json: async () => items};
+    const budget = left == null ? {} : {'x-ratelimit-remaining': String(left), 'x-ratelimit-reset': '1900000000'};   // `left`: the hourly budget the answer reports
+    return {ok: true, status: 200, headers: new Headers({ETag: etag, ...link, ...budget}), json: async () => items};
   };
   calls.repoCalls = repoCalls;
   return calls;
@@ -338,5 +339,33 @@ test('a renamed repo is found by its id: when it is not in the list it is unstar
     assert.ok(asked.includes('/repositories/2'), 'asked by id, not by the old name: ' + asked);
     assert.ok(!asked.includes('/repos/acme/old-name'));
     assert.equal(S.repos.some(r => r.id === 2), false);
+  });
+});
+
+test('no token, no cache and too little budget for the whole list: the newest pages are shown read-only, nothing is saved, no budget is wasted', async () => {
+  await check(async g => {
+    const calls = fakeStarList(Array.from({length: 450}, (_, i) => star(i + 1)), {left: 2});   // 5 pages, but only 2 requests left after page 1
+    await assert.rejects(sync(g), /Rate limited: without a token.*Showing the 300 newest of about 500 stars/);
+    assert.deepEqual(calls.map(c => c.page).sort(), [1, 2, 3], 'only as many pages as the budget allows');
+    assert.equal(S.repos.length, 300, 'the pages that arrived are on screen');
+    assert.deepEqual(S.starPages, [], 'but they are not the star list: no ETags, nothing saved');
+  });
+});
+
+test('the budget running out while the pages arrive also shows what arrived; a cached list is never replaced by a partial one', async () => {
+  await check(async g => {
+    const list = Array.from({length: 450}, (_, i) => star(i + 1));
+    fakeStarList(list, {fail: page => page >= 3});   // no budget header on the first page: only the 403s tell
+    await assert.rejects(sync(g), /Rate limited/);
+    assert.ok(S.repos.length >= 100 && S.repos.length <= 200, 'pages 1 and 2 are shown, not the failed ones: ' + S.repos.length);
+
+    Object.assign(S, {repos: [], starPages: []});
+    fakeStarList(list);
+    await sync(g);   // a full check works as ever
+    assert.equal(S.repos.length, 450);
+    const repos = S.repos;
+    fakeStarList(list, {fail: page => page >= 3, left: 0});
+    await assert.rejects(sync(g), /Rate limited/);
+    assert.equal(S.repos, repos, 'with a cache the cached list stays exactly as it was');
   });
 });
