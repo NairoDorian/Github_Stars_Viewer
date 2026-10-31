@@ -11,6 +11,7 @@ jobs:
   test:   # syntax check + unit tests on every supported Node; a broken build is never published
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false   # a failure on one Node version must not hide the result of the others
       matrix:
         node: [20, 22, 24]
     steps:

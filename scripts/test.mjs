@@ -407,7 +407,8 @@ test('starhistory: a failed refresh is remembered, "Clear cache" drops charts st
     STAR_TUNING.timeoutMs = 20;
     globalThis.fetch = (url, init) => new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(new Error('aborted'))));
     const t0 = Date.now();
-    await loadCurve('hang/chart');
+    const alive = setInterval(() => {}, 10);   // AbortSignal.timeout's own timer does not keep Node alive: without this, some Node versions end the run with the request still pending
+    try { await loadCurve('hang/chart'); } finally { clearInterval(alive); }
     assert.ok(Date.now() - t0 < 5000);
     assert.equal(S.starCurves['hang/chart'], undefined);
 
