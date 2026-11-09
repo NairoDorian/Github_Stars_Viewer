@@ -18,6 +18,7 @@ import {debug, info, warn} from './log.js';
 import {render, searchFor, card} from './list.js';
 import {watchStarCharts} from './starhistory.js';
 import {SORT_OPTIONS, sortRepos} from './sort.js';
+import {forkVisible, copyOfStar, hiddenCount} from './forks.js';
 
 const DISC_TTL = 3 * DAY;
 // Every theme, keyword and "✨ Show suggestions" result is cached with its card details, so the cache is kept bounded.
@@ -169,7 +170,8 @@ const progress = text => {
     delete el.dataset.resultId;
   }
 };
-const visible = res => res.items.filter(c => !excluded(c.x) && (!S.hideForks || !c.x.fork));
+// Hidden forks: a suggestion with the name and description of an older star of yours is a copy of it (forks.js).
+const visible = res => res.items.filter(c => !excluded(c.x) && (!S.hideForks || !c.x.fork) && (!S.hideCopies || !copyOfStar(c.x)));
 
 /** Runs an explorer (depth 0 replaces the result, deeper runs merge into it), saves it and shows it. */
 async function explore(id, {force = false, depth = 0}, run) {
@@ -469,7 +471,7 @@ function showResults(id) {
     <p class="muted discovery-note">${(discoverySort === 'release' || discoverySort === 'commit') ?
       (!S.token ? 'Add a token for exact commit and release dates.' : sortPending.has(res) ? 'Checking exact dates…' : sortIncomplete.has(res) ? 'Some dates could not be checked; refresh to retry.' : '') : ''}
       ${low || restoreForks ? ' · ⏳ finding more…' : ''}${res.note?.length ? `<br>⚠ ${res.note.map(esc).join(' · ')}` : ''}</p>
-    ${empty}<ul class="sugg">${items.slice(0, shown).map(c => card(suggestionRepo(c.x), {suggestion: true, reasons: c.reasons})).join('')}</ul>
+    ${empty}<ul class="sugg">${items.slice(0, shown).map(c => { const o = copyOfStar(c.x); return card(suggestionRepo(c.x), {suggestion: true, reasons: o ? [`⧉ looks like a copy of ${o.full}, which you starred`, ...c.reasons] : c.reasons}); }).join('')}</ul>
     ${items.length > shown ? `<button data-more>Show more (${items.length - shown} left)</button>` : ''}`;
   watchStarCharts(el);   // star history of the suggestions loads as they scroll into view
   if (low || restoreForks) topUp(id);   // runs in the background and re-renders when done
@@ -505,7 +507,7 @@ async function fillCardDetails(id, onScreen) {
 }
 
 function overviewHTML() {
-  const repos = S.hideForks ? S.repos.filter(r => !r.fork) : S.repos;
+  const repos = S.repos.filter(r => forkVisible(r));
   const bars = (list, explore = false) => {
     const top = list.slice(0, 10), max = Math.max(1, ...top.map(([, c]) => c));
     return top.map(([k, c]) => `<div class="barline"><span title="${esc(k)}">${explore ? `<button class="pattern-link" data-pattern="${esc(k)}" title="Find related repositories">${esc(k)}</button>` : esc(k)}</span><i style="width:${Math.round(c / max * 120)}px"></i><span class="muted">${c}</span></div>`).join('');
@@ -517,7 +519,7 @@ function overviewHTML() {
     <div><h3>Trending for you (last 90 days)</h3>${bars(tally(repos, r => Date.parse(r.starred) > since ? r.topics : []), true) || '<p class="muted">No recent stars.</p>'}</div>
     <div><h3>Languages</h3>${bars(tally(repos, r => r.lang), true)}</div>
     <div><h3>Stars per year</h3>${bars(tally(repos, r => r.starred?.slice(0, 4)).sort((a, b) => b[0] - a[0]))}
-      <p class="muted">${stale} look stale (archived or no commit in 2y) · ${repos.filter(r => r.stars < 500).length} hidden gems (&lt;500★) · ${S.repos.filter(r => r.fork).length} forks</p></div></div>
+      <p class="muted">${stale} look stale (archived or no commit in 2y) · ${repos.filter(r => r.stars < 500).length} hidden gems (&lt;500★) · ${S.repos.filter(r => r.fork).length} forks · ${hiddenCount()} hidden forks</p></div></div>
     <p class="muted">Click a topic or language to find related repos. You can sort the results in Discover.</p>`;
 }
 

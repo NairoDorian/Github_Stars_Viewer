@@ -25,13 +25,16 @@ import {initLog, LOG, info, warn, debug} from './log.js';
 import {$, ago, esc, status} from './util.js';
 import {get, peek, saveConfig, initStore, setPersist, persisting, isUnreadable, clearAll, saveAll, loadHistory, forgetHistoryDirty, setVisit, adoptProfile, CACHE_VERSION} from './store.js';
 import {task, waitIdle, sync, enrich, indexReadmes, migrateReadmes} from './sync.js';
-import {indexHistory} from './history.js';
+import {indexCommits, indexReleases} from './history.js';
 import {initHistOpts, resetHistOpts, reconcileStored} from './histopts.js';
 import {render, initList, resetFilters, resetListPrefs, prepareHistorySearch} from './list.js';
 import {initDiscover, closeDiscover, resetDiscoverPrefs} from './discover.js';
 import {initUsers, closeUsers, renderUsers, resetUsersPrefs} from './users.js';
 import {initToken, setToken} from './token.js';
 import {forgetStarCharts} from './starhistory.js';
+
+/** The profile the LOCAL app opens when none is named or saved (the online version starts with an empty box). */
+const LOCAL_DEFAULT_USER = 'NairoDorian';
 
 /** "NairoDorian", "@NairoDorian" or "https://github.com/NairoDorian?tab=stars" → "NairoDorian". */
 function parseUser(v) {
@@ -157,8 +160,9 @@ async function load({login, visit, push = false, why = ''} = {}) {
     if (g === S.gen) S.loading = null;   // a newer load owns the flag now
     loaded();
   }
-  if ($('#inHistory').checked) { await prepareHistorySearch(); if (g !== S.gen) return; }   // build the search text in slices, not in the first render
-  if ($('#inReadme').checked || $('#inHistory').checked) render();
+  const searchHistory = $('#inCommits').checked || $('#inReleases').checked;
+  if (searchHistory) { await prepareHistorySearch(); if (g !== S.gen) return; }   // build the search text in slices, not in the first render
+  if ($('#inReadme').checked || searchHistory) render();
   renderUsers();
   // Show the new user's cache immediately. The old profile's network job can finish before this sync starts.
   await waitIdle();
@@ -262,7 +266,8 @@ if (location.protocol !== 'file:') {   // ES modules can't run from file://; ind
   initLog();
   LOG.devtools = true;   // the log is mirrored to the browser's DevTools console too
   info('app', `Stars Viewer started at ${location.href} · ${navigator.userAgent}`);
-  initCacheToggle(await initStore());
+  const storeInfo = await initStore();
+  initCacheToggle(storeInfo);
   initClearButton();
   initList();
   initDiscover();
@@ -274,7 +279,8 @@ if (location.protocol !== 'file:') {   // ES modules can't run from file://; ind
   info('app', `config: ${S.home ? 'your profile is ' + S.home : 'no profile saved yet'} · token ${config.token ? 'found' : 'not set'} · ${Object.keys(S.starCurves).length.toLocaleString()} star-history charts cached`);
   initToken(config.token || '');
   initHistOpts();
-  $('#user').value = asked || params.get('user') || S.home || 'NairoDorian';
+  // Only the local app (server.js running) opens a profile by itself when none is named or saved; online starts empty.
+  $('#user').value = asked || params.get('user') || S.home || (storeInfo.serverUp ? LOCAL_DEFAULT_USER : '');
 
   $('#load').onclick = () => load({push: true, why: '“Load stars” clicked'});
   $('#visit').onclick = () => load({visit: true, push: true, why: '“Visit” clicked'});
@@ -282,7 +288,8 @@ if (location.protocol !== 'file:') {   // ES modules can't run from file://; ind
   $('#refresh').onclick = () => task(sync);
   $('#enrich').onclick = () => task(enrich);
   $('#indexReadme').onclick = () => task(indexReadmes);
-  $('#indexHistory').onclick = () => task(indexHistory);
+  $('#indexCommits').onclick = () => task(indexCommits);
+  $('#indexReleases').onclick = () => task(indexReleases);
   $('#cancelTask').onclick = () => { S.stop = true; status('■ Stopping after the current batch (progress is kept)…'); };
   $('#visitBanner').onclick = e => {
     const act = e.target.closest('[data-visit-act]')?.dataset.visitAct;
@@ -298,5 +305,10 @@ if (location.protocol !== 'file:') {   // ES modules can't run from file://; ind
     if (visit && !S.home) S.home = parseUser(p.get('user') || '');
     if (want) load({login: want, visit: visit ? true : undefined, why: 'the browser’s Back / Forward button'});
   });
-  load({visit: asked ? true : undefined, why: 'page opened'});
+  if ($('#user').value) load({visit: asked ? true : undefined, why: 'page opened'});
+  else {
+    info('app', 'no profile named in the address bar and none saved: waiting for a username');
+    status('👋 Enter a GitHub username (or profile URL) and click Load stars.');
+    $('#user').focus();
+  }
 }

@@ -7,10 +7,13 @@
    Counts are cached with the profile (users:<user>) and refreshed after a week. list.js and main.js are reached through
    window events ('filter-owner', 'visit-user'), like the rest of the app. */
 import {S} from './state.js';
+import {forkVisible} from './forks.js';
 import {$, DAY, esc, ago, pool} from './util.js';
 import {ownerStats, starredCount, isFatalError} from './github.js';
 import {saveUsers} from './store.js';
 import {debug, info, warn} from './log.js';
+
+const plural = (n, word) => `${n.toLocaleString()} ${word}${n === 1 ? '' : 's'}`;
 
 const MAX_AGE = 7 * DAY, PAGE = 100, REST_BATCH = 25;
 
@@ -77,7 +80,7 @@ let job = null;   // the running count: {stop, done, total, failed, fatal}
 let note = '';
 
 const open = () => $('#usersPanel')?.classList.contains('show');
-const people = () => filterUsers(buildUsers(S.hideForks ? S.repos.filter(r => !r.fork) : S.repos), ui.text, ui.type);
+const people = () => filterUsers(buildUsers(S.repos.filter(r => forkVisible(r))), ui.text, ui.type);
 
 function rowHTML(u) {
   const org = !isPerson(u), login = encodeURIComponent(u.login), q = esc(u.login);
@@ -101,10 +104,10 @@ function rowHTML(u) {
 /** Draws the panel (when it is open): summary, controls, the table of the first `ui.shown` matches. */
 export function renderUsers() {
   if (!open()) return;
-  const all = buildUsers(S.hideForks ? S.repos.filter(r => !r.fork) : S.repos), list = sortUsers(filterUsers(all, ui.text, ui.type), ui.sort, ui.dir);
+  const all = buildUsers(S.repos.filter(r => forkVisible(r))), list = sortUsers(filterUsers(all, ui.text, ui.type), ui.sort, ui.dir);
   const persons = all.filter(isPerson), counted = persons.filter(u => u.stars != null).length;
   $('#usersSummary').textContent = S.repos.length
-    ? `${all.length.toLocaleString()} users (${(all.length - persons.length).toLocaleString()} organizations) · star counts known for ${counted.toLocaleString()} of ${persons.length.toLocaleString()} people` +
+    ? `${plural(all.length, 'user')} (${plural(all.length - persons.length, 'organization')}) · star counts known for ${counted.toLocaleString()} of ${persons.length.toLocaleString()} ${persons.length === 1 ? 'person' : 'people'}` +
       (list.length !== all.length ? ` · ${list.length.toLocaleString()} shown` : '')
     : '';
   const btn = $('#usersFetch');
@@ -169,7 +172,7 @@ async function runCount(logins) {
 
 /** What the toolbar button counts: with a token everyone (a refresh); without, the first few shown users still without a count. */
 function countTargets() {
-  const list = sortUsers(filterUsers(buildUsers(S.hideForks ? S.repos.filter(r => !r.fork) : S.repos), ui.text, ui.type), ui.sort, ui.dir);
+  const list = sortUsers(filterUsers(buildUsers(S.repos.filter(r => forkVisible(r))), ui.text, ui.type), ui.sort, ui.dir);
   const persons = list.filter(isPerson);
   return (S.token ? persons : persons.filter(u => needsStats(u)).slice(0, REST_BATCH)).map(u => u.login);
 }

@@ -1,11 +1,16 @@
 /* Commit messages and release notes: fetched for every starred repo so they can be searched ("Search in commits & releases").
 
+  Commits and releases are two parts, each pulled by its own toolbar button and searched with its own checkbox; one
+  check per 40 repos serves both. The background top-up after "Check for updates" keeps up to date exactly the parts
+  that were pulled (see indexedParts).
+
   Needs a token (GraphQL). Per repo the cache keeps, newest first:
     c   [[oid10, unix seconds, message], …]    every commit message of the default branch (up to the commit cap)
     rel [[tag, name, unix seconds, notes, prerelease 0|1], …]    every published release (up to MAX_RELEASES, the newest 5,000)
   plus head (newest commit walked from), tail (oldest commit stored), done (history walked to its end), ro (the notes
   options the releases were fetched with), and relN / relTop / relAt (release count, newest release, when fetched), which
-  tell whether the releases need fetching again.
+  tell whether the releases need fetching again. cAt / cPushed and rAt / rPushed stamp when each part was last checked
+  complete (records from before the split have one shared at / pushed, read as the stamp of both).
 
   What is fetched, and when it is fetched again (first fetch and every later update use the same records):
    • Commits never change, so they are only ever added: a repo whose branch head moved is walked from the new head down to
@@ -29,10 +34,12 @@
    later. When GitHub says "slow down" (secondary rate limit) the run waits and continues with fewer parallel requests.
   Nothing is deleted before its replacement arrived; a failed or aborted run leaves what was stored.
 
-  Options (the ▾ panel next to the Index button): release notes can have @mentions and/or links stripped, and the notes
-  length and commits-per-repo caps can change. Stripping is applied to already stored notes without any request;
-  going the other way (keeping what was stripped, a longer cap) marks the repos so their release notes are fetched again. */
-import {S, rkey, bumpIndex} from './state.js';
+  Options (the ▾ panel next to the Index button): release notes can have @mentions and/or links stripped, and the number
+  of commits per repo can change. Release notes are always kept whole (records cut by an older version's length cap are
+  fetched again). Stripping is applied to already stored notes without any request; going the other way (keeping what
+  was stripped) marks the repos so their release notes are fetched again. */
+import {S, rkey, bumpIndex, indexedParts, commitsPulled, releasesPulled} from './state.js';
+export {indexedParts};
 import {$, DAY, status, secs, pool, chunks, sleep} from './util.js';
 import {plan, start, report, finish} from './progress.js';
 import {gqlRepos, isFatalError, needToken, parseLast} from './github.js';
@@ -40,7 +47,10 @@ import {saveHistory, saveStars, markHistory, historyDirty} from './store.js';
 import {debug, info, warn, error, names} from './log.js';
 import {render, prepareHistorySearch} from './list.js';
 
-export const DEFAULT_OPTS = {mentions: true, links: false, notes: 6_000, commits: 10_000};
+// Release notes are always stored whole (notes: 0 = no length cap); only the number of commits per repo can be chosen.
+export const DEFAULT_OPTS = {mentions: true, links: false, notes: 0, commits: 1_000};
+/** The commits-per-repo choices of the ▾ panel (0 = every commit). */
+export const COMMIT_CHOICES = [100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 0];
 export const MAX_COMMITS = DEFAULT_OPTS.commits, MAX_RELEASES = 5_000, MSG_CHARS = 400;
 const HISTORY_MAX_AGE = 7 * DAY, RELEASES_MAX_AGE = 30 * DAY, SAVE_EVERY = 10_000;
 const COMMIT_PAGE = 100, RELEASE_PAGE = 25;
@@ -63,7 +73,7 @@ const clamp = (v, lo, hi, d) => {
   return Number(v) === UNLIMITED ? UNLIMITED : Math.min(hi, Math.max(lo, Math.round(Number(v))));
 };
 const sanitize = o => ({mentions: !!(o.mentions ?? DEFAULT_OPTS.mentions), links: !!(o.links ?? DEFAULT_OPTS.links),
-  notes: clamp(o.notes, 500, 10_000_000, DEFAULT_OPTS.notes), commits: clamp(o.commits, 100, 10_000_000, DEFAULT_OPTS.commits)});
+  notes: UNLIMITED, commits: clamp(o.commits, 100, 10_000_000, DEFAULT_OPTS.commits)});
 export function histOpts() {
   if (!opts) {
     let saved = {};
@@ -78,6 +88,23 @@ export function setHistOpts(patch) {
   opts = sanitize({...histOpts(), ...patch});
   try { localStorage.setItem(OPT_KEY, JSON.stringify(opts)); } catch {}
   return opts;
+}
+/**
+ * Until 1,000 became the default, the commit limit defaulted to 10,000. An index built with that old default (no choice was
+ * ever saved, and some repo stores more than 1,000 commits) keeps 10,000 as its saved choice, so upgrading never cuts
+ * commits that were already downloaded. Returns true when it did that.
+ */
+export const LEGACY_COMMITS = 10_000;
+export function keepLegacyCommitCap(history = S.history) {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(OPT_KEY) || '{}') || {}; } catch {}
+  if (saved.commits !== undefined) return false;
+  let most = 0;
+  for (const h of Object.values(history)) most = Math.max(most, h?.c?.length || 0);
+  if (most <= DEFAULT_OPTS.commits) return false;
+  setHistOpts({commits: LEGACY_COMMITS});
+  info('history', `this index was built with the old default of ${LEGACY_COMMITS.toLocaleString()} commits per repo: that limit is kept (pick another one in the ▾ panel)`);
+  return true;
 }
 /** What a release record was fetched with: "m" mentions stripped, "l" links stripped, then the notes length cap. */
 export const optFlags = o => `${o.mentions ? 'm' : ''}${o.links ? 'l' : ''}:${o.notes}`;
@@ -103,7 +130,8 @@ export const stripMentions = text => strip(text, p => p.replace(BY_MENTION, '').
 /** Removes links: markdown links keep their text, images, <autolinks> and bare URLs go. */
 export const stripLinks = text => strip(text, p => p.replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
   .replace(/<https?:\/\/[^>\s]+>/g, '').replace(/https?:\/\/[^\s)>\]"']+/g, ''));
-/** Release notes as stored: line endings normalized, stripped as the options say, cut to the notes length cap. */
+/** Release notes as stored: line endings normalized, stripped as the options say (and cut to `o.notes` characters when a
+ *  caller passes one: the app itself always keeps them whole). */
 export function cleanNotes(text, o = histOpts()) {
   let t = String(text ?? '').replace(/\r\n?/g, '\n').trim();
   if (o.links) t = stripLinks(t);
@@ -113,11 +141,25 @@ export function cleanNotes(text, o = histOpts()) {
 
 // ---------- records ----------
 const spread = r => ((r.id || 0) % 7) * DAY;
-/** Whether the background check should look at this repo: never indexed, pushed since, unfinished, or checked long ago. */
-export const needsHistory = r => {
-  const h = S.history[rkey(r)];
-  return !h || !h.done || h.pushed !== r.pushed || Date.now() - h.at > HISTORY_MAX_AGE + spread(r);
-};
+/** Both parts: what the background top-up of an index from before the split passes around. */
+export const BOTH = Object.freeze({commits: true, releases: true});
+/** What a run pulls, in words: "commits & releases", "commits" or "releases". */
+export const partsLabel = p => p.commits && p.releases ? 'commits & releases' : p.commits ? 'commits' : 'releases';
+const stale = (r, t) => Date.now() - (t || 0) > HISTORY_MAX_AGE + spread(r);
+/** The commits of this repo need a look: never walked, unfinished, pushed since, or checked over a week ago. */
+export const needsCommits = (r, h = S.history[rkey(r)]) => !h || !h.done || (h.cPushed ?? h.pushed) !== r.pushed || stale(r, h.cAt ?? h.at);
+/** The releases of this repo need a look: never fetched, marked to fetch again, pushed since, or checked over a week ago. */
+export const needsReleases = (r, h = S.history[rkey(r)]) => !h || !(h.relN >= 0) || (h.rPushed ?? h.pushed) !== r.pushed || stale(r, h.rAt ?? h.at);
+/** Whether a run over `parts` should look at this repo. */
+export const needsHistory = (r, parts = BOTH) => (parts.commits && needsCommits(r)) || (parts.releases && needsReleases(r));
+/** Marks the given parts of a repo as checked complete at `now`. */
+function stamp(k, r, parts, now = Date.now()) {
+  const h = S.history[k];
+  if (!h) return;
+  if (parts.commits) Object.assign(h, {cAt: now, cPushed: r.pushed});
+  if (parts.releases) Object.assign(h, {rAt: now, rPushed: r.pushed});
+  markHistory(k);
+}
 const blank = () => ({head: null, tail: null, c: [], rel: [], relN: -1, relTop: '', relAt: 0, done: false, capped: false, at: 0, pushed: null, ro: optFlags(histOpts())});   // ro: not '', or reconcile() would rewrite every new record once
 const set = (k, patch) => { S.history[k] = {...(S.history[k] || blank()), ...patch}; markHistory(k); };
 
@@ -132,6 +174,17 @@ export function historyTotals() {
   let commits = 0, releases = 0, repos = 0;
   for (const h of Object.values(S.history)) { commits += h.c?.length || 0; releases += h.rel?.length || 0; repos++; }
   return {commits, releases, repos};
+}
+/** Of `repos`: how many had their commits pulled (complete or partly), how many completely, how many their releases. */
+export function partCounts(repos = S.repos) {
+  let commits = 0, commitsDone = 0, releases = 0;
+  for (const r of repos) {
+    const h = S.history[rkey(r)];
+    if (!h) continue;
+    if (commitsPulled(h)) { commits++; if (h.done) commitsDone++; }
+    if (releasesPulled(h)) releases++;
+  }
+  return {commits, commitsDone, releases};
 }
 
 /**
@@ -159,7 +212,7 @@ export function reconcile(o = histOpts()) {
     if (have !== flags && rec.rel?.length) {
       const truncated = rec.rel.some(x => x[3].length >= lim(haveCap));
       if ((!o.mentions && wasM) || (!o.links && wasL) || (lim(o.notes) > lim(haveCap) && truncated)) {
-        patch.relN = -1; patch.ro = have; patch.at = 0; out.refetch++;   // fetched again, with the new options, at the next check
+        patch.relN = -1; patch.ro = have; patch.at = 0; patch.rAt = 0; out.refetch++;   // fetched again, with the new options, at the next check
       } else {
         patch.rel = rec.rel.map(x => [x[0], x[1], x[2], cleanNotes(x[3], o), x[4]]);
         patch.ro = flags; out.stripped++;
@@ -169,7 +222,7 @@ export function reconcile(o = histOpts()) {
     else if (rec.capped && rec.done && lim(o.commits) > (rec.c?.length || 0)) {
       // The cap went up: the commits are walked again from the head (a cut-off record has no exact place to continue
       // from). Its release notes stay.
-      Object.assign(patch, {head: null, tail: null, c: [], done: false, capped: false, at: 0});
+      Object.assign(patch, {head: null, tail: null, c: [], done: false, capped: false, at: 0, cAt: 0});
       out.restart++;
     }
     if (Object.keys(patch).length) { S.history[k] = {...rec, ...patch}; markHistory(k); }
@@ -215,7 +268,7 @@ export function advance(item, nodes, hasNext) {
 
 // ---------- one run: shared plumbing ----------
 /** State shared by the stages of one syncHistory run. `fatal` is set by a token / rate-limit error. */
-const newRun = g => ({g, o: {...histOpts()}, fatal: null, skipped: 0, lastSave: Date.now(), slotCap: Infinity, beforeSave: null});
+const newRun = (g, parts = BOTH) => ({g, parts, o: {...histOpts()}, fatal: null, skipped: 0, lastSave: Date.now(), slotCap: Infinity, beforeSave: null});
 const halted = run => run.fatal || S.stop || run.g !== S.gen;
 /** [owner, name] of a work item that has a .job (releases) or an .item with a .job (commits). */
 const jobRepo = t => { const r = (t.job || t.item.job).r; return [r.owner, r.name]; };
@@ -284,7 +337,7 @@ async function pump(run, queue, {parallel, batch}, handle) {
 async function checkStage(run, todo) {
   const checks = new Map();
   let checked = 0, tiles = 0;
-  start('check', todo.length);
+  start('check', todo.length, `Check ${partsLabel(run.parts)}`);
   info('history', `check: asking about ${todo.length.toLocaleString()} repos (branch head, 5 newest releases, release count): ${Math.ceil(todo.length / 40)} cheap GraphQL calls of 40, ${CHECK_PARALLEL} at a time`);
   await pool(chunks(todo, 40), CHECK_PARALLEL, async batch => {
     if (halted(run)) return;
@@ -307,7 +360,7 @@ async function checkStage(run, todo) {
     checked += batch.length;
     debug('history', `check: ${checked}/${todo.length} repos${tiles ? ', ' + tiles + ' tile(s) refreshed so far' : ''}`);
     if (run.g === S.gen) {
-      status(`Checking commits & releases ${checked}/${todo.length}…`);
+      status(`Checking ${partsLabel(run.parts)} ${checked}/${todo.length}…`);
       report('check', checked, todo.length, `${checked.toLocaleString()} of ${todo.length.toLocaleString()} repos`);
     }
   });
@@ -318,21 +371,21 @@ async function checkStage(run, todo) {
 }
 
 /** Decides per repo what is missing. Repos with nothing to do are stamped as checked right away. */
-function planStage(checks) {
+function planStage(checks, parts = BOTH) {
   const jobs = [], now = Date.now();
   for (const [r, c] of checks) {
     const k = rkey(r), rec = S.history[k];
-    const needRel = !rec || !sameReleases(rec, c) || now - (rec.relAt || rec.at || 0) > RELEASES_MAX_AGE + spread(r);
-    const job = {r, k, c, failed: false, needRel, relDone: false,
-      needNew: !!c.head && (!rec || rec.head !== c.head), needOld: !!c.head && !!rec && rec.head === c.head && !rec.done};
+    const needRel = parts.releases && (!rec || !sameReleases(rec, c) || now - (rec.relAt || rec.at || 0) > RELEASES_MAX_AGE + spread(r));
+    const job = {r, k, c, relFailed: false, comFailed: false, needRel, relDone: false,
+      needNew: parts.commits && !!c.head && (!rec || rec.head !== c.head), needOld: parts.commits && !!c.head && !!rec && rec.head === c.head && !rec.done};
     // Empty repository. Never when commits are stored: one check that comes back without a branch head (a GitHub hiccup)
     // must not wipe a repo's index.
-    if (!c.head && !rec?.done && !rec?.c?.length) set(k, {head: null, tail: null, c: [], done: true});
+    if (parts.commits && !c.head && !rec?.done && !rec?.c?.length) set(k, {head: null, tail: null, c: [], done: true});
     if (job.needRel || job.needNew || job.needOld) { jobs.push(job); continue; }
-    Object.assign(S.history[k], {at: now, pushed: r.pushed, relTop: c.relTop});   // relTop: upgrades a key from before updatedAt
-    markHistory(k);
+    if (parts.releases) S.history[k].relTop = c.relTop;   // upgrades a key from before updatedAt
+    stamp(k, r, parts, now);
   }
-  info('history', `plan: ${checks.size.toLocaleString()} repos checked · ${checks.size - jobs.length} up to date (nothing to download) · ${jobs.filter(j => j.needRel).length} need their releases fetched · ${jobs.filter(j => j.needNew).length} have new commits · ${jobs.filter(j => j.needOld).length} continue an unfinished walk`);
+  info('history', `plan: ${checks.size.toLocaleString()} repos checked for ${partsLabel(parts)} · ${checks.size - jobs.length} up to date (nothing to download)${parts.releases ? ` · ${jobs.filter(j => j.needRel).length} need their releases fetched` : ''}${parts.commits ? ` · ${jobs.filter(j => j.needNew).length} have new commits · ${jobs.filter(j => j.needOld).length} continue an unfinished walk` : ''}`);
   if (jobs.length) debug('history', `to update: ${names(jobs.map(j => j.r.full), 10)}`);
   return jobs;
 }
@@ -345,7 +398,7 @@ async function releaseStage(run, jobs) {
   const page = t => `releases(first:${RELEASE_PAGE},${t.after ? `after:${JSON.stringify(t.after)},` : ''}orderBy:{field:CREATED_AT,direction:DESC})` +
     '{pageInfo{hasNextPage endCursor} nodes{tagName name description createdAt publishedAt isPrerelease isDraft}}';
   const queue = jobs.filter(j => j.needRel).map(job => ({job, after: null, nodes: []}));
-  const total = queue.length, giveUp = t => { t.job.failed = true; };
+  const total = queue.length, giveUp = t => { t.job.relFailed = true; };
   let done = 0;
   if (total) { start('releases', total); info('history', `releases: ${total.toLocaleString()} repo(s) have a changed release list: fetching every release (25 per page, ${RELEASE_BATCH} repos per call, ${RELEASE_PARALLEL} calls at a time)`); }
   else { finish('releases', 'no release list changed'); info('history', 'releases: no release list changed, nothing to download'); }
@@ -371,7 +424,7 @@ async function releaseStage(run, jobs) {
       set(t.job.k, {rel: t.nodes.slice(0, MAX_RELEASES).map(n => toRelease(n, run.o)), relN: t.job.c.relN, relTop: t.job.c.relTop, relAt: Date.now(), ro: flags});
       t.job.relDone = true;
       done++;
-      debug('history', `releases ${t.job.r.full}: ${Math.min(t.nodes.length, MAX_RELEASES)} release(s) stored (drafts skipped; notes ${run.o.mentions ? 'without @mentions' : 'with @mentions'}, ${run.o.links ? 'without links' : 'with links'}, ≤ ${run.o.notes || 'no limit'} characters) · https://github.com/${t.job.r.full}/releases`);
+      debug('history', `releases ${t.job.r.full}: ${Math.min(t.nodes.length, MAX_RELEASES)} release(s) stored (drafts skipped; notes ${run.o.mentions ? 'without @mentions' : 'with @mentions'}, ${run.o.links ? 'without links' : 'with links'}, whole) · https://github.com/${t.job.r.full}/releases`);
     });
     status(`Fetching release notes… ${done}/${total} repos`);
     report('releases', done, total, `${done.toLocaleString()} of ${total.toLocaleString()} repos`);
@@ -425,7 +478,7 @@ async function commitStage(run, jobs) {
     info('history', `commits: ${total.toLocaleString()} repo(s) to walk · ${items.filter(w => w.kind === 'join').length} add new commits on top of the stored ones, ${items.filter(w => w.kind === 'bulk').length} walk from a start or continue an unfinished walk · 100 commits per page, ${COMMIT_BATCH} pages per call, ${COMMIT_PARALLEL} calls at a time · limit ${lim(run.o.commits) === Infinity ? 'none: every commit' : lim(run.o.commits).toLocaleString() + ' per repo'}`);
   } else { finish('commits', 'no new commits'); info('history', 'commits: no new commits anywhere, nothing to download'); }
   const finishWalk = w => { if (!w.over) { w.over = true; finished++; } };
-  const abandon = t => { const w = t.item; w.dead = true; w.job.failed = true; w.pages?.clear(); syncRecord(w); warn('history', `commits ${w.job.r.full}: abandoned for now; the ${(S.history[w.k]?.c?.length || 0).toLocaleString()} commits already stored are kept`); };
+  const abandon = t => { const w = t.item; w.dead = true; w.job.comFailed = true; w.pages?.clear(); syncRecord(w); warn('history', `commits ${w.job.r.full}: abandoned for now; the ${(S.history[w.k]?.c?.length || 0).toLocaleString()} commits already stored are kept`); };
   run.beforeSave = () => items.forEach(syncRecord);
 
   /** Moves the contiguous pages that have arrived into the walker's collected commits; finishes it when done or capped. */
@@ -512,54 +565,67 @@ async function commitStage(run, jobs) {
 
 // ---------- the run ----------
 /**
- * Brings commit messages and release notes of `repos` up to date. `force` checks every repo (the toolbar button);
- * otherwise only repos that need it (see needsHistory) are looked at. Returns {summary}.
+ * Brings the commit messages and/or release notes (`parts`; default both; the background top-up passes indexedParts()) of `repos` up to
+ * date. `force` checks every repo (the toolbar buttons); otherwise only repos that need it (see needsHistory) are looked
+ * at. Returns {summary}.
  */
-export async function syncHistory(g, repos, {force = false} = {}) {
-  if (!S.token) return {summary: 'commits & releases need a token'};
-  const run = newRun(g);
+export async function syncHistory(g, repos, {force = false, parts = BOTH} = {}) {
+  const what = partsLabel(parts);
+  if (!S.token) return {summary: `${what} need a token`};
+  if (!parts.commits && !parts.releases) return {summary: ''};
+  const run = newRun(g, parts);
   reconcile(run.o);   // options changed since the records were written? apply what can be applied locally
   repos = repos.filter(r => !r.gone);   // a repo GitHub no longer shows can't be indexed: its stored index stays
-  const todo = force ? repos : repos.filter(needsHistory);
-  info('history', `commits & releases: ${todo.length.toLocaleString()} of ${repos.length.toLocaleString()} repos to check${force ? ' (forced: the toolbar button checks every repo)' : ' (pushed since the last check, unfinished, or older than a week)'} · options: notes ${run.o.notes ? '≤ ' + run.o.notes.toLocaleString() + ' characters' : 'whole'}, commits ${run.o.commits ? '≤ ' + run.o.commits.toLocaleString() + ' per repo' : 'all'}, @mentions ${run.o.mentions ? 'stripped' : 'kept'}, links ${run.o.links ? 'stripped' : 'kept'}`);
-  if (!todo.length) { info('history', 'everything is up to date (0 requests)'); return {summary: 'commits & releases up to date (0 requests)'}; }
+  const todo = force ? repos : repos.filter(r => needsHistory(r, parts));
+  info('history', `${what}: ${todo.length.toLocaleString()} of ${repos.length.toLocaleString()} repos to check${force ? ' (forced: a toolbar button checks every repo)' : ' (pushed since the last check, unfinished, or older than a week)'} · options: release notes whole, commits ${run.o.commits ? '≤ ' + run.o.commits.toLocaleString() + ' per repo' : 'all'}, @mentions ${run.o.mentions ? 'stripped' : 'kept'}, links ${run.o.links ? 'stripped' : 'kept'}`);
+  if (!todo.length) { info('history', 'everything is up to date (0 requests)'); return {summary: `${what} up to date (0 requests)`}; }
 
   const checks = await checkStage(run, todo);
   if (g !== S.gen) return {summary: ''};
-  const jobs = planStage(checks);
-  const left = await Promise.all([releaseStage(run, jobs), commitStage(run, jobs)]);   // the two stages run at the same time
+  const jobs = planStage(checks, parts);
+  // The two stages run at the same time; a part that wasn't asked for doesn't run at all.
+  const left = await Promise.all([parts.releases ? releaseStage(run, jobs) : 0, parts.commits ? commitStage(run, jobs) : 0]);
   if (g !== S.gen) return {summary: ''};
 
-  // A repo is marked as checked only when every part of it succeeded (its commits walked to the end, its releases fetched
+  // Each part of a repo is marked as checked only when it succeeded (its commits walked to the end, its releases fetched
   // if they had to be); anything else, e.g. releases cut short by Cancel, is looked at again next time.
-  const stamp = Date.now();
+  const now = Date.now();
   let failed = 0;
   for (const j of jobs) {
-    if (j.failed) failed++;
-    else if (!run.fatal && S.history[j.k]?.done && (!j.needRel || j.relDone)) { Object.assign(S.history[j.k], {at: stamp, pushed: j.r.pushed}); markHistory(j.k); }
+    if (j.relFailed || j.comFailed) failed++;
+    if (run.fatal) continue;
+    const okC = parts.commits && !j.comFailed && !!S.history[j.k]?.done, okR = parts.releases && !j.relFailed && (!j.needRel || j.relDone);
+    if (okC || okR) stamp(j.k, j.r, {commits: okC, releases: okR}, now);
   }
   await flush(run, true);
-  const t = historyTotals(), skipped = run.skipped + failed;
-  info('history', `run ${run.fatal ? 'stopped: ' + run.fatal.message : S.stop ? 'stopped by Cancel' : 'finished'} · ${jobs.length} repo(s) updated · ${skipped} skipped or failed · the index now holds ${t.commits.toLocaleString()} commit messages and ${t.releases.toLocaleString()} releases in ${t.repos.toLocaleString()} repos`);
-  return {summary: `🔎 ${t.commits.toLocaleString()} commit messages and ${t.releases.toLocaleString()} releases indexed in ${t.repos} repos` +
+  const t = historyTotals(), pc = partCounts(repos), skipped = run.skipped + failed;
+  info('history', `run (${what}) ${run.fatal ? 'stopped: ' + run.fatal.message : S.stop ? 'stopped by Cancel' : 'finished'} · ${jobs.length} repo(s) updated · ${skipped} skipped or failed · the index now holds ${t.commits.toLocaleString()} commit messages from ${pc.commits.toLocaleString()} repos and ${t.releases.toLocaleString()} releases from ${pc.releases.toLocaleString()} repos`);
+  const held = [parts.commits && `${t.commits.toLocaleString()} commit messages`, parts.releases && `${t.releases.toLocaleString()} releases`].filter(Boolean).join(' and ');
+  return {summary: `🔎 ${held} indexed in ${(parts.commits ? pc.commits : pc.releases).toLocaleString()} repos` +
     (jobs.length ? ` (${jobs.length} updated)` : ' (all up to date)') +
     (skipped ? ` · ${skipped} skipped (GitHub omitted results or timed out; retried next check)` : '') +
     (S.stop && (left[0] || left[1]) ? ' · ■ stopped, progress saved: click again to continue' : '') +
     (run.fatal ? ` · ⚠ ${run.fatal.message} (progress saved, click again to continue)` : '')};
 }
 
-/** Toolbar button: index (or re-check) commits and releases of every starred repo, then turn on the search option. */
-export async function indexHistory(g) {
-  if (!S.token) { needToken(); return status('⚠ Commits & releases need a token (GraphQL). Add one in the 🔑 panel.'); }
-  info('history', 'Index commits & releases: every commit message and release note of every star (resumes where a cancelled run stopped)');
+/** Pulls (or re-checks) one or both parts for every starred repo, then turns on searching what was pulled. */
+async function pullParts(g, parts) {
+  const what = partsLabel(parts);
+  if (!S.token) { needToken(); return status(`⚠ Pulling ${what} needs a token (GraphQL). Add one in the 🔑 panel.`); }
+  info('history', `Pull ${what}: ${[parts.commits && 'every commit message (up to the limit in ⚙ Index options)', parts.releases && 'every release note'].filter(Boolean).join(' and ')} of every star (resumes where a cancelled run stopped)`);
   const t0 = performance.now();
-  status('Checking commits & releases…');
-  plan([['check'], ['releases'], ['commits']]);
-  const {summary} = await syncHistory(g, S.repos, {force: true});
+  status(`Checking ${what}…`);
+  plan([['check', `Check ${what}`], parts.releases && ['releases'], parts.commits && ['commits']].filter(Boolean));
+  const {summary} = await syncHistory(g, S.repos, {force: true, parts});
   if (g !== S.gen) return;
-  $('#inHistory').checked = true;
+  if (parts.commits) $('#inCommits').checked = true;
+  if (parts.releases) $('#inReleases').checked = true;
   bumpIndex();
   await prepareHistorySearch();
   render();
   status(`${summary} · ${secs(t0)}`);
 }
+/** Toolbar button "Commits": every commit message of every star, up to the limit per repo. */
+export const indexCommits = g => pullParts(g, {commits: true, releases: false});
+/** Toolbar button "Releases": every release of every star, notes kept whole. */
+export const indexReleases = g => pullParts(g, {commits: false, releases: true});

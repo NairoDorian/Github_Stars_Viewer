@@ -16,14 +16,14 @@
   Jobs run one at a time per tab (task) and per profile across tabs (a Web Lock). The Cancel button sets S.stop: a job
   finishes its current batch, saves, and ends. Nothing is deleted before its replacement arrived: a failed, cancelled
   or aborted refresh always leaves the previous data. */
-import {S, rkey, ukey, bumpIndex} from './state.js';   // S.visit: someone else's stars are on screen (see store.js), which get the lighter check below
+import {S, rkey, ukey, bumpIndex, indexedParts} from './state.js';   // S.visit: someone else's stars are on screen (see store.js), which get the lighter check below
 import {$, DAY, status, secs, pool, chunks} from './util.js';
 import {plan, start, report, finish, stopAll, settle} from './progress.js';
 import {gh, ghFetch, headers, gqlRepos, isFatalError, mapStar, gitSha, needToken, LANG_FIELDS, LAST_FIELDS, parseLast, languageShares, activityFields, parseActivity, recordStars} from './github.js';
 import {saveStars, saveReadmes, saveHistory, saveUsers, markHistory} from './store.js';
 import {debug, info, warn, error, names} from './log.js';
 import {render} from './list.js';
-import {syncHistory} from './history.js';
+import {syncHistory, partsLabel} from './history.js';
 
 const ENRICH_MAX_AGE = 7 * DAY, README_MAX_AGE = 30 * DAY;
 // READMEs are the first source of information and are never trimmed. Older versions cut them at this many characters;
@@ -254,9 +254,9 @@ export async function sync(g) {
   info('sync', `checking ${S.user}'s stars (${lite ? 'light check, a visit' : 'full check'}) · cache: ${S.repos.length.toLocaleString()} repos, ${Object.keys(S.readmes).length.toLocaleString()} READMEs, ${Object.keys(S.history).length.toLocaleString()} repos indexed for commits & releases · token ${S.token ? 'set' : 'not set'}`);
   // The steps of this job, shown up front: what exists in the cache decides which later steps will run.
   const phase = (n, what) => info('sync', `── phase ${n} of 7: ${what} (${secs(t0)} since the start)`);
-  const indexed = S.token && Object.keys(S.history).length > 0;
+  const parts = indexedParts(), indexed = !!S.token && (parts.commits || parts.releases);   // only the parts that were pulled are topped up
   plan([['stars'], (S.token || S.repos.some(r => r.enrichedAt)) && ['details'], Object.keys(S.readmes).length > 0 && ['readmes'],
-    ...(indexed ? [['check'], ['releases'], ['commits']] : [])].filter(Boolean));
+    indexed && ['check', `Check ${partsLabel(parts)}`], indexed && parts.releases && ['releases'], indexed && parts.commits && ['commits']].filter(Boolean));
   phase(1, `downloading the star list: every page at once, each conditional on its saved ETag (https://github.com/${S.user}?tab=stars)`);
   start('stars');
   let pages;
@@ -339,9 +339,9 @@ export async function sync(g) {
   const res = wantEnrich || hadReadmes ? await refreshDetails(g, {wantReadmes: hadReadmes, wantEnrich, lite}) : null;
   // Commit messages and release notes: only if they were indexed before (the toolbar button does the first full run).
   let hist = null;
-  if (g === S.gen && hadHistory && S.token) {
-    phase(6, 'topping up the commit message and release note index (only what is new)');
-    hist = await syncHistory(g, S.repos.filter(r => !r.gone));
+  if (g === S.gen && hadHistory && indexed) {
+    phase(6, `topping up the pulled ${partsLabel(parts)} (only what is new)`);
+    hist = await syncHistory(g, S.repos.filter(r => !r.gone), {parts});
     if (g === S.gen) { bumpIndex(); render(); }
   }
   if (g === S.gen) phase(7, `done: ${S.repos.length.toLocaleString()} stars on screen${hadHistory && !S.token ? '; the index needs a token to be topped up' : ''}`);
@@ -491,7 +491,7 @@ async function restReadmes(g, todo, quiet = false, base = 0) {
 
 // ---- toolbar actions ----
 export async function enrich(g) {
-  info('sync', 'Refresh latest tiles: last commit, last release, languages and the 12-month chart of every repo that needs it');
+  info('sync', 'Refresh tiles: last commit, last release, languages and the 12-month chart of every repo that needs it');
   if (!S.token) { needToken(); return status('⚠ Releases/commits need a token (GraphQL). Add one in the 🔑 panel.'); }
   const t0 = performance.now(), wantReadmes = Object.keys(S.readmes).length > 0;
   plan([['details'], wantReadmes && ['readmes']].filter(Boolean));

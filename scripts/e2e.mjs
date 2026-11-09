@@ -204,27 +204,47 @@ try {
   await page.click('#toggleUsers');   // closed again, as the rest of the test expects
 
   // ---- toolbar groups and the collapsible options panel ----
-  assert.deepEqual(await page.locator('.grp-label').allInnerTexts(), ['SEARCH IN', 'INDEX', 'VIEW', 'DATA']);
+  assert.deepEqual(await page.locator('.grp-label').allInnerTexts(), ['ALSO SEARCH IN', 'PULL FOR SEARCH', 'VIEW']);
+  for (const id of ['#indexReadme', '#indexCommits', '#indexReleases', '#inCommits', '#inReleases']) assert.ok(await page.$(id), id + ' exists');
   assert.equal(await page.isHidden('#histOpts'), true, 'options panel starts collapsed');
   assert.match(await page.textContent('#histOptsSummary'), /@mentions stripped · links kept/);
   await page.click('#histOptsToggle');
   assert.equal(await page.isVisible('#histOpts'), true);
   assert.equal(await page.getAttribute('#histOptsToggle', 'aria-expanded'), 'true');
   assert.equal(await page.isChecked('#optMentions'), true); assert.equal(await page.isChecked('#optLinks'), false);
-  step('toolbar is grouped; ▾ opens the options panel (mentions stripped, links kept by default)');
+  assert.equal(await page.inputValue('#optCommits'), '1000', '1,000 commits per repo by default');
+  const choices = await page.locator('#optCommits option').evaluateAll(os => os.map(o => o.value));
+  assert.ok(choices.length >= 8 && choices.at(-1) === '0', 'many commit limits, ALL last: ' + choices);
+  assert.equal(await page.$('#optNotes'), null, 'no release-notes length choice: always whole');
+  await page.selectOption('#optCommits', '10000');   // the fake repos hold 5,000 commits each: index all of them
+  await until(() => /Saved|Applied/.test(document.querySelector('#optNote').textContent), null, 10000);
+  step('toolbar is grouped; ⚙ opens the options panel (mentions stripped, links kept, 1,000 commits by default)');
   await page.screenshot({path: process.env.E2E_SHOT || 'e2e-toolbar.png'});
 
-  // ---- index with Cancel in the middle ----
-  await page.click('#indexHistory');
+  // ---- releases on their own: no commit is fetched ----
+  Object.assign(calls, {first: 0, after: 0, seq: 0, rel: 0});
+  await page.click('#indexReleases');
+  await waitStatus(/🔎 3 releases indexed/, 30000);
+  assert.equal(calls.first + calls.after + calls.seq, 0, 'pulling releases fetches no commit');
+  assert.ok(calls.rel > 0, 'but the releases');
+  assert.equal(await page.isChecked('#inReleases'), true, 'and searching them is turned on');
+  assert.equal(await page.isChecked('#inCommits'), false);
+  await page.waitForSelector('#cancelTask', {state: 'hidden', timeout: 10000});
+  step('🏷 Releases pulls only the releases', await status());
+
+  // ---- commits with Cancel in the middle ----
+  Object.assign(calls, {first: 0, after: 0, seq: 0, rel: 0});
+  await page.click('#indexCommits');
   await page.waitForSelector('#cancelTask', {state: 'visible', timeout: 10000});
   await page.waitForSelector('#lanes .lane[data-lane="commits"]', {timeout: 10000});   // (the lanes of the first sync may still be fading out)
   const lanesText = await page.locator('#lanes').innerText();
-  for (const label of ['Check commits & releases', 'Fetch release notes', 'Fetch commit messages']) assert.match(lanesText, new RegExp(label), 'step shown: ' + label);
+  for (const label of ['Check commits', 'Fetch commit messages']) assert.match(lanesText, new RegExp(label), 'step shown: ' + label);
+  assert.doesNotMatch(lanesText, /Fetch release notes/, 'no release step when pulling commits');
   await waitStatus(/Indexing commit messages/, 20000);
   await until(() => (document.querySelector('.lane[data-lane="commits"] progress')?.value ?? 0) > 0, null, 5000);   // the commit bar has moved
   if (process.env.E2E_LANES) await page.screenshot({path: process.env.E2E_LANES});   // optional: what the panel looks like mid-run
   assert.match(await logText(), /check: asking about 3 repos[\s\S]*plan: 3 repos checked[\s\S]*commits: 3 repo\(s\) to walk/, 'the index run explains itself in the log');
-  assert.match(await logText(), /🖱 clicked “Index commits & releases” \(#indexHistory\) · in the toolbar/, 'your click is in the log');
+  assert.match(await logText(), /🖱 clicked “📝 Commits” \(#indexCommits\) · in the toolbar/, 'your click is in the log');
   assert.match(await page.locator('.lane[data-lane="commits"] .lane-text').innerText(), /\d+% · .*repos · .*commits \(\+[\d,]+ new\) · .*\/s · elapsed/, 'with its numbers');
   await page.click('#cancelTask');
   await waitStatus(/stopped, progress saved/, 40000);
@@ -238,8 +258,9 @@ try {
 
   // ---- continue: nothing is fetched twice, the rest is fetched by cursor ----
   Object.assign(calls, {first: 0, after: 0, seq: 0, rel: 0});
-  await page.click('#indexHistory');
-  await waitStatus(new RegExp(`🔎 ${TOTAL.toLocaleString()} commit messages and 3 releases indexed`), 60000);
+  await page.click('#indexCommits');
+  await waitStatus(new RegExp(`🔎 ${TOTAL.toLocaleString()} commit messages indexed`), 60000);
+  assert.equal(calls.rel, 0, 'the releases are not fetched again');
   assert.equal(calls.seq, 0, 'resuming never restarts a repo from its head');
   assert.ok(calls.after > 0, 'the remaining pages were fetched by cursor');
   step('second click continues and completes', await status());
@@ -264,7 +285,7 @@ try {
   await page.uncheck('#optLinks');
   await until(() => /downloaded again/.test(document.querySelector('#optNote').textContent), null, 10000);
   assert.match(await search('pull/9'), /^0 of 3/, 'the stripped text can not come back until it is downloaded again');
-  await page.click('#indexHistory');   // the status still shows the previous run's "🔎 … indexed": wait for this job to end
+  await page.click('#optReleases2');   // (the panel's button = 🏷 Releases) the status still shows the previous run's "🔎 … indexed": wait for this job to end
   await page.waitForSelector('#cancelTask', {state: 'hidden', timeout: 60000});
   await waitStatus(/🔎 .*indexed/);
   assert.equal(calls.rel, 2, 'only the release notes of repos that have releases are fetched again');
@@ -275,11 +296,10 @@ try {
   // ---- "no limit" values ----
   await page.selectOption('#optCommits', '0');
   await until(() => /ALL commits/.test(document.querySelector('#optNote').textContent), null, 10000);
-  await page.selectOption('#optNotes', '0');
-  await until(() => /Applied|Saved/.test(document.querySelector('#optNote').textContent), null, 10000);
-  assert.match(await page.textContent('#histOptsSummary'), /@mentions stripped/);
+  assert.equal(await page.$('#optNotes'), null, 'release notes are always whole: no length choice');
+  assert.match(await page.textContent('#histOptsSummary'), /ALL commits per repo · @mentions stripped/);
   assert.match(await search('zebra crash'), /^1 of 3/, 'changing a cap never loses what is stored');
-  step('dropdowns offer ALL commits and entire release notes');
+  step('the commits dropdown offers ALL commits; release notes are always whole');
 
   // ---- reload: state comes back from the shards, panel state is remembered ----
   await page.fill('#q', '');
@@ -288,11 +308,16 @@ try {
   // everything was read.
   await waitStatus(/all checked/);
   assert.equal(await page.isVisible('#histOpts'), true, 'panel stays open');
-  assert.deepEqual([await page.inputValue('#optCommits'), await page.inputValue('#optNotes')], ['0', '0'], 'the "no limit" choices are remembered');
-  await page.check('#inHistory');
+  assert.equal(await page.inputValue('#optCommits'), '0', 'the "no limit" choice is remembered');
+  await page.check('#inCommits'); await page.check('#inReleases');
   assert.match(await search('zebra crash'), /^1 of 3/);
-  assert.match(await page.textContent('#cntHistory'), /3/);
-  step('after a reload everything comes back from the cache', (await page.textContent('#cntHistory')).trim());
+  await page.uncheck('#inCommits');
+  assert.match(await search('zebra crash'), /^0 of 3/, 'commits not searched when unticked');
+  assert.match(await search('quokka'), /^2 of 3/, 'releases still are');
+  await page.check('#inCommits');
+  assert.match(await page.textContent('#cntCommits'), /3/);
+  assert.match(await page.textContent('#cntReleases'), /3/);
+  step('after a reload everything comes back from the cache; commits and releases are searched separately', (await page.textContent('#cntCommits')).trim());
 
   // ---- "Keep cache": on (cookie) → clear everything → off → default off ----
   assert.equal(await page.isChecked('#browserCache'), true, 'the cookie said on');

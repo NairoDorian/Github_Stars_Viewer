@@ -151,7 +151,37 @@ test('syncHistory indexes every commit and release, updates incrementally, and r
     assert.deepEqual(gh.calls, {check: 1, releases: 1, first: 0, after: 0, seq: 2});
     assert.deepEqual(S.history['500'].c.map(e => e[0]), oids(repos['o/big'].commits));
     assert.equal(S.history['500'].rel.length, 3);
-    assert.equal(S.history['500'].pushed, 'p2');
+    assert.deepEqual([S.history['500'].cPushed, S.history['500'].rPushed], ['p2', 'p2'], 'both parts stamped as checked');
+  });
+});
+
+test('commits and releases are pulled separately: each button fetches only its part, and the top-up keeps only what was pulled', async () => {
+  const {indexedParts, needsCommits, needsReleases} = await import('../public/js/history.js');
+  const repos = {'o/a': {commits: makeCommits(0, 150), releases: [release('v1', 'notes one', '10')]}};
+  await withGitHub(repos, {}, async (gh, g) => {
+    // releases only: no commit page is asked for, and the record holds no commits
+    await syncHistory(g, S.repos, {force: true, parts: {commits: false, releases: true}});
+    assert.deepEqual([gh.calls.releases, gh.calls.first + gh.calls.after + gh.calls.seq], [1, 0]);
+    assert.deepEqual([S.history['500'].rel.length, S.history['500'].c.length], [1, 0]);
+    assert.deepEqual(indexedParts(), {commits: false, releases: true});
+    assert.deepEqual([needsReleases(S.repos[0]), needsCommits(S.repos[0])], [false, true], 'releases stamped as checked, commits never pulled');
+    // the background top-up (parts = what was pulled) never starts the commits on its own
+    zero(gh.calls);
+    await syncHistory(g, S.repos, {parts: indexedParts()});
+    assert.deepEqual(gh.calls, {check: 0, releases: 0, first: 0, after: 0, seq: 0}, 'up to date: no request at all');
+    // commits only: the releases are not fetched again
+    zero(gh.calls);
+    await syncHistory(g, S.repos, {force: true, parts: {commits: true, releases: false}});
+    assert.equal(gh.calls.releases, 0);
+    assert.equal(S.history['500'].c.length, 150);
+    assert.deepEqual(indexedParts(), {commits: true, releases: true});
+    // search can look at one part or both
+    assert.equal(historyHit(S.repos[0], 'notes one', 'c'), null);
+    assert.equal(historyHit(S.repos[0], 'notes one', 'r').kind, 'Release');
+    assert.equal(historyHit(S.repos[0], 'commit number 3', 'r'), null);
+    assert.equal(historyHit(S.repos[0], 'commit number 3', 'c').kind, 'Commit');
+    assert.equal(historyHit(S.repos[0], 'commit number 3', 'rc').kind, 'Commit');
+    assert.equal(historyIndex(S.repos[0], ''), null, 'no part chosen: nothing searched');
   });
 });
 
@@ -178,6 +208,7 @@ test('an interrupted first index keeps its progress; the next run continues belo
 test('pages of one repo are fetched in parallel, and the result is exactly the history', async () => {
   const repos = {'o/long': {commits: makeCommits(0, 2050), releases: []}};
   await withGitHub(repos, {}, async (gh, g) => {
+    setHistOpts({commits: 10_000});   // more than the 1,000 default, so the whole history is walked
     gh.state.delay = 15;
     await syncHistory(g, S.repos, {force: true});
     assert.deepEqual(S.history['500'].c.map(e => e[0]), oids(repos['o/long'].commits));
@@ -190,6 +221,7 @@ test('if GitHub\'s cursors can not be trusted, the repo is fetched one page at a
   const repos = {'o/long': {commits: makeCommits(0, 1050), releases: []}};
   for (const cursors of ['opaque', 'lying']) {
     await withGitHub(repos, {cursors}, async (gh, g) => {
+      setHistOpts({commits: 10_000});   // more than the 1,000 default, so the whole history is walked
       await syncHistory(g, S.repos, {force: true});
       assert.deepEqual(S.history['500'].c.map(e => e[0]), oids(repos['o/long'].commits), cursors);
       assert.equal(S.history['500'].done, true);
@@ -449,7 +481,35 @@ test('options: defaults keep links, notes are cleaned and capped, changes reconc
   assert.deepEqual([t.rel[0][3], t.relN, t.relTop, t.relAt], ['kept notes', 1, 'v1|a|b', 5], 'the release notes stay, and are not fetched again');
   // persisted in localStorage
   setHistOpts({links: true, notes: 3000});
-  assert.deepEqual([histOpts().links, histOpts().notes, histOpts().mentions], [true, 3000, true]);
+  assert.deepEqual([histOpts().links, histOpts().notes, histOpts().mentions], [true, 0, true], 'release notes can not be cut: always whole');
+  setHistOpts(DEFAULT_OPTS);
+  S.history = {};
+});
+
+test('options: release notes are always whole, 1,000 commits by default, and an old index keeps its 10,000', async () => {
+  const {COMMIT_CHOICES, keepLegacyCommitCap, LEGACY_COMMITS} = await import('../public/js/history.js');
+  assert.deepEqual([DEFAULT_OPTS.notes, DEFAULT_OPTS.commits], [0, 1000]);
+  assert.ok(COMMIT_CHOICES.includes(1000) && COMMIT_CHOICES.at(-1) === 0, 'the list offers 1,000 and ends with ALL');
+  // notes cut by an older version's length cap are downloaded again (whole); uncut ones only get their flag updated
+  S.history = {cut: {c: [], rel: [['v1', '', 1, 'x'.repeat(6000), 0]], done: true, ro: 'm:6000'}, ok: {c: [], rel: [['v1', '', 1, 'short', 0]], done: true, ro: 'm:6000'}};
+  const r = reconcile(DEFAULT_OPTS);
+  assert.deepEqual([r.refetch, S.history.cut.relN, S.history.ok.ro], [1, -1, 'm:0']);
+
+  // an index built with the old default (10,000, never saved) keeps it instead of being cut to 1,000...
+  storage.delete('starsViewer.histOpts');
+  setHistOpts(DEFAULT_OPTS); storage.delete('starsViewer.histOpts');
+  S.history = {big: {c: Array.from({length: 4000}, (_, i) => ['o' + i, i, 'm']), rel: [], done: true, ro: 'm:0'}};
+  assert.equal(keepLegacyCommitCap(), true);
+  assert.equal(histOpts().commits, LEGACY_COMMITS);
+  assert.equal(reconcile().trimmed, 0, 'nothing stored is cut');
+  assert.equal(S.history.big.c.length, 4000);
+  // ...but a choice the user saved is never overridden, and a small index just takes the new default
+  setHistOpts({commits: 500});
+  assert.equal(keepLegacyCommitCap(), false);
+  storage.delete('starsViewer.histOpts'); setHistOpts(DEFAULT_OPTS); storage.delete('starsViewer.histOpts');
+  S.history = {small: {c: [['o', 1, 'm']], rel: [], done: true}};
+  assert.equal(keepLegacyCommitCap(), false);
+  assert.equal(histOpts().commits, 1000);
   setHistOpts(DEFAULT_OPTS);
   S.history = {};
 });

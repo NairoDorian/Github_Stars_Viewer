@@ -3,15 +3,16 @@
    Search: every positive term must match the card fields (name, owner, about, topics, languages) or, when ticked, the
    READMEs or the commit messages / release notes; each term may match somewhere different. "exact phrase", -exclude and
    qualifiers (lang: owner: topic: is: stars:) are supported. Matches outside the card fields are explained by snippets. */
-import {S, isMine, rkey, readmeEntry, readmeText, readmeLower, historyIndex, historyHit, warmHistoryIndex} from './state.js';
+import {S, isMine, rkey, readmeEntry, readmeText, readmeLower, historyIndex, historyHit, warmHistoryIndex, partsKey, indexedParts, commitsPulled, releasesPulled} from './state.js';
 import {$, esc, escRe, fmtN, fmtDate, ago, when, safeUrl, tally, status} from './util.js';
 import {activityNow, starGains, ACTIVITY_SPAN, ACTIVITY_BUCKETS, setStar, whoAmI, needToken} from './github.js';
 import {drawableCurve, starsAt, watchStarCharts} from './starhistory.js';
 import {sortRepos, SORT_OPTIONS} from './sort.js';
 import {debug, info, warn} from './log.js';
+import {hiddenFork, copiesOf, forkKind, forkVisible, setForkMode, scheduleForkScan, notACopy, resetForks, FORK_MODES} from './forks.js';
 
 const PAGE = 200;   // cards rendered per step; more load automatically when you reach the end (or via Show more)
-const filters = {lang: null, topic: null, owner: null, gone: false};   // gone: only the repos GitHub no longer shows (removed, private or hidden)
+const filters = {lang: null, topic: null, owner: null, gone: false, family: null};   // gone: only the repos GitHub no longer shows (removed, private or hidden) · family: rkey of an original, shown with its hidden forks
 let limit = PAGE;
 
 // Lower-cased searchable text per repo object: name, about, topics and languages. Repo objects are replaced on every
@@ -61,7 +62,9 @@ function checkQual(r, {k, v}) {
   if (k === 'owner' || k === 'user') return (r.owner || '').toLowerCase() === v;
   if (k === 'topic' || k === 'tag') return (r.topics || []).some(t => t.toLowerCase() === v);
   // is:new / is:mine: did YOU star it (while visiting someone: unknown, hence ignored, until your stars are known). is:removed: deleted, private or hidden on GitHub.
+  // is:fork: GitHub's forks · is:hiddenfork / is:copy: copies GitHub doesn't mark (forks.js) · is:anyfork: either · is:original: has hidden forks in your stars.
   if (k === 'is') return v === 'archived' ? !!r.archived : v === 'active' ? !r.archived : v === 'fork' ? !!r.fork : v === 'removed' ? !!r.gone
+    : v === 'hiddenfork' || v === 'hidden-fork' || v === 'copy' ? forkKind(r) === 'hidden' : v === 'anyfork' ? !!forkKind(r) : v === 'original' ? copiesOf(r).length > 0
     : v === 'mine' ? isMine(r) : v === 'new' ? (isMine(r) === null ? null : !isMine(r)) : null;
   if (k === 'stars') {   // GitHub's forms: stars:>1000, stars:>=1k, stars:10..500, stars:100..*, stars:*..50
     const s = r.stars ?? 0, range = v.split('..');
@@ -77,7 +80,7 @@ function checkQual(r, {k, v}) {
 }
 
 const MAX_SNIPS = 4;
-const inHistoryText = (r, t) => historyIndex(r)?.low.includes(t) ?? false;
+const inHistoryText = (r, t, which) => historyIndex(r, which)?.low.includes(t) ?? false;
 const date = unix => unix ? fmtDate(unix * 1000, {dateStyle: 'medium'}) : '';
 const around = (text, term) => {
   const j = Math.max(0, text.toLowerCase().indexOf(term)), a = Math.max(0, j - 80);
@@ -85,12 +88,13 @@ const around = (text, term) => {
 };
 
 /** Every positive term must match name/owner/about/topics/language (or the README / commit messages / release notes
- *  when those are enabled), with no excluded term matching anywhere that is enabled. Each term may match in a
+ *  when those are enabled: `inHistory` is 'rc', 'c', 'r' or '' (see partsKey), true meaning both), with no excluded
+ *  term matching anywhere that is enabled. Each term may match in a
  *  different place. Returns {snips} or null; snips explain the terms that matched only inside a README, a commit
  *  message or a release note (one line per source, newest commit / release first, at most MAX_SNIPS). */
 export function match(r, q, inReadme, inHistory = false) {
   for (const qual of q.quals) { const ok = checkQual(r, qual); if (ok !== null && ok === qual.neg) return null; }
-  for (const t of q.exc) if (hay(r).includes(t) || (inReadme && readmeLower(r).includes(t)) || (inHistory && inHistoryText(r, t))) return null;
+  for (const t of q.exc) if (hay(r).includes(t) || (inReadme && readmeLower(r).includes(t)) || (inHistory && inHistoryText(r, t, inHistory))) return null;
   const snips = [];
   for (const t of q.inc) {
     if (hay(r).includes(t)) continue;
@@ -99,7 +103,7 @@ export function match(r, q, inReadme, inHistory = false) {
       if (!snips.some(x => x.kind === 'README')) snips.push({kind: 'README', text: readmeText(r).slice(Math.max(0, i - 80), i + 120).replace(/\s+/g, ' ')});
       continue;
     }
-    const h = inHistory ? historyHit(r, t) : null;
+    const h = inHistory ? historyHit(r, t, inHistory) : null;
     if (!h) return null;
     if (!snips.some(x => x.kind === h.kind && x.id === h.id)) snips.push({kind: h.kind, id: h.id, when: date(h.t), text: around(h.text, t)});   // one line per commit / release
   }
@@ -230,7 +234,7 @@ function viewerLinks(r) {
  *  a push: a push can be a tag or another branch, months after the last commit. */
 export function lastCommitTile(r) {
   if (r.commitAt) return `<span class="lastcommit" title="Last commit on the default branch: ${esc(when(r.commitAt))}">🕒 last commit ${ago(r.commitAt)}</span>`;
-  if (r.pushed) return `<span class="lastcommit muted" title="Last push: ${esc(when(r.pushed))}. The exact last commit date is fetched with a token (Refresh latest tiles).">🕒 last push ${ago(r.pushed)}</span>`;
+  if (r.pushed) return `<span class="lastcommit muted" title="Last push: ${esc(when(r.pushed))}. The exact last commit date is fetched with a token (🕒 Refresh tiles).">🕒 last push ${ago(r.pushed)}</span>`;
   return '';
 }
 
@@ -243,7 +247,7 @@ export function lastReleaseTile(r, suggestion = false) {
     return `<span class="lastrelease" title="${esc(`Newest release by date: ${r.release}, published ${when(r.releaseAt)}.${latest}`)}">🏷 last release ${esc(r.release)}${pre} · ${ago(r.releaseAt)}</span>`;
   }
   if (r.release === null) return '<span class="lastrelease muted" title="This repository has no published releases">🏷 no releases</span>';
-  return suggestion ? '' : '<span class="lastrelease muted" title="Not fetched yet: click Refresh latest tiles (needs a token)">🏷 last release —</span>';
+  return suggestion ? '' : '<span class="lastrelease muted" title="Not fetched yet: click 🕒 Refresh tiles (needs a token)">🏷 last release —</span>';
 }
 
 /** One search-hit line: README text, or a commit / release note linking to it on GitHub. */
@@ -261,8 +265,8 @@ function historyBadge(r) {
   const h = S.history[rkey(r)], nc = h?.c?.length || 0, nr = h?.rel?.length || 0;   // a record may lack either list
   if (!nc && !nr) return '';
   const part = [nc ? `${nc.toLocaleString()}${h.done ? '' : '+'} commits` : '', nr ? `${nr} release${nr === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ');
-  const note = h.capped ? ` (only the newest ${nc.toLocaleString()} commits)` : h.done ? '' : ' (still being indexed)';
-  return `<span title="Commit messages and release notes searchable with “Search in commits &amp; releases”${note}">🔎 ${part}</span>`;
+  const note = !nc ? '' : h.capped ? ` (only the newest ${nc.toLocaleString()} commits)` : h.done ? '' : ' (commits still being pulled)';
+  return `<span title="Searchable with “Search in: Commits / Releases”${note}">🔎 ${part}</span>`;
 }
 
 /** At most 8 topics; when there are more, the ones matching the active topic filter or the search come first. */
@@ -305,6 +309,16 @@ async function starVisited(full, btn) {
   }
 }
 
+/** "⧉ hidden fork of a/b" (with its evidence and a "not a copy" button) on a copy; "⧉ 2 hidden forks" on an original.
+ *  Both open the family: the original and its copies. */
+function forkTags(r) {
+  const h = hiddenFork(r), cs = copiesOf(r);
+  const via = h && h.root !== h.of ? ` ${h.of.full} is itself a copy of ${h.root.full}.` : '';
+  if (h) return ` <span class="chip hfork-tag" tabindex="0" role="button" data-family="${esc(rkey(h.root))}" title="${esc(`Probably copied from ${h.of.full} without GitHub marking it as a fork: ${h.why.join(', ')}.${via} Click to see the whole family.`)}">⧉ hidden fork of ${esc(h.of.full)}</span>` +
+    `<button class="linkish notcopy" data-notcopy="${esc(rkey(r))}" title="${esc(`Not a copy of ${h.of.full}: don't report this pair again`)}">not a copy?</button>`;
+  return cs.length ? ` <span class="chip hfork-tag" tabindex="0" role="button" data-family="${esc(rkey(r))}" title="${esc(`Copied without GitHub marking them as forks: ${cs.map(c => c.full).join(', ')}. Click to see them.`)}">⧉ ${cs.length} hidden fork${cs.length === 1 ? '' : 's'}</span>` : '';
+}
+
 /** Shared card layout. Discovery passes a normalized repo plus reasons and actions. */
 export function card(r, {snips = [], re = null, suggestion = false, reasons = []} = {}) {
   const avatar = r.avatar ? `${r.avatar}${r.avatar.includes('?') ? '&' : '?'}s=36` : '';
@@ -313,7 +327,7 @@ export function card(r, {snips = [], re = null, suggestion = false, reasons = []
   const tag = suggestion ? 'li' : 'div';
   const shownTopics = pickTopics(r.topics || [], re);
   return `<${tag} class="card${suggestion ? ' suggestion-card' : ''}${r.gone ? ' gone' : ''}">
-    <div class="owner">${avatar ? `<img src="${esc(avatar)}" loading="lazy" alt="">` : ''}<span class="chip" tabindex="0" role="button" data-owner="${esc(r.owner)}">${hl(r.owner, re)}</span>${r.archived ? ' · archived' : ''}${r.fork ? ' · fork' : ''}${r.gone ? ' <span class="chip gone-tag" tabindex="0" role="button" data-gone="1" title="Deleted, made private or hidden on GitHub. Click to see all such repos">🚫 removed / private</span>' : ''}</div>
+    <div class="owner">${avatar ? `<img src="${esc(avatar)}" loading="lazy" alt="">` : ''}<span class="chip" tabindex="0" role="button" data-owner="${esc(r.owner)}">${hl(r.owner, re)}</span>${r.archived ? ' · archived' : ''}${r.fork ? ' · fork' : ''}${suggestion ? '' : forkTags(r)}${r.gone ? ' <span class="chip gone-tag" tabindex="0" role="button" data-gone="1" title="Deleted, made private or hidden on GitHub. Click to see all such repos">🚫 removed / private</span>' : ''}</div>
     <a href="${esc(safeUrl(r.url))}" target="_blank" rel="noopener">${hl(r.name, re)}</a>
     ${r.gone ? `<div class="gone-note" title="GitHub no longer shows this repository: it was deleted, made private or hidden. You still starred it, so this local copy is kept. It is not updated any more.">🚫 Removed, private or hidden on GitHub · local copy from ${esc(ago(r.gone.at))}</div>` : ''}
     <p class="desc">${r.about ? hl(r.about, re) : '<span class="muted">No description</span>'}</p>
@@ -343,6 +357,7 @@ export function showOnlyRemoved(on) { filters.gone = !!on; info('list', on ? 'sh
 export function resetFilters() {
   filters.lang = filters.topic = filters.owner = null;
   filters.gone = false;
+  filters.family = null;
   limit = PAGE;
   shown.clear();
 }
@@ -373,11 +388,15 @@ export function render() {
   const rawQ = $('#q').value;
   const q = parseQuery(rawQ);
   const re = q.inc.length ? new RegExp(q.inc.map(escRe).join('|'), 'gi') : null;
-  const inReadme = $('#inReadme').checked, inHistory = $('#inHistory').checked;
+  const inReadme = $('#inReadme').checked, inHistory = searchParts();
 
   const out = [], forLang = [], forTopic = [], forOwner = [];
+  scheduleForkScan();   // finds hidden forks in the background when the repos, READMEs or commit index changed
+  const family = filters.family ? S.repos.find(r => rkey(r) === filters.family) : null;
+  if (!family) filters.family = null;
   for (const r of S.repos) {
-    if (S.hideForks && r.fork) continue;
+    if (family) { if (r !== family && rkey(hiddenFork(r)?.root ?? {}) !== filters.family) continue; }   // a family (an original and every copy down its chain) is shown whole, whatever the Forks choice
+    else if (!forkVisible(r)) continue;
     if (filters.gone && !r.gone) continue;   // "🚫 removed or hidden": only the repos kept as a local copy
     if (S.visit && S.onlyNew && isMine(r) === true) continue;   // visiting: only what you have not starred yet
     const okLang = !filters.lang || r.lang === filters.lang;
@@ -399,18 +418,32 @@ export function render() {
     .filter(([k]) => filters[k])
     .map(([k, label]) => `<button class="chip filter-pill" data-${k}="${esc(filters[k])}" title="Remove ${label.toLowerCase()} filter">${label}: ${esc(filters[k])} ✕</button>`);
   if (filters.gone) pills.push('<button class="chip filter-pill" data-gone="1" title="Show all repos again">Status: removed or hidden ✕</button>');
+  if (family) pills.push(`<button class="chip filter-pill" data-family="${esc(filters.family)}" title="Show all repos again">${esc(family.full)} and its hidden forks ✕</button>`);
   const nGone = S.repos.filter(r => r.gone).length;
   const goneChip = nGone && !filters.gone ? `<button class="chip gone-chip" data-gone="1" title="Show only the repos that were deleted, made private or hidden on GitHub (kept here as a local copy). Search: is:removed">🚫 ${nGone} removed or hidden</button>` : '';
-  const filtered = S.hideForks || (S.visit && S.onlyNew) || pills.length > 0 || q.hasQuery;
+  const filtered = S.forkMode !== 'all' || (S.visit && S.onlyNew) || pills.length > 0 || q.hasQuery;
+  forkCounts();
   const exportBtns = out.length ? `<span class="export-actions"><button class="clear-filters" data-export="md" title="Export shown repos as Markdown">⬇ .md</button><button class="clear-filters" data-export="json" title="Export shown repos as JSON">⬇ .json</button></span>` : '';
   $('#count').innerHTML = `<span>${out.length} of ${S.repos.length} repos${filtered ? ' (filtered)' : ''}</span>` + (goneChip ? ' ' + goneChip : '') +
     (pills.length ? ` <span class="active-filters">${pills.join('')}<button class="clear-filters" data-clear-filters title="Clear active filters">Clear</button></span>` : '') + exportBtns;
   $('#list').innerHTML = out.slice(0, limit).map(x => card(x.r, {snips: x.snips, re})).join('');
   moreButton();
   indexCounts();
-  debug('list', `showing ${Math.min(out.length, limit)} of ${out.length} matches (${S.repos.length.toLocaleString()} repos) in ${Math.round(performance.now() - t0)} ms · sort ${$('#sort').value || 'default'}${rawQ.trim() ? ' · search “' + rawQ.trim() + '”' + (inReadme ? ' + READMEs' : '') + (inHistory ? ' + commits & releases' : '') : ''}${filters.lang ? ' · language ' + filters.lang : ''}${filters.topic ? ' · topic ' + filters.topic : ''}${filters.owner ? ' · owner ' + filters.owner : ''}${filters.gone ? ' · only removed/hidden' : ''}${S.hideForks ? ' · forks hidden' : ''}`);
-  renderFacets({forLang, forTopic, forOwner}, `${rawQ.trim().toLowerCase()}\0${inReadme ? 1 : 0}${inHistory ? 1 : 0}`);
+  debug('list', `showing ${Math.min(out.length, limit)} of ${out.length} matches (${S.repos.length.toLocaleString()} repos) in ${Math.round(performance.now() - t0)} ms · sort ${$('#sort').value || 'default'}${rawQ.trim() ? ' · search “' + rawQ.trim() + '”' + (inReadme ? ' + READMEs' : '') + (inHistory ? ' + ' + {rc: 'commits & releases', c: 'commits', r: 'releases'}[inHistory] : '') : ''}${filters.lang ? ' · language ' + filters.lang : ''}${filters.topic ? ' · topic ' + filters.topic : ''}${filters.owner ? ' · owner ' + filters.owner : ''}${filters.gone ? ' · only removed/hidden' : ''}${S.forkMode !== 'all' ? ' · forks: ' + S.forkMode : ''}${family ? ' · family of ' + family.full : ''}`);
+  renderFacets({forLang, forTopic, forOwner}, `${rawQ.trim().toLowerCase()}\0${inReadme ? 1 : 0}${inHistory}`);
   watchStarCharts($('#list'));
+}
+
+/** Counts in the Forks menu: "Only forks (12)", "Only hidden forks (3)". */
+let forkCountsFor = null;
+function forkCounts() {
+  const sel = $('#forkMode');
+  if (!sel?.options) return;
+  const nFork = S.repos.filter(r => r.fork).length, nHidden = S.repos.filter(r => forkKind(r) === 'hidden').length, key = nFork + ',' + nHidden;
+  if (forkCountsFor === key) return;
+  forkCountsFor = key;
+  const n = {hide: nFork, only: nFork, hideHidden: nHidden, onlyHidden: nHidden, hideAll: nFork + nHidden, onlyAll: nFork + nHidden};
+  for (const o of sel.options) { const label = FORK_MODES.find(([m]) => m === o.value)?.[1]; if (label) o.textContent = label + (o.value in n ? ` (${n[o.value].toLocaleString()})` : ''); }
 }
 
 /** "(1,512)" / "(800/1,512)" next to the search-in checkboxes: how much of your stars is searchable there. */
@@ -421,16 +454,23 @@ function indexCounts() {
   countsFor = key;
   const total = S.repos.length, n = x => x.toLocaleString();
   const readmes = S.repos.filter(r => readmeText(r)).length;
-  const hist = S.repos.filter(r => S.history[rkey(r)]), done = hist.filter(r => S.history[rkey(r)].done).length;
+  let commits = 0, done = 0, releases = 0;
+  for (const r of S.repos) {
+    const h = S.history[rkey(r)];
+    if (!h) continue;
+    if (commitsPulled(h)) { commits++; if (h.done) done++; }
+    if (releasesPulled(h)) releases++;
+  }
   const set = (id, text, title) => { const el = $(id); if (el) { el.textContent = text; el.title = title; } };
   set('#cntReadme', readmes ? `(${n(readmes)})` : '', `${n(readmes)} of ${n(total)} READMEs are indexed`);
-  set('#cntHistory', hist.length ? `(${done === total ? n(total) : `${n(done)}/${n(total)}`})` : '', `Commit messages and release notes: ${n(done)} of ${n(total)} repos complete, ${n(hist.length - done)} partial`);
+  set('#cntCommits', commits ? `(${done === total ? n(total) : `${n(done)}/${n(total)}`})` : '', `Commit messages: ${n(done)} of ${n(total)} repos complete, ${n(commits - done)} partial`);
+  set('#cntReleases', releases ? `(${releases === total ? n(total) : `${n(releases)}/${n(total)}`})` : '', `Release notes pulled for ${n(releases)} of ${n(total)} repos`);
 }
 
 // Each facet group is cross-filtered by the active search and the other two facets, so counts reflect real matches.
 let facetsKey = null;
 function renderFacets({forLang, forTopic, forOwner}, queryKey) {
-  const k = [S.repos, S.hideForks, filters.lang, filters.topic, filters.owner, filters.gone, queryKey, S.indexVer];   // indexVer: README / history text changed
+  const k = [S.repos, S.forkMode, filters.lang, filters.topic, filters.owner, filters.gone, filters.family, queryKey, S.indexVer, hiddenVer];   // indexVer: README / history text changed · hiddenVer: a fork scan changed its result
   if (facetsKey && k.every((v, i) => v === facetsKey[i])) return;
   facetsKey = k;
   const row = (kind, active, [v, c]) =>
@@ -446,7 +486,13 @@ function renderFacets({forLang, forTopic, forOwner}, queryKey) {
       (more.length ? `<details><summary class="small">Show ${more.length} more</summary>${more.map(x => row(kind, active, x)).join('')}</details>` : '');
   };
   const nGone = S.repos.filter(r => r.gone).length;   // the Status block exists only when there is something to show
-  const status = nGone || filters.gone ? `<h3>Status</h3><div class="facet ${filters.gone ? 'on' : ''}" tabindex="0" role="button" data-gone="1" title="Repos that were deleted, made private or hidden on GitHub: your local copy is kept"><span>🚫 Removed or hidden</span><span class="muted">${nGone}</span></div>` : '';
+  const gone = nGone || filters.gone ? `<div class="facet ${filters.gone ? 'on' : ''}" tabindex="0" role="button" data-gone="1" title="Repos that were deleted, made private or hidden on GitHub: your local copy is kept"><span>🚫 Removed or hidden</span><span class="muted">${nGone}</span></div>` : '';
+  // Forks: click to show only that kind (the toolbar's Forks menu), again to show everything.
+  const nFork = S.repos.filter(r => r.fork).length, nHidden = S.repos.filter(r => forkKind(r) === 'hidden').length;
+  const forkRow = (mode, label, c, title) => c || S.forkMode === mode ? `<div class="facet ${S.forkMode === mode ? 'on' : ''}" tabindex="0" role="button" data-forkmode="${mode}" title="${title}"><span>${label}</span><span class="muted">${c}</span></div>` : '';
+  const forks = forkRow('only', '⑂ Forks', nFork, 'Repos GitHub marks as forks') +
+    forkRow('onlyHidden', '⧉ Hidden forks', nHidden, 'Copies of another of your stars that GitHub does not mark as forks (same commits, README, description or name)');
+  const status = gone || forks ? `<h3>Status</h3>${gone}${forks}` : '';
   $('#facets').innerHTML = status + block('Languages', 'lang', tally(forLang, r => r.lang), 15) +
     block('Topics', 'topic', tally(forTopic, r => r.topics), 30) +
     block('Owners', 'owner', tally(forOwner, r => r.owner).filter(([v, c]) => c > 1 || v === filters.owner), 15);
@@ -460,9 +506,9 @@ const NOT_EXPORTED = new Set(['starHist', 'activity', 'enrichedAt', 'enrichedPus
 export function exportText(repos, fmt, user) {
   const oneLine = s => String(s).replace(/\s+/g, ' ').trim();   // a description with line breaks would end its list item
   return fmt === 'json'
-    ? JSON.stringify(repos, (k, v) => NOT_EXPORTED.has(k) ? undefined : v, 2)
+    ? JSON.stringify(repos.map(r => hiddenFork(r) ? {...r, hiddenForkOf: hiddenFork(r).of.full} : r), (k, v) => NOT_EXPORTED.has(k) ? undefined : v, 2)
     : `# ★ ${user}'s Starred Repositories (${repos.length})\n\n` +
-      repos.map(r => `- **[${r.full}](${r.url})** (★ ${fmtN(r.stars)}${r.lang ? ` · ${r.lang}` : ''})${r.about ? ` — ${oneLine(r.about)}` : ''}`).join('\n') + '\n';
+      repos.map(r => `- **[${r.full}](${r.url})** (★ ${fmtN(r.stars)}${r.lang ? ` · ${r.lang}` : ''})${r.about ? ` — ${oneLine(r.about)}` : ''}${r.fork ? ' (fork)' : hiddenFork(r) ? ` (hidden fork of ${hiddenFork(r).of.full})` : ''}`).join('\n') + '\n';
 }
 
 /** Downloads the currently shown (filtered and sorted) repositories as Markdown or JSON. */
@@ -478,10 +524,15 @@ function exportMatches(fmt) {
 }
 
 /** Before the first search over commit messages / release notes: builds their search text without freezing the page. */
+/** The "Search in" checkboxes for commits and releases, as a partsKey ('rc', 'c', 'r' or ''). */
+export const searchParts = () => partsKey($('#inCommits').checked, $('#inReleases').checked);
+
 export async function prepareHistorySearch() {
-  const msg = 'Preparing the commit & release search…';
+  const which = searchParts();
+  if (!which) return;
+  const msg = `Preparing the ${{rc: 'commit & release', c: 'commit', r: 'release'}[which]} search…`;
   status(msg);
-  await warmHistoryIndex();
+  await warmHistoryIndex(S.repos, which);
   if ($('#status').textContent === msg) status('');
 }
 
@@ -489,12 +540,30 @@ export async function prepareHistorySearch() {
 export async function searchFor(q) {
   $('#q').value = q;
   $('#inReadme').checked = true;
-  if (Object.keys(S.history).length) { $('#inHistory').checked = true; await prepareHistorySearch(); }
+  if (Object.keys(S.history).length) {
+    const {commits, releases} = indexedParts();
+    if (commits) $('#inCommits').checked = true;
+    if (releases) $('#inReleases').checked = true;
+    await prepareHistorySearch();
+  }
   limit = PAGE; render();
   $('#q').scrollIntoView({block: 'nearest'});
 }
 
 const FACETS_PREF = 'starsViewer.hideFacets';   // localStorage: sidebar hidden?
+const FORK_PREF = 'starsViewer.forkMode';
+let hiddenVer = 0;
+
+/** The Forks menu changed (or a Status row of the sidebar was clicked). */
+function applyForkMode(mode) {
+  setForkMode(mode);
+  $('#forkMode').value = S.forkMode;
+  try { localStorage.setItem(FORK_PREF, S.forkMode); localStorage.removeItem('starsViewer.hideForks'); } catch {}
+  filters.family = null;
+  limit = PAGE;
+  render();
+  window.dispatchEvent(new CustomEvent('fork-filter-change'));
+}
 const SORT_PREF = 'starsViewer.sort';
 function setFacetsHidden(hide, save = true) {
   document.querySelector('main').classList.toggle('nofacets', hide);
@@ -506,10 +575,11 @@ function setFacetsHidden(hide, save = true) {
 
 /** After "Clear cache" erased the stored preferences: the toolbar shows the defaults again (nothing is saved back). */
 export function resetListPrefs() {
-  S.hideForks = false;
-  $('#hideForks').checked = false;
+  setForkMode('all');
+  resetForks();   // the "not a copy" choices were preferences too
+  $('#forkMode').value = 'all';
   $('#sort').value = 'starred';
-  $('#inReadme').checked = $('#inHistory').checked = false;   // the indexes they search are gone too
+  $('#inReadme').checked = $('#inCommits').checked = $('#inReleases').checked = false;   // the indexes they search are gone too
   setFacetsHidden(false, false);
   limit = PAGE;
 }
@@ -517,15 +587,14 @@ export function resetListPrefs() {
 export function initList() {
   // One list of sort choices for the toolbar and for Discover (sort.js); "Best match" only makes sense for suggestions.
   $('#sort').innerHTML = SORT_OPTIONS.filter(([key]) => key !== 'relevance').map(([key, label]) => `<option value="${key}">${esc(label)}</option>`).join('');
-  try { S.hideForks = localStorage.getItem('starsViewer.hideForks') === '1'; } catch {}
-  $('#hideForks').checked = S.hideForks;
-  $('#hideForks').onchange = e => {
-    S.hideForks = e.target.checked;
-    try { localStorage.setItem('starsViewer.hideForks', S.hideForks ? '1' : '0'); } catch {}
-    limit = PAGE;
-    render();
-    window.dispatchEvent(new CustomEvent('fork-filter-change'));
-  };
+  // Forks: one menu for both kinds. Earlier versions had a "Hide forks" checkbox; its choice is carried over.
+  $('#forkMode').innerHTML = FORK_MODES.map(([m, label]) => `<option value="${m}">${esc(label)}</option>`).join('');
+  let mode = 'all';
+  try { mode = localStorage.getItem(FORK_PREF) || (localStorage.getItem('starsViewer.hideForks') === '1' ? 'hide' : 'all'); } catch {}
+  setForkMode(mode);
+  $('#forkMode').value = S.forkMode;
+  $('#forkMode').onchange = e => applyForkMode(e.target.value);
+  window.addEventListener('hidden-forks', () => { hiddenVer++; render(); window.dispatchEvent(new CustomEvent('fork-filter-change')); });   // forks.js finished a scan with a different result
   try {
     const savedSort = localStorage.getItem(SORT_PREF);
     if (savedSort && [...$('#sort').options].some(o => o.value === savedSort)) $('#sort').value = savedSort;
@@ -544,7 +613,7 @@ export function initList() {
   });
   let timer;
   // Searching commit messages scans far more text than the card fields, so it waits a little longer after each keystroke.
-  $('#q').oninput = () => { clearTimeout(timer); timer = setTimeout(() => { limit = PAGE; render(); }, $('#inHistory').checked ? 300 : 120); };
+  $('#q').oninput = () => { clearTimeout(timer); timer = setTimeout(() => { limit = PAGE; render(); }, searchParts() ? 300 : 120); };
   $('#q').onkeydown = e => {
     if (e.key === 'Escape') {
       if ($('#q').value) { clearTimeout(timer); $('#q').value = ''; limit = PAGE; render(); }
@@ -557,7 +626,7 @@ export function initList() {
     render();
   };
   $('#inReadme').onchange = () => { limit = PAGE; render(); };
-  $('#inHistory').onchange = async e => { if (e.target.checked) await prepareHistorySearch(); limit = PAGE; render(); };
+  for (const id of ['#inCommits', '#inReleases']) $(id).onchange = async e => { if (e.target.checked) await prepareHistorySearch(); limit = PAGE; render(); };
   $('#more').onclick = showMore;
   // Infinite scroll: when the button comes near the viewport, load the next step automatically.
   if (typeof IntersectionObserver !== 'undefined')
@@ -574,8 +643,14 @@ export function initList() {
     const exp = e.target.closest('[data-export]');
     if (exp) { exportMatches(exp.dataset.export); return; }
     if (e.target.closest('[data-gone]')) { showOnlyRemoved(!filters.gone); return; }   // the chip, the facet, the pill and the tag on a card all toggle it
+    const nc = e.target.closest('#list [data-notcopy]');
+    if (nc) { notACopy(nc.dataset.notcopy); return; }
+    const fam = e.target.closest('#list [data-family], #count [data-family]');
+    if (fam) { filters.family = filters.family === fam.dataset.family ? null : fam.dataset.family; limit = PAGE; render(); return; }
+    const fm = e.target.closest('#facets [data-forkmode]');
+    if (fm) { applyForkMode(S.forkMode === fm.dataset.forkmode ? 'all' : fm.dataset.forkmode); return; }
     if (e.target.closest('[data-clear-filters]')) {
-      filters.lang = filters.topic = filters.owner = null;
+      filters.lang = filters.topic = filters.owner = filters.family = null;
       filters.gone = false;
       limit = PAGE; render();
       return;

@@ -9,12 +9,21 @@ code{font-size:12px;background:var(--chip);padding:1px 4px;border-radius:4px}
 .muted{color:var(--muted)}.small{font-size:12px}
 
 /* ---- header & toolbar ---- */
-header{position:sticky;top:0;z-index:5;background:var(--panel);border-bottom:1px solid var(--border);padding:12px 16px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
-header h1{font-size:16px;margin:0 12px 0 0}
+header{position:sticky;top:0;z-index:5;background:var(--panel);border-bottom:1px solid var(--border);padding:10px 16px;display:grid;gap:8px}
+header h1{font-size:16px;margin:0 8px 0 0;white-space:nowrap}
+.hrow{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.hgroup{display:inline-flex;flex-wrap:wrap;gap:8px;align-items:center}
+.hgroup.end{margin-left:auto}
+.pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:13px;color:var(--muted);cursor:pointer}
+.pill:hover{border-color:var(--accent)}
+.searchin{color:var(--muted);font-size:13px}
+.searchin label{cursor:pointer;white-space:nowrap}
+#histOptsToggle[aria-expanded="true"]{border-color:var(--accent);color:var(--accent)}
+@media (max-width:700px){.hgroup.end{margin-left:0}#user{flex:1;min-width:0}}
 input,select,button{font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 10px}
 button{cursor:pointer}button:hover:not(:disabled){border-color:var(--accent)}button:disabled{opacity:.6;cursor:wait}
 button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
-#q{flex:1;min-width:200px}
+#q{flex:1 1 320px;min-width:200px}
 .bar{padding:8px 16px;display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;color:var(--muted);font-size:13px}
 /* toolbar groups: Search in · Index · View · Data (each wraps as a unit on narrow screens) */
 .grp{display:inline-flex;flex-wrap:wrap;align-items:center;gap:6px 8px;padding:0 0 0 12px;border-left:2px solid var(--border)}
@@ -44,7 +53,7 @@ button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
 .opt-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px 24px;align-items:center}
 .opt-grid label{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 #histOpts p{margin:8px 0 0}#histOpts p:empty{display:none}
-.opt-actions{margin-top:8px}
+.opt-actions{margin-top:8px;display:flex;gap:8px;flex-wrap:wrap}
 button.confirm{border-color:#d1242f;color:#d1242f}
 .lastrelease .pre{font-size:10px;border:1px solid var(--star);color:var(--star);border-radius:8px;padding:0 5px;margin-left:2px}
 .banner{margin:16px;padding:12px 16px;border:1px solid var(--star);border-radius:8px;background:var(--panel)}
@@ -180,6 +189,12 @@ details summary{cursor:pointer;color:var(--accent);margin:8px 0}
 
 .gone-tag,.gone-chip{color:var(--star);border:1px solid var(--star);background:transparent}
 .gone-tag{padding:0 6px;font-size:10px;margin-left:4px}
+
+/* hidden forks: copies GitHub doesn't mark as forks (forks.js) */
+.hfork-tag{padding:0 6px;font-size:10px;margin-left:4px;border:1px dashed var(--accent);background:transparent;white-space:nowrap}
+.notcopy{font-size:10px;margin-left:4px;opacity:.7}
+.notcopy:hover{opacity:1}
+#forkMode{max-width:15em}
 
 /* ---- activity log (right of the progress bars) ---- */
 #runPanel{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;margin:0 16px 12px}

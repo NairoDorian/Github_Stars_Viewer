@@ -14,12 +14,32 @@
 </head>
 <body>
 <header>
-  <h1>★ Stars Viewer</h1>
-  <input id="user" placeholder="GitHub username or profile URL" size="28" aria-label="GitHub user">
-  <button class="primary" id="load">Load stars</button>
-  <button id="visit" title="Browse this user's stars without saving anything about them (nothing is written to disk or to this browser)">👁 Visit</button>
-  <input id="q" type="search" placeholder="Search name, about, topics, &quot;exact phrase&quot;, -exclude, lang:rust, stars:>1000…  (/ to focus)" title="Supports &quot;exact phrases&quot;, -excluded terms, and qualifiers: lang:, owner:, topic:, is:active, is:archived, is:fork, stars:>1000, stars:>=1k, stars:10..500" aria-label="Search">
-  <select id="sort" aria-label="Sort"></select><!-- options come from SORT_OPTIONS in js/sort.js (filled by initList) -->
+  <!-- Row 1: whose stars (profile) on the left, your data (updates, token, cache) on the right. -->
+  <div class="hrow">
+    <h1>★ Stars Viewer</h1>
+    <div class="hgroup" role="group" aria-label="Profile">
+      <input id="user" placeholder="GitHub username or profile URL" size="24" aria-label="GitHub user">
+      <button class="primary" id="load">Load stars</button>
+      <button id="visit" title="Browse this user's stars without saving anything about them (nothing is written to disk or to this browser)">👁 Visit</button>
+    </div>
+    <div class="hgroup end" role="group" aria-label="Data">
+      <button id="refresh" title="Checks the star list for new, removed and changed repos, and tops up whatever was pulled (READMEs, commits, releases): only what is new is downloaded">⟳ Check for updates</button>
+      <button id="tokenBtn">🔑 Token</button>
+      <label id="cacheToggle" class="pill"><input type="checkbox" id="browserCache"> <span id="cacheLabel">💾 Keep cache</span></label>
+      <button id="clearCache" title="Deletes ALL stored data: stars, READMEs, commits &amp; releases, suggestions, star charts, preferences and your token, from the local server's data folder, this browser's storage and this tab.">🗑 Clear cache</button>
+    </div>
+  </div>
+  <!-- Row 2: the search, its order, and where it looks. -->
+  <div class="hrow">
+    <input id="q" type="search" placeholder="Search name, about, topics, &quot;exact phrase&quot;, -exclude, lang:rust, stars:>1000…  (/ to focus)" title="Supports &quot;exact phrases&quot;, -excluded terms, and qualifiers: lang:, owner:, topic:, is:active, is:archived, is:fork, is:hiddenfork, is:anyfork, is:original, stars:>1000, stars:>=1k, stars:10..500" aria-label="Search">
+    <select id="sort" aria-label="Sort"></select><!-- options come from SORT_OPTIONS in js/sort.js (filled by initList) -->
+    <div class="grp searchin" role="group" aria-label="Search in">
+      <span class="grp-label">Also search in</span>
+      <label title="Also search the text of every pulled README (pull them with 📄 READMEs below)"><input type="checkbox" id="inReadme"> READMEs <span class="muted" id="cntReadme"></span></label>
+      <label title="Also search every pulled commit message (pull them with 📝 Commits below)"><input type="checkbox" id="inCommits"> Commits <span class="muted" id="cntCommits"></span></label>
+      <label title="Also search every pulled release: tag, title and whole notes (pull them with 🏷 Releases below)"><input type="checkbox" id="inReleases"> Releases <span class="muted" id="cntReleases"></span></label>
+    </div>
+  </div>
 </header>
 
 <!-- Shown while someone else's stars are on screen (filled in by main.js showVisit()). -->
@@ -36,34 +56,21 @@
 if (self !== top) document.documentElement.hidden = true;   // framed by another site: invisible, so no click can be tricked into it</script>
 
 <div class="bar">
-  <div class="grp" role="group" aria-label="Search in">
-    <span class="grp-label">Search in</span>
-    <label title="Also search the text of every indexed README"><input type="checkbox" id="inReadme"> READMEs <span class="muted" id="cntReadme"></span></label>
-    <label title="Also search every commit message and release note. Click &quot;Index commits &amp; releases&quot; first."><input type="checkbox" id="inHistory"> Commits &amp; releases <span class="muted" id="cntHistory"></span></label>
-  </div>
-  <div class="grp" role="group" aria-label="Index">
-    <span class="grp-label">Index</span>
-    <button id="indexReadme" title="Downloads the README of every starred repo so the search can look inside them">Index READMEs</button>
-    <span class="split">
-      <button id="indexHistory" title="Downloads every commit message and release note of every starred repo (needs a token), so the search can look inside them. Later checks only fetch what is new.">Index commits &amp; releases</button>
-      <button id="histOptsToggle" class="caret" aria-expanded="false" aria-controls="histOpts" title="Options for the commit &amp; release index" aria-label="Commit and release index options">▾</button>
-    </span>
+  <div class="grp" role="group" aria-label="Pull for search">
+    <span class="grp-label">Pull for search</span>
+    <button id="indexReadme" title="Downloads the README of every starred repo so the search can look inside them. Later checks only fetch the READMEs that changed.">📄 READMEs</button>
+    <button id="indexCommits" title="Downloads the commit messages of every starred repo, newest first, up to the limit set in ⚙ (needs a token). Later checks only fetch new commits.">📝 Commits</button>
+    <button id="indexReleases" title="Downloads every release of every starred repo: tag, title and the whole release notes (needs a token). Later checks only fetch release lists that changed.">🏷 Releases</button>
+    <button id="histOptsToggle" aria-expanded="false" aria-controls="histOpts" title="Commits per repo, and stripping @mentions / links from release notes" aria-label="Commit and release options">⚙ Options</button>
     <span id="histOptsSummary" class="muted small"></span>
-    <button id="enrich" title="Last commit and last release of every repo (shown on the cards and used by the Last commit / Last release sorting). Kept up to date automatically when you have a token.">Refresh latest tiles</button>
   </div>
   <div class="grp" role="group" aria-label="View">
     <span class="grp-label">View</span>
-    <label title="Hide repositories that GitHub marks as forks in your stars and Discover suggestions"><input type="checkbox" id="hideForks"> Hide forks</label>
+    <label title="Forks: GitHub's forks, and hidden forks (copies of another of your stars that GitHub doesn't mark as forks: same commits, README, description or name). Show both, hide either, or show only them. Discover follows the hiding choices.">Forks <select id="forkMode" aria-label="Which forks to show"><option value="all">Show all repos</option></select></label>
     <button id="toggleUsers" aria-controls="usersPanel" aria-expanded="false" title="Everyone who owns a repo in your stars, with how many repos they starred themselves">👥 Users</button>
-    <button id="toggleInsights">🧭 Discover &amp; suggestions</button>
+    <button id="toggleInsights">🧭 Discover</button>
     <button id="toggleFacets" aria-controls="facets" title="Hide or show the Languages / Topics / Owners filters">◧ Hide filters</button>
-  </div>
-  <div class="grp" role="group" aria-label="Data">
-    <span class="grp-label">Data</span>
-    <button id="refresh">Check for updates</button>
-    <button id="tokenBtn">🔑 Token</button>
-    <label id="cacheToggle"><input type="checkbox" id="browserCache"> <span id="cacheLabel">💾 Keep cache</span></label>
-    <button id="clearCache" title="Deletes ALL stored data: stars, READMEs, commits &amp; releases, suggestions, star charts, preferences and your token, from the local server's data folder, this browser's storage and this tab.">🗑 Clear cache</button>
+    <button id="enrich" title="Re-downloads the last commit and last release of every repo (shown on the cards and used by the Last commit / Last release sorting). With a token they are kept up to date automatically.">🕒 Refresh tiles</button>
   </div>
   <div class="statusrow">
     <button id="cancelTask" hidden title="Stop after the current batch; what was fetched so far is kept and the next run continues from there">■ Cancel</button>
@@ -90,18 +97,18 @@ if (self !== top) document.documentElement.hidden = true;   // framed by another
 </div>
 
 <section id="histOpts" hidden aria-label="Commit and release index options">
-  <h3>Commit &amp; release index options</h3>
+  <h3>Commit &amp; release options</h3>
   <div class="opt-grid">
     <label title="Removes @username mentions from release notes (credits, “by @user”, contributor lists). Code, e-mail addresses and scoped packages like @types/node are left alone. Applied to stored notes at once."><input type="checkbox" id="optMentions"> Strip @mentions from release notes</label>
     <label title="Removes links from release notes (markdown links keep their text). Leave off to keep links searchable: after compression they cost little."><input type="checkbox" id="optLinks"> Strip links from release notes</label>
-    <label>Release notes length
-      <select id="optNotes" aria-label="Release notes length"><option value="3000">3,000 characters</option><option value="6000">6,000 characters</option><option value="12000">12,000 characters</option><option value="0">Entire notes (no limit)</option></select></label>
-    <label>Commits per repo
-      <select id="optCommits" aria-label="Commits per repo"><option value="2000">2,000 newest</option><option value="10000">10,000 newest</option><option value="25000">25,000 newest</option><option value="0">ALL commits (no limit)</option></select></label>
+    <label title="How many commit messages are kept per repo, newest first. Lowering it trims what is stored at once; raising it downloads the rest at the next index. Release notes are always kept whole.">Commits per repo
+      <select id="optCommits" aria-label="Commits per repo"></select></label><!-- options come from COMMIT_CHOICES in js/history.js (filled by histopts.js) -->
   </div>
   <p id="optNote" class="muted small"></p>
   <p id="optStats" class="muted small"></p>
   <div class="opt-actions">
+    <button id="optCommits2" title="Same as 📝 Commits in the toolbar: pulls the commits the limit above now asks for">📝 Pull commits</button>
+    <button id="optReleases2" title="Same as 🏷 Releases in the toolbar: pulls release notes that need downloading again">🏷 Pull releases</button>
     <button id="optClear" title="Deletes the stored commit messages and release notes of this profile (the next index downloads them again)">Clear commit &amp; release index</button>
   </div>
 </section>
