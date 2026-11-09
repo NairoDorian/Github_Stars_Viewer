@@ -2,6 +2,7 @@
 import {S, genSignal} from './state.js';
 import {DAY, sleep, pool, chunks} from './util.js';
 import {debug, info, warn, error, names, reqId} from './log.js';
+import {noteHeaders, rateLimitError, setBudgets} from './budget.js';
 
 const API = 'https://api.github.com';
 
@@ -64,6 +65,7 @@ export async function ghFetch(url, init = {}, tries = 3, what = '') {
       if (sig?.aborted) throw new DOMException('Aborted', 'AbortError');
       continue;
     }
+    noteHeaders(r.headers);   // every answer says how much budget is left and when it refills (budget.js)
     const retryAfter = Number(r.headers.get('retry-after')) || 0;
     const transient = r.status >= 500 || ((r.status === 403 || r.status === 429) && retryAfter > 0 && retryAfter <= 60);
     (r.status >= 500 || r.status === 401 || r.status === 403 || r.status === 429 ? warn : debug)('http',
@@ -86,8 +88,6 @@ const rateNote = r => {
   return ` · ${kind} budget ${Number(left).toLocaleString()}${limit ? '/' + Number(limit).toLocaleString() : ''} left`;
 };
 
-/** " (resets 14:05)" from a rate-limited response, when GitHub says when. */
-const resetNote = r => { const t = r.headers.get('x-ratelimit-reset'); return t ? ` (resets ${new Date(t * 1000).toLocaleTimeString()})` : ''; };
 
 /** REST GET. Throws on auth / rate-limit / unexpected errors; returns the response for 2xx, 304 and 404. */
 export async function gh(path, extraHeaders) {
@@ -95,7 +95,7 @@ export async function gh(path, extraHeaders) {
   if (r.status === 401) { needToken(); throw Object.assign(new Error('Token rejected by GitHub. Update it in the 🔑 panel.'), {fatal: true}); }
   if (r.status === 429 || (r.status === 403 && r.headers.get('x-ratelimit-remaining') === '0')) {
     if (!S.token) needToken();
-    throw Object.assign(new Error('Rate limited' + (S.token ? '' : ', add a token') + resetNote(r)), {fatal: true});
+    throw rateLimitError(r, 'core');   // says which budget, its size, and the exact refill time
   }
   if (!r.ok && r.status !== 404 && r.status !== 304) throw new Error('GitHub ' + r.status);
   return r;
@@ -108,7 +108,7 @@ export async function gql(query, what = '') {
   const r = await ghFetch('/graphql', {method: 'POST', headers: headers(), body: JSON.stringify({query})}, 3, what);
   if (r.status === 401) { error('graphql', 'GitHub rejected the token (401)'); needToken(); throw Object.assign(new Error('Token rejected by GitHub. Update it in the 🔑 panel.'), {fatal: true}); }
   if (r.status === 403 || r.status === 429) {
-    if (r.headers.get('x-ratelimit-remaining') === '0') throw Object.assign(new Error('GraphQL rate limit reached' + resetNote(r)), {fatal: true});   // used up: ends the run
+    if (r.headers.get('x-ratelimit-remaining') === '0') throw rateLimitError(r, 'graphql');   // used up: the run waits for the refill or ends
     // Still has budget: GitHub's secondary limit ("slow down", too many requests at once). Callers may wait and retry.
     warn('graphql', 'GitHub asked to slow down (secondary rate limit)');
     throw Object.assign(new Error('GitHub asked to slow down (secondary limit)'), {secondary: true});
@@ -119,10 +119,22 @@ export async function gql(query, what = '') {
   if (!body.data) {   // GitHub can also report limits inside a 200 answer
     const first = body.errors?.[0], msg = first?.message || 'no data';
     if (/secondary rate limit|abuse/i.test(msg)) throw Object.assign(new Error('GitHub asked to slow down (secondary limit)'), {secondary: true});
-    if (first?.type === 'RATE_LIMITED') throw Object.assign(new Error('GraphQL rate limit reached' + resetNote(r)), {fatal: true});
+    if (first?.type === 'RATE_LIMITED') throw rateLimitError(r, 'graphql');
     throw new Error('GraphQL: ' + msg);
   }
   return body.data;
+}
+
+/** Reads every budget from GET /rate_limit (free: it counts against nothing) into budget.js, and returns GitHub's
+ *  {resources} (or null). Shows what other tabs, scripts or an earlier visit of this page already used this hour. */
+export async function readBudget() {
+  try {
+    const r = await ghFetch('/rate_limit', {headers: headers(), signal: null}, 2, 'how much budget is left');
+    if (!r.ok) return null;
+    const {resources} = await r.json();
+    setBudgets(resources);
+    return resources;
+  } catch { return null; }
 }
 
 /** One aliased `repository(...)` block for batched GraphQL queries. */

@@ -12,7 +12,7 @@ import {debug, info} from './log.js';
 
 /** Default names of the steps; callers may pass their own label to start(). */
 const LABELS = {stars: 'Pull the star list', details: 'Update repo details', readmes: 'Download READMEs',
-  check: 'Check commits & releases', releases: 'Fetch release notes', commits: 'Fetch commit messages'};
+  check: 'Check commits & releases', releases: 'Fetch release notes', commits: 'Fetch commit messages', files: 'List files'};
 
 const lanes = new Map();   // id → {label, state: 'waiting' | 'running' | 'done' | 'stopped', done, total, detail, t0, t1}
 let redraw = null, ticker = null, hider = null;

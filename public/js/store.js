@@ -7,6 +7,7 @@
 //
 // Keys:  config {token, user} · stars:<user> {v, at, repos, pages} · readmes:<user> {<id>: {…}}
 //        history:<user>:<0-255> {<repo id>: {commit messages + release notes}} (sharded, see below; history.js)
+//        files:<user>:<0-63> {<repo id>: {file paths + what they say about the repo}} (sharded the same way; files.js)
 //        discover:<user> {dismissed, results} · users:<user> {<owner login>: {stars, followers…}} (users.js)
 //        starcurves {<owner/name>: {at, pts}} (star-history.com, all users)
 //
@@ -27,14 +28,14 @@ const mem = new Map();   // memory mode: the whole cache; browser mode: a copy o
 // "nothing stored", so this tab would build a near-empty replacement; put() refuses to overwrite the real file with it.
 const unreadable = new Set();
 /** Shards of the commit index are logged as a group (writeHistory), not one line each. */
-const quiet = key => /^history:[^:]+:\d+$/.test(key);
+const quiet = key => /^(?:history|files):[^:]+:\d+$/.test(key);
 /** "found" / "nothing stored" for a read. The old single-file commit index is expected to be absent: it lives in 256 shards now. */
 const found = (key, v) => v != null ? 'found' : /^history:[^:]+$/.test(key) ? 'nothing stored (normal: the commit index lives in 256 shards, this key only held an older single-file copy)' : 'nothing stored';
 const where = () => mode === 'server' ? 'the data/ folder' : mode === 'browser' ? 'IndexedDB' : 'memory';
 const visitMem = new Map();
 const visited = new Set();   // logins (lower-cased) visited in this tab and not adopted since: put() refuses their keys, whatever happens
 /** The login a profile key belongs to (stars:<user>, history:<user>:<n>…), or null for shared keys (config, starcurves). */
-const keyUser = key => key.match(/^(?:stars|readmes|discover|users|history):([^:]+)/)?.[1].toLowerCase() ?? null;
+const keyUser = key => key.match(/^(?:stars|readmes|discover|users|history|files):([^:]+)/)?.[1].toLowerCase() ?? null;
 
 /** Starts, switches or (with '') ends a visit. A visit never inherits the previous visit's data. */
 export function setVisit(login) {
@@ -130,7 +131,8 @@ export async function clearAll() {
   mem.clear();
   visitMem.clear();
   visited.clear();
-  dirtyShards.clear();
+  historyShards.forget();
+  fileShards.forget();
   unreadable.clear();
   let files = 0;
   if (serverUp) {
@@ -154,6 +156,8 @@ export async function saveAll(g = S.gen) {
   await saveReadmes(g);
   markAllHistory();
   await saveHistory(g);
+  fileShards.markAll();
+  await saveFiles(g);
   await saveDisc(g);
   await saveUsers(g);
 }
@@ -202,8 +206,8 @@ async function readStored(key) {
 /** Was this key's stored copy unreadable the last time it was read? (Writing it is refused, see put.) */
 export const isUnreadable = key => unreadable.has(key);
 
-/** Forgets which history shards are waiting to be saved (another profile is being loaded: they belong to the old one). */
-export const forgetHistoryDirty = () => { dirtyShards.clear(); };
+/** Forgets which history / file-list shards are waiting to be saved (another profile is being loaded: they belong to the old one). */
+export const forgetHistoryDirty = () => { historyShards.forget(); fileShards.forget(); };
 
 export async function put(key, value) {
   if (S.visit && key !== 'config') {   // kept for this visit only
@@ -250,50 +254,71 @@ export const saveUsers = (g = S.gen) => mayWrite(g) && put('users:' + ukey(), S.
 /** The config holds the token and YOUR login (S.home), never the profile on screen: a visit must not become the next start's profile. */
 export const saveConfig = () => put('config', {token: S.token, user: S.home});
 
-/* Commit messages and release notes are large (hundreds of MB for a big star list), so they are stored in HISTORY_SHARDS
-   small records, `history:<user>:<n>` holding {<repo id>: record}, and a save rewrites only the shards whose repos
-   changed. The old single `history:<user>` record is split into shards on first load, then emptied. */
-export const HISTORY_SHARDS = 256;
-export const shardOf = k => [...String(k)].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7) % HISTORY_SHARDS;
-const dirtyShards = new Set();
-/** Marks a repo's history record as changed (written by the next saveHistory). */
-export const markHistory = k => { dirtyShards.add(shardOf(k)); };
-export const markAllHistory = () => { for (let i = 0; i < HISTORY_SHARDS; i++) dirtyShards.add(i); };
-export const historyDirty = () => dirtyShards.size;
-
-/** Writes the shards marked dirty (records of `history`, default S.history). True when every write succeeded; a failed
- *  shard stays dirty and is retried by the next call. Saves run one after another: a save that started later holds
- *  newer records, and must not have one of its shards overwritten by an earlier, slower save (a big index takes longer
- *  to write than the time between two progress saves). */
-let historySaves = Promise.resolve();
-export function saveHistory(g = S.gen, history = S.history) {
-  const save = historySaves.then(() => writeHistory(g, history));
-  historySaves = save.catch(() => {});
-  return save;
-}
-async function writeHistory(g, history) {
-  if (g !== S.gen) return false;
-  const user = ukey(), todo = [...dirtyShards];
-  dirtyShards.clear();
-  if (todo.length) debug('store', `commit index: writing ${todo.length} changed shard(s) of ${HISTORY_SHARDS} to ${where()}`);
-  const shards = new Map(todo.map(i => [i, {}]));
-  for (const [k, rec] of Object.entries(history)) { const shard = shards.get(shardOf(k)); if (shard) shard[k] = rec; }
-  let ok = true;
-  for (const [i, data] of shards) {
-    if (g !== S.gen) return false;   // another profile now: the rest belongs to the old one and is never written for the new one
-    if (!(await put(`history:${user}:${i}`, data))) { dirtyShards.add(i); ok = false; }
+/* Commit messages and release notes are large (hundreds of MB for a big star list), and so are the file lists of every
+   repo, so each is stored in small records, `<name>:<user>:<n>` holding {<repo id>: record}, and a save rewrites only
+   the shards whose repos changed. The old single `history:<user>` record is split into shards on first load, then
+   emptied. */
+function shardStore(name, count, label, data) {
+  const shardOf = k => [...String(k)].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7) % count;
+  const dirty = new Set();
+  let saves = Promise.resolve();
+  async function write(g, records) {
+    if (g !== S.gen) return false;
+    const user = ukey(), todo = [...dirty];
+    dirty.clear();
+    if (todo.length) debug('store', `${label}: writing ${todo.length} changed shard(s) of ${count} to ${where()}`);
+    const shards = new Map(todo.map(i => [i, {}]));
+    for (const [k, rec] of Object.entries(records)) { const shard = shards.get(shardOf(k)); if (shard) shard[k] = rec; }
+    let ok = true;
+    for (const [i, part] of shards) {
+      if (g !== S.gen) return false;   // another profile now: the rest belongs to the old one and is never written for the new one
+      if (!(await put(`${name}:${user}:${i}`, part))) { dirty.add(i); ok = false; }
+    }
+    if (todo.length && !ok) warn('store', `${label}: some shards could not be saved; they stay marked and are written by the next save`);
+    return ok;
   }
-  if (todo.length && !ok) warn('store', 'commit index: some shards could not be saved; they stay marked and are written by the next save');
-  return ok;
+  return {
+    count, shardOf,
+    mark: k => { dirty.add(shardOf(k)); },
+    markAll: () => { for (let i = 0; i < count; i++) dirty.add(i); },
+    dirty: () => dirty.size,
+    forget: () => { dirty.clear(); },
+    /** Writes the shards marked dirty. True when every write succeeded; a failed shard stays dirty and is retried by the
+     *  next call. Saves run one after another: a save that started later holds newer records, and must not have one of its
+     *  shards overwritten by an earlier, slower save. */
+    save(g = S.gen, records = data()) {
+      const run = saves.then(() => write(g, records));
+      saves = run.catch(() => {});
+      return run;
+    },
+    /** Reads every shard: {} when none, null if the profile changed meanwhile. */
+    async load(g = S.gen, extra = []) {
+      const user = ukey(), out = {};
+      const parts = await Promise.all([...extra.map(k => get(k)), ...Array.from({length: count}, (_, i) => get(`${name}:${user}:${i}`))]);
+      for (const part of parts.slice(extra.length)) if (part) Object.assign(out, part);
+      if (g !== S.gen) return null;
+      return {out, extra: parts.slice(0, extra.length)};
+    },
+  };
 }
+
+export const HISTORY_SHARDS = 256, FILE_SHARDS = 64;
+const historyShards = shardStore('history', HISTORY_SHARDS, 'commit index', () => S.history);
+const fileShards = shardStore('files', FILE_SHARDS, 'file lists', () => S.files);
+export const shardOf = historyShards.shardOf;
+/** Marks a repo's history record as changed (written by the next saveHistory). */
+export const markHistory = historyShards.mark;
+export const markAllHistory = historyShards.markAll;
+export const historyDirty = historyShards.dirty;
+/** Writes the commit-index shards marked dirty (records of `history`, default S.history). */
+export const saveHistory = (g = S.gen, history = S.history) => historyShards.save(g, history);
 
 /** Reads every shard and returns the history ({} when none), or null if the profile changed meanwhile. A legacy single
  *  record (written by an older version) is imported on top, split into shards, then emptied. */
 export async function loadHistory(g = S.gen) {
-  const user = ukey(), out = {};
-  const [legacy, ...parts] = await Promise.all([get('history:' + user), ...Array.from({length: HISTORY_SHARDS}, (_, i) => get(`history:${user}:${i}`))]);
-  for (const part of parts) if (part) Object.assign(out, part);
-  if (g !== S.gen) return null;
+  const user = ukey(), got = await historyShards.load(g, ['history:' + user]);
+  if (!got) return null;
+  const {out, extra: [legacy]} = got;
   info('store', `commit index: ${Object.keys(out).length.toLocaleString()} repos read from its ${HISTORY_SHARDS} shards${legacy ? ' (+ an older single-file copy, being split into shards)' : ''}`);
   if (legacy && typeof legacy === 'object') {   // an older version wrote it last: it wins, then it is retired
     Object.assign(out, legacy);
@@ -301,4 +326,17 @@ export async function loadHistory(g = S.gen) {
     if (await saveHistory(g, out)) await put('history:' + user, null);
   }
   return out;
+}
+
+/** Marks a repo's file list as changed (written by the next saveFiles). */
+export const markFiles = fileShards.mark;
+export const markAllFiles = fileShards.markAll;
+export const filesDirty = fileShards.dirty;
+export const saveFiles = (g = S.gen, files = S.files) => mayWrite(g) ? fileShards.save(g, files) : Promise.resolve(false);
+/** Reads the file lists of the profile ({} when none), or null if the profile changed meanwhile. */
+export async function loadFiles(g = S.gen) {
+  const got = await fileShards.load(g);
+  if (!got) return null;
+  info('store', `file lists: ${Object.keys(got.out).length.toLocaleString()} repos read from ${FILE_SHARDS} shards`);
+  return got.out;
 }

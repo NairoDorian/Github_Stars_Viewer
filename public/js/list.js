@@ -7,13 +7,40 @@ import {S, isMine, rkey, readmeEntry, readmeText, readmeLower, historyIndex, his
 import {$, esc, escRe, fmtN, fmtDate, ago, when, safeUrl, tally, status} from './util.js';
 import {activityNow, starGains, ACTIVITY_SPAN, ACTIVITY_BUCKETS, setStar, whoAmI, needToken} from './github.js';
 import {drawableCurve, starsAt, watchStarCharts} from './starhistory.js';
-import {sortRepos, SORT_OPTIONS} from './sort.js';
+import {sortRepos, SORT_OPTIONS, EXTRA_VALUES} from './sort.js';
+import {summaryOf, hasKind, extOf, hardwareCount, models3dCount, KINDS, EMBEDDED, kindLabel, kindIcon, kindHelp} from './filekinds.js';
 import {debug, info, warn} from './log.js';
 import {hiddenFork, copiesOf, forkKind, forkVisible, setForkMode, scheduleForkScan, notACopy, resetForks, FORK_MODES} from './forks.js';
 
 const PAGE = 200;   // cards rendered per step; more load automatically when you reach the end (or via Show more)
-const filters = {lang: null, topic: null, owner: null, gone: false, family: null};   // gone: only the repos GitHub no longer shows (removed, private or hidden) · family: rkey of an original, shown with its hidden forks
+const filters = {lang: null, topic: null, owner: null, gone: false, family: null, kind: null};   // gone: only the repos GitHub no longer shows (removed, private or hidden) · family: rkey of an original, shown with its hidden forks
 let limit = PAGE;
+
+// ---- file lists (files.js): summaries, path search, has: / ext: / path: / files: ----
+const fileRec = r => S.files[rkey(r)];
+/** The file-list summary of a repo (kinds, build systems, extensions), or null when its files were not pulled. */
+export const filesOf = r => summaryOf(fileRec(r));
+// Lower-cased paths of a file-list record, one per line, built once per record (records are replaced, never edited).
+const pathCache = new WeakMap();
+function pathsLower(rec) {
+  if (!rec?.p?.length) return '';
+  let t = pathCache.get(rec);
+  if (t === undefined) pathCache.set(rec, t = rec.p.join('\n').toLowerCase());
+  return t;
+}
+/** First stored path containing `term` (lower-cased), or null. */
+function fileHit(r, term) {
+  const rec = fileRec(r), low = pathsLower(rec), i = low.indexOf(term);
+  if (i < 0) return null;
+  const start = low.lastIndexOf('\n', i) + 1, end = low.indexOf('\n', i), line = low.slice(start, end < 0 ? undefined : end);
+  return rec.p.find(x => x.toLowerCase() === line) || line;
+}
+/** Does the repo have a "file kind" (filters.kind / the sidebar): a kind key, or 'firmware' (an embedded build system). */
+const hasFileKind = (r, kind) => { const f = filesOf(r); return !!f && !!hasKind(f, kind, fileRec(r).p); };
+// Sort orders that need the file lists (sort.js asks for them by key; repos without the kind sort last).
+EXTRA_VALUES.hardware = r => { const c = hardwareCount(filesOf(r)); return c || null; };
+EXTRA_VALUES.models3d = r => { const c = models3dCount(filesOf(r)); return c || null; };
+EXTRA_VALUES.files = r => fileRec(r)?.n || null;
 
 // Lower-cased searchable text per repo object: name, about, topics and languages. Repo objects are replaced on every
 // sync; the language breakdown (r.langs) is filled in later by the details check, so it is part of the cache check.
@@ -29,7 +56,7 @@ function hay(r) {
 
 /** Parses search text into {inc, exc, quals, hasQuery}: supports "exact phrases", -negation, and key:value qualifiers. */
 export function parseQuery(raw) {
-  const inc = [], exc = [], quals = [], QK = /^(lang|language|owner|user|topic|tag|is|stars)$/;
+  const inc = [], exc = [], quals = [], QK = /^(lang|language|owner|user|topic|tag|is|stars|has|ext|path|file|files|build)$/;
   for (const m of (raw || '').toLowerCase().matchAll(/(-?)(?:([a-z]+):)?"([^"]+)"|(\S+)/g)) {
     if (m[3] !== undefined) {
       const neg = m[1] === '-', k = m[2], v = m[3].trim();
@@ -66,8 +93,14 @@ function checkQual(r, {k, v}) {
   if (k === 'is') return v === 'archived' ? !!r.archived : v === 'active' ? !r.archived : v === 'fork' ? !!r.fork : v === 'removed' ? !!r.gone
     : v === 'hiddenfork' || v === 'hidden-fork' || v === 'copy' ? forkKind(r) === 'hidden' : v === 'anyfork' ? !!forkKind(r) : v === 'original' ? copiesOf(r).length > 0
     : v === 'mine' ? isMine(r) : v === 'new' ? (isMine(r) === null ? null : !isMine(r)) : null;
-  if (k === 'stars') {   // GitHub's forms: stars:>1000, stars:>=1k, stars:10..500, stars:100..*, stars:*..50
-    const s = r.stars ?? 0, range = v.split('..');
+  // File lists (📁 Files): unknown (ignored) for a repo whose files were not pulled.
+  if (k === 'has') { const f = filesOf(r); return f ? hasKind(f, v, fileRec(r).p) : null; }
+  if (k === 'ext') { const rec = fileRec(r); if (!rec?.p) return null; const e = v.replace(/^\./, ''); return rec.p.some(x => extOf(x) === e); }
+  if (k === 'path' || k === 'file') { const rec = fileRec(r); return rec?.p ? pathsLower(rec).includes(v) : null; }
+  if (k === 'build') { const f = filesOf(r); return f ? f.build.some(b => b.toLowerCase().replace(/\s+/g, '-') === v) : null; }
+  if (k === 'stars' || k === 'files') {   // GitHub's forms: stars:>1000, stars:>=1k, stars:10..500, stars:100..*, stars:*..50 (files: the same, on the file count)
+    if (k === 'files' && !fileRec(r)) return null;
+    const s = (k === 'files' ? fileRec(r).n : r.stars) ?? 0, range = v.split('..');
     if (range.length === 2) {
       const lo = range[0] === '*' ? -Infinity : count(range[0]), hi = range[1] === '*' ? Infinity : count(range[1]);
       return Number.isNaN(lo) || Number.isNaN(hi) ? null : s >= lo && s <= hi;
@@ -92,9 +125,9 @@ const around = (text, term) => {
  *  term matching anywhere that is enabled. Each term may match in a
  *  different place. Returns {snips} or null; snips explain the terms that matched only inside a README, a commit
  *  message or a release note (one line per source, newest commit / release first, at most MAX_SNIPS). */
-export function match(r, q, inReadme, inHistory = false) {
+export function match(r, q, inReadme, inHistory = false, inFiles = false) {
   for (const qual of q.quals) { const ok = checkQual(r, qual); if (ok !== null && ok === qual.neg) return null; }
-  for (const t of q.exc) if (hay(r).includes(t) || (inReadme && readmeLower(r).includes(t)) || (inHistory && inHistoryText(r, t, inHistory))) return null;
+  for (const t of q.exc) if (hay(r).includes(t) || (inReadme && readmeLower(r).includes(t)) || (inHistory && inHistoryText(r, t, inHistory)) || (inFiles && pathsLower(fileRec(r)).includes(t))) return null;
   const snips = [];
   for (const t of q.inc) {
     if (hay(r).includes(t)) continue;
@@ -104,7 +137,12 @@ export function match(r, q, inReadme, inHistory = false) {
       continue;
     }
     const h = inHistory ? historyHit(r, t, inHistory) : null;
-    if (!h) return null;
+    if (!h) {
+      const path = inFiles ? fileHit(r, t) : null;
+      if (!path) return null;
+      if (!snips.some(x => x.kind === 'File' && x.id === path)) snips.push({kind: 'File', id: path, text: path});
+      continue;
+    }
     if (!snips.some(x => x.kind === h.kind && x.id === h.id)) snips.push({kind: h.kind, id: h.id, when: date(h.t), text: around(h.text, t)});   // one line per commit / release
   }
   return {snips: snips.slice(0, MAX_SNIPS)};
@@ -254,7 +292,8 @@ export function lastReleaseTile(r, suggestion = false) {
 function snipHTML(r, s, re) {
   let label = esc(s.kind);
   if (s.id && r.url) {
-    const href = s.kind === 'Commit' ? `${r.url}/commit/${s.id}` : `${r.url}/releases/tag/${encodeURIComponent(s.id)}`;
+    const href = s.kind === 'Commit' ? `${r.url}/commit/${s.id}` : s.kind === 'File' ? `${r.url}/blob/${encodeURIComponent(fileRec(r)?.branch || 'HEAD')}/${s.id.split('/').map(encodeURIComponent).join('/')}`
+      : `${r.url}/releases/tag/${encodeURIComponent(s.id)}`;
     label = `<a href="${esc(safeUrl(href))}" target="_blank" rel="noopener" title="Open on GitHub">${label} ${esc(s.id)}</a>`;
   }
   return `<div class="snip"><b>${label}</b>${s.when ? ` <span class="muted">${esc(s.when)}</span>` : ''}: …${hl(s.text, re)}…</div>`;
@@ -267,6 +306,19 @@ function historyBadge(r) {
   const part = [nc ? `${nc.toLocaleString()}${h.done ? '' : '+'} commits` : '', nr ? `${nr} release${nr === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ');
   const note = !nc ? '' : h.capped ? ` (only the newest ${nc.toLocaleString()} commits)` : h.done ? '' : ' (commits still being pulled)';
   return `<span title="Searchable with “Search in: Commits / Releases”${note}">🔎 ${part}</span>`;
+}
+
+/** "📁 1,204 files · 🔌 12 · 🧊 4 · PlatformIO": what the file list says, each kind clickable (filters by it). */
+function filesBadge(r) {
+  const rec = fileRec(r), f = summaryOf(rec);
+  if (!f) return '';
+  if (rec.miss) return `<span class="muted" title="GitHub has no file tree for it (HTTP ${rec.miss}: an empty repository)">📁 empty</span>`;
+  const tree = `${r.url}/tree/${encodeURIComponent(rec.branch || 'HEAD')}`;
+  const exts = f.ext.slice(0, 8).map(([e, c]) => `.${e} ${c.toLocaleString()}`).join(', ');
+  const kinds = Object.entries(f.kinds).sort((a, b) => b[1] - a[1]).map(([k, c]) =>
+    `<span class="chip fk" tabindex="0" role="button" data-kind="${esc(k)}" title="${esc(kindLabel(k))}: ${c.toLocaleString()} file(s), e.g. ${esc((f.ex[k] || []).join(', '))}. Click to show every repo with such files">${kindIcon(k)} ${c.toLocaleString()}</span>`).join('');
+  const build = f.build.length ? `<span class="muted" title="Build systems and platforms found from their marker files">${esc(f.build.slice(0, 4).join(' · '))}</span>` : '';
+  return `<a href="${esc(safeUrl(tree))}" target="_blank" rel="noopener" title="${rec.n.toLocaleString()} files${rec.trunc || rec.cut ? ' (only part of a very large tree)' : ''}. Most common: ${esc(exts)}. Open the file tree on GitHub">📁 ${rec.n.toLocaleString()} files</a>${kinds}${build}`;
 }
 
 /** At most 8 topics; when there are more, the ones matching the active topic filter or the search come first. */
@@ -338,6 +390,7 @@ export function card(r, {snips = [], re = null, suggestion = false, reasons = []
       ${lastCommitTile(r)}
       ${historyBadge(r)}
       ${lastReleaseTile(r, suggestion)}
+      ${suggestion ? '' : filesBadge(r)}
       ${r.created ? `<span title="Created ${esc(when(r.created))}">created ${ago(r.created)}</span>` : ''}
       ${r.starred ? `<span title="${esc(r.starred)}">starred ${ago(r.starred)}</span>` : ''}
       ${home ? `<a href="${esc(home)}" target="_blank" rel="noopener">site ↗</a>` : ''}
@@ -357,7 +410,7 @@ export function showOnlyRemoved(on) { filters.gone = !!on; info('list', on ? 'sh
 export function resetFilters() {
   filters.lang = filters.topic = filters.owner = null;
   filters.gone = false;
-  filters.family = null;
+  filters.family = filters.kind = null;
   limit = PAGE;
   shown.clear();
 }
@@ -388,7 +441,7 @@ export function render() {
   const rawQ = $('#q').value;
   const q = parseQuery(rawQ);
   const re = q.inc.length ? new RegExp(q.inc.map(escRe).join('|'), 'gi') : null;
-  const inReadme = $('#inReadme').checked, inHistory = searchParts();
+  const inReadme = $('#inReadme').checked, inHistory = searchParts(), inFiles = $('#inFiles').checked;
 
   const out = [], forLang = [], forTopic = [], forOwner = [];
   scheduleForkScan();   // finds hidden forks in the background when the repos, READMEs or commit index changed
@@ -398,12 +451,13 @@ export function render() {
     if (family) { if (r !== family && rkey(hiddenFork(r)?.root ?? {}) !== filters.family) continue; }   // a family (an original and every copy down its chain) is shown whole, whatever the Forks choice
     else if (!forkVisible(r)) continue;
     if (filters.gone && !r.gone) continue;   // "🚫 removed or hidden": only the repos kept as a local copy
+    if (filters.kind && !hasFileKind(r, filters.kind)) continue;   // a "File kinds" row of the sidebar
     if (S.visit && S.onlyNew && isMine(r) === true) continue;   // visiting: only what you have not starred yet
     const okLang = !filters.lang || r.lang === filters.lang;
     const okTopic = !filters.topic || r.topics.includes(filters.topic);
     const okOwner = !filters.owner || r.owner === filters.owner;
     if (okLang + okTopic + okOwner < 2) continue;
-    const m = match(r, q, inReadme, inHistory);
+    const m = match(r, q, inReadme, inHistory, inFiles);
     if (!m) continue;
     if (okTopic && okOwner) forLang.push(r);
     if (okLang && okOwner) forTopic.push(r);
@@ -418,6 +472,7 @@ export function render() {
     .filter(([k]) => filters[k])
     .map(([k, label]) => `<button class="chip filter-pill" data-${k}="${esc(filters[k])}" title="Remove ${label.toLowerCase()} filter">${label}: ${esc(filters[k])} ✕</button>`);
   if (filters.gone) pills.push('<button class="chip filter-pill" data-gone="1" title="Show all repos again">Status: removed or hidden ✕</button>');
+  if (filters.kind) pills.push(`<button class="chip filter-pill" data-kind="${esc(filters.kind)}" title="Show all repos again">Files: ${esc(kindName(filters.kind))} ✕</button>`);
   if (family) pills.push(`<button class="chip filter-pill" data-family="${esc(filters.family)}" title="Show all repos again">${esc(family.full)} and its hidden forks ✕</button>`);
   const nGone = S.repos.filter(r => r.gone).length;
   const goneChip = nGone && !filters.gone ? `<button class="chip gone-chip" data-gone="1" title="Show only the repos that were deleted, made private or hidden on GitHub (kept here as a local copy). Search: is:removed">🚫 ${nGone} removed or hidden</button>` : '';
@@ -429,8 +484,8 @@ export function render() {
   $('#list').innerHTML = out.slice(0, limit).map(x => card(x.r, {snips: x.snips, re})).join('');
   moreButton();
   indexCounts();
-  debug('list', `showing ${Math.min(out.length, limit)} of ${out.length} matches (${S.repos.length.toLocaleString()} repos) in ${Math.round(performance.now() - t0)} ms · sort ${$('#sort').value || 'default'}${rawQ.trim() ? ' · search “' + rawQ.trim() + '”' + (inReadme ? ' + READMEs' : '') + (inHistory ? ' + ' + {rc: 'commits & releases', c: 'commits', r: 'releases'}[inHistory] : '') : ''}${filters.lang ? ' · language ' + filters.lang : ''}${filters.topic ? ' · topic ' + filters.topic : ''}${filters.owner ? ' · owner ' + filters.owner : ''}${filters.gone ? ' · only removed/hidden' : ''}${S.forkMode !== 'all' ? ' · forks: ' + S.forkMode : ''}${family ? ' · family of ' + family.full : ''}`);
-  renderFacets({forLang, forTopic, forOwner}, `${rawQ.trim().toLowerCase()}\0${inReadme ? 1 : 0}${inHistory}`);
+  debug('list', `showing ${Math.min(out.length, limit)} of ${out.length} matches (${S.repos.length.toLocaleString()} repos) in ${Math.round(performance.now() - t0)} ms · sort ${$('#sort').value || 'default'}${rawQ.trim() ? ' · search “' + rawQ.trim() + '”' + (inReadme ? ' + READMEs' : '') + (inHistory ? ' + ' + {rc: 'commits & releases', c: 'commits', r: 'releases'}[inHistory] : '') + (inFiles ? ' + file names' : '') : ''}${filters.kind ? ' · files: ' + filters.kind : ''}${filters.lang ? ' · language ' + filters.lang : ''}${filters.topic ? ' · topic ' + filters.topic : ''}${filters.owner ? ' · owner ' + filters.owner : ''}${filters.gone ? ' · only removed/hidden' : ''}${S.forkMode !== 'all' ? ' · forks: ' + S.forkMode : ''}${family ? ' · family of ' + family.full : ''}`);
+  renderFacets({forLang, forTopic, forOwner}, `${rawQ.trim().toLowerCase()}\0${inReadme ? 1 : 0}${inHistory}${inFiles ? 'f' : ''}`);
   watchStarCharts($('#list'));
 }
 
@@ -464,13 +519,29 @@ function indexCounts() {
   const set = (id, text, title) => { const el = $(id); if (el) { el.textContent = text; el.title = title; } };
   set('#cntReadme', readmes ? `(${n(readmes)})` : '', `${n(readmes)} of ${n(total)} READMEs are indexed`);
   set('#cntCommits', commits ? `(${done === total ? n(total) : `${n(done)}/${n(total)}`})` : '', `Commit messages: ${n(done)} of ${n(total)} repos complete, ${n(commits - done)} partial`);
+  const files = S.repos.filter(r => fileRec(r)).length;
+  set('#cntFiles', files ? `(${files === total ? n(total) : `${n(files)}/${n(total)}`})` : '', `File lists pulled for ${n(files)} of ${n(total)} repos`);
   set('#cntReleases', releases ? `(${releases === total ? n(total) : `${n(releases)}/${n(total)}`})` : '', `Release notes pulled for ${n(releases)} of ${n(total)} repos`);
+}
+
+/** "🔌 PCB & schematic sources", or "🔧 Embedded firmware" for the build-system kind. */
+const kindName = k => k === 'firmware' ? '🔧 Embedded firmware' : kindLabel(k);
+/** The sidebar's "File kinds": how many of your stars hold each kind of file (once file lists are pulled). Click to
+ *  show only those, again to show everything. */
+function fileKindsBlock() {
+  const lists = S.repos.map(filesOf).filter(Boolean);
+  if (!lists.length && !filters.kind) return '';
+  const counts = KINDS.map(([k]) => [k, lists.filter(f => f.kinds[k]).length]);
+  counts.splice(4, 0, ['firmware', lists.filter(f => f.build.some(b => EMBEDDED.has(b))).length]);
+  const rows = counts.filter(([k, c]) => c || filters.kind === k).map(([k, c]) =>
+    `<div class="facet ${filters.kind === k ? 'on' : ''}" tabindex="0" role="button" data-kind="${esc(k)}" title="${esc(k === 'firmware' ? 'ESP-IDF, PlatformIO, Arduino, Zephyr, Rust embedded, MicroPython, STM32Cube projects' : kindHelp(k))} · search: has:${esc(k)}"><span>${esc(kindName(k))}</span><span class="muted">${c}</span></div>`);
+  return `<h3 title="From the file lists (📁 Files): ${lists.length.toLocaleString()} of ${S.repos.length.toLocaleString()} repos listed">File kinds</h3>${rows.join('') || '<div class="muted small">No special files found</div>'}`;
 }
 
 // Each facet group is cross-filtered by the active search and the other two facets, so counts reflect real matches.
 let facetsKey = null;
 function renderFacets({forLang, forTopic, forOwner}, queryKey) {
-  const k = [S.repos, S.forkMode, filters.lang, filters.topic, filters.owner, filters.gone, filters.family, queryKey, S.indexVer, hiddenVer];   // indexVer: README / history text changed · hiddenVer: a fork scan changed its result
+  const k = [S.repos, S.forkMode, filters.lang, filters.topic, filters.owner, filters.gone, filters.family, filters.kind, queryKey, S.indexVer, hiddenVer];   // indexVer: README / history text changed · hiddenVer: a fork scan changed its result
   if (facetsKey && k.every((v, i) => v === facetsKey[i])) return;
   facetsKey = k;
   const row = (kind, active, [v, c]) =>
@@ -493,7 +564,7 @@ function renderFacets({forLang, forTopic, forOwner}, queryKey) {
   const forks = forkRow('only', '⑂ Forks', nFork, 'Repos GitHub marks as forks') +
     forkRow('onlyHidden', '⧉ Hidden forks', nHidden, 'Copies of another of your stars that GitHub does not mark as forks (same commits, README, description or name)');
   const status = gone || forks ? `<h3>Status</h3>${gone}${forks}` : '';
-  $('#facets').innerHTML = status + block('Languages', 'lang', tally(forLang, r => r.lang), 15) +
+  $('#facets').innerHTML = status + fileKindsBlock() + block('Languages', 'lang', tally(forLang, r => r.lang), 15) +
     block('Topics', 'topic', tally(forTopic, r => r.topics), 30) +
     block('Owners', 'owner', tally(forOwner, r => r.owner).filter(([v, c]) => c > 1 || v === filters.owner), 15);
 }
@@ -579,7 +650,7 @@ export function resetListPrefs() {
   resetForks();   // the "not a copy" choices were preferences too
   $('#forkMode').value = 'all';
   $('#sort').value = 'starred';
-  $('#inReadme').checked = $('#inCommits').checked = $('#inReleases').checked = false;   // the indexes they search are gone too
+  $('#inReadme').checked = $('#inCommits').checked = $('#inReleases').checked = $('#inFiles').checked = false;   // the indexes they search are gone too
   setFacetsHidden(false, false);
   limit = PAGE;
 }
@@ -625,7 +696,7 @@ export function initList() {
     limit = PAGE;
     render();
   };
-  $('#inReadme').onchange = () => { limit = PAGE; render(); };
+  $('#inReadme').onchange = $('#inFiles').onchange = () => { limit = PAGE; render(); };
   for (const id of ['#inCommits', '#inReleases']) $(id).onchange = async e => { if (e.target.checked) await prepareHistorySearch(); limit = PAGE; render(); };
   $('#more').onclick = showMore;
   // Infinite scroll: when the button comes near the viewport, load the next step automatically.
@@ -647,10 +718,12 @@ export function initList() {
     if (nc) { notACopy(nc.dataset.notcopy); return; }
     const fam = e.target.closest('#list [data-family], #count [data-family]');
     if (fam) { filters.family = filters.family === fam.dataset.family ? null : fam.dataset.family; limit = PAGE; render(); return; }
+    const fk = e.target.closest('[data-kind]');
+    if (fk) { filters.kind = filters.kind === fk.dataset.kind ? null : fk.dataset.kind; info('list', filters.kind ? `showing only repos with ${kindName(filters.kind)} files` : 'file-kind filter removed'); limit = PAGE; render(); return; }
     const fm = e.target.closest('#facets [data-forkmode]');
     if (fm) { applyForkMode(S.forkMode === fm.dataset.forkmode ? 'all' : fm.dataset.forkmode); return; }
     if (e.target.closest('[data-clear-filters]')) {
-      filters.lang = filters.topic = filters.owner = filters.family = null;
+      filters.lang = filters.topic = filters.owner = filters.family = filters.kind = null;
       filters.gone = false;
       limit = PAGE; render();
       return;

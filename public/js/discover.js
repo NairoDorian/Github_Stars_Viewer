@@ -17,7 +17,7 @@ import {saveDisc, saveStars} from './store.js';
 import {debug, info, warn} from './log.js';
 import {render, searchFor, card} from './list.js';
 import {watchStarCharts} from './starhistory.js';
-import {SORT_OPTIONS, sortRepos} from './sort.js';
+import {SORT_OPTIONS, STARS_ONLY, sortRepos} from './sort.js';
 import {forkVisible, copyOfStar, hiddenCount} from './forks.js';
 
 const DISC_TTL = 3 * DAY;
@@ -405,7 +405,7 @@ let current = null, shown = PAGE;   // result on screen, and how many of its car
 const SORT_PREF = 'starsViewer.discoverySort';
 let discoverySort = 'relevance';
 try { discoverySort = localStorage.getItem(SORT_PREF) || 'relevance'; } catch {}
-if (!SORT_OPTIONS.some(([key]) => key === discoverySort) || discoverySort === 'starred') discoverySort = 'relevance';
+if (!SORT_OPTIONS.some(([key]) => key === discoverySort) || STARS_ONLY.has(discoverySort)) discoverySort = 'relevance';
 
 /** Old discovery caches have fewer fields; normalize them for the shared starred-repo card. */
 function suggestionRepo(x) {
@@ -463,7 +463,7 @@ function showResults(id) {
   const dismissedCount = S.disc.dismissed.length;
   el.dataset.resultId = id;
   el.innerHTML = `<div class="discovery-controls"><span class="muted">${items.length} suggestions · found ${ago(res.at)}</span>
-      <label>Sort <select id="discoverySort" aria-label="Sort suggestions">${SORT_OPTIONS.filter(([key]) => key !== 'starred')
+      <label>Sort <select id="discoverySort" aria-label="Sort suggestions">${SORT_OPTIONS.filter(([key]) => !STARS_ONLY.has(key))
         .map(([key, label]) => `<option value="${key}"${discoverySort === key ? ' selected' : ''}>${label}</option>`).join('')}</select></label>
       ${lastStarred ? `<button data-unstar="${esc(lastStarred)}" title="Unstar ${esc(lastStarred)} on GitHub">↩ Unstar ${esc(lastStarred.split('/')[1] || lastStarred)}</button>` : ''}
       ${dismissedCount ? `<button data-undismiss title="Restore the last dismissed suggestion (${esc(S.disc.dismissed.at(-1))})">↩ Undo dismiss (${dismissedCount})</button>` : ''}

@@ -72,6 +72,15 @@ await page.route('https://api.github.com/**', async r => {
   const u = new URL(r.request().url()), json = (o, s = 200) => r.fulfill({status: s, contentType: 'application/json', body: JSON.stringify(o)});
   if (u.pathname.endsWith('/starred')) return json(names.map(star));
   if (u.pathname === '/rate_limit') return json({resources: {core: {remaining: 5000, limit: 5000, reset: 0}, graphql: {remaining: 4999, limit: 5000, reset: 0}}});
+  const tree = u.pathname.match(/^\/repos\/acme\/(\w+)\/git\/trees\/main$/);   // 📁 Files: alpha is a board (KiCad, STEP, PlatformIO), beta a web app, gamma empty
+  if (tree) {
+    calls.trees = (calls.trees || 0) + 1;
+    if (r.request().headers()['if-none-match'] === '"t1"') return r.fulfill({status: 304, headers: {etag: '"t1"'}});
+    if (tree[1] === 'gamma') return json({message: 'Git Repository is empty.'}, 409);
+    const paths = tree[1] === 'alpha' ? ['hardware/board.kicad_pcb', 'hardware/board.kicad_sch', 'case/lid.step', 'firmware/platformio.ini', 'firmware/src/main.cpp']
+      : ['src/app.ts', 'package.json', 'README.md'];
+    return r.fulfill({status: 200, contentType: 'application/json', headers: {etag: '"t1"'}, body: JSON.stringify({sha: 'x', truncated: false, tree: paths.map(path => ({path, type: 'blob'}))})});
+  }
   if (u.pathname !== '/graphql') return json({}, 404);
   const q = JSON.parse(r.request().postData()).query, data = {};
   if (q.includes('repositoryOwner(')) {   // the Users panel: how many repos has each owner starred
@@ -94,6 +103,8 @@ await page.route('https://api.github.com/**', async r => {
       calls.rel++;
       data[m[1]] = {releases: {pageInfo: {hasNextPage: false, endCursor: 'x'}, nodes: rels.map(x => ({...x, name: '', isDraft: false,
         description: `Notes for ${full}: Quokka mode, thanks @zed-the-author! See https://github.com/acme/${full.slice(5)}/pull/9 and [docs](https://docs.test/a).`}))}};
+    } else if (body.includes('expression:"HEAD:')) {   // README git hashes only (a README check of repos whose details are fresh): no README
+      data[m[1]] = {};
     } else if (body.includes('object(expression:')) {   // a page of commit history, from a commit, optionally after a cursor "<commit> <index>"
       slow = true;
       const start = body.match(/expression:"([0-9a-f]{40})"/)[1], after = body.match(/after:"([0-9a-f]{40}) (\d+)"/);
@@ -129,6 +140,8 @@ try {
   await page.goto(base + '/');
   await waitStatus(/all checked/);
   step('loads a profile with 3 stars', await status());
+  // The status line can be written a moment before the panel and the log are redrawn: wait for them, then check.
+  await until(() => ['stars:done', 'details:done'].every(l => window.__lanes.has(l)), null, 5000).catch(() => {});
   const firstLanes = await lanesSeen();
   for (const lane of ['stars:done', 'details:done']) assert.ok(firstLanes.includes(lane), `the first load shows its steps (${lane}): ${firstLanes}`);
   step('first load: the star-list pull and the details update are shown as steps, then done');
@@ -141,14 +154,15 @@ try {
   assert.match(gamma, /no releases/);
   // ---- the activity log beside the progress bars ----
   const logText = async () => page.locator('#conBody').innerText();
-  const firstLog = await logText();
-  for (const re of [/Stars Viewer started/, /storage: the local server is running · Keep cache is ON → files in the data\/ folder/, /▶ sync for e2etest/,
+  const logPatterns = [/Stars Viewer started/, /storage: the local server is running · Keep cache is ON → files in the data\/ folder/, /▶ sync for e2etest/,
     /── phase 1 of 7: downloading the star list/, /── phase 7 of 7: done: 3 stars on screen/, /address bar → http:\/\/localhost:\d+\/\?user=e2etest/,
     /#\d+ → GET https:\/\/api\.github\.com\/users\/e2etest\/starred\?per_page=100&page=1 · with the date of each star · token attached \(never logged\)/,
     /#\d+ ← GET \/users\/e2etest\/starred\?per_page=100&page=1 → 200 in \d+ ms/, /▶ step 1 of 2: Pull the star list/,
     /POST https:\/\/api\.github\.com\/graphql \(details of 3 repos, full\) · [\d,]+ bytes · asks 3 repositories \[acme\/alpha, acme\/beta, acme\/gamma\] for: last commit, the 5 newest releases, languages, 12-month commit activity/,
-    /star list page 1: 3 repos downloaded/, /compared with the cache: 3 repos on GitHub · 3 new/, /new stars: acme\/alpha/, /POST \/graphql \(details of 3 repos, full\) → 200/, /✓ Update repo details/])
-    assert.match(firstLog, re, 'the log tells: ' + re);
+    /star list page 1: 3 repos downloaded/, /compared with the cache: 3 repos on GitHub · 3 new/, /new stars: acme\/alpha/, /POST \/graphql \(details of 3 repos, full\) → 200/, /✓ Update repo details/];
+  await until(sources => sources.every(src => new RegExp(src).test(document.querySelector('#conBody').innerText)), logPatterns.map(re => re.source), 5000).catch(() => {});
+  const firstLog = await logText();
+  for (const re of logPatterns) assert.match(firstLog, re, 'the log tells: ' + re);
   assert.ok(!firstLog.includes('ghp_fake') && !firstLog.includes('Bearer'), 'the token is never in the log');
   const box = await page.locator('#console').boundingBox(), lanes = await page.locator('#lanes').boundingBox().catch(() => null);
   if (lanes) assert.ok(box.x > lanes.x, 'the log is to the right of the progress bars');
@@ -205,20 +219,24 @@ try {
 
   // ---- toolbar groups and the collapsible options panel ----
   assert.deepEqual(await page.locator('.grp-label').allInnerTexts(), ['ALSO SEARCH IN', 'PULL FOR SEARCH', 'VIEW']);
-  for (const id of ['#indexReadme', '#indexCommits', '#indexReleases', '#inCommits', '#inReleases']) assert.ok(await page.$(id), id + ' exists');
-  assert.equal(await page.isHidden('#histOpts'), true, 'options panel starts collapsed');
-  assert.match(await page.textContent('#histOptsSummary'), /@mentions stripped · links kept/);
-  await page.click('#histOptsToggle');
-  assert.equal(await page.isVisible('#histOpts'), true);
-  assert.equal(await page.getAttribute('#histOptsToggle', 'aria-expanded'), 'true');
+  for (const id of ['#indexReadme', '#indexCommits', '#indexReleases', '#indexFiles', '#inCommits', '#inReleases', '#inFiles']) assert.ok(await page.$(id), id + ' exists');
+  assert.equal(await page.$('#histOpts'), null, 'no big options box any more');
+  for (const k of ['readmes', 'commits', 'releases', 'files']) assert.equal(await page.isHidden('#menu-' + k), true, k + ' menu starts closed');
+  await page.click('#caret-releases');
+  assert.equal(await page.isVisible('#menu-releases'), true, 'the ▾ opens a small menu under its button');
+  assert.equal(await page.getAttribute('#caret-releases', 'aria-expanded'), 'true');
   assert.equal(await page.isChecked('#optMentions'), true); assert.equal(await page.isChecked('#optLinks'), false);
+  await page.click('#caret-commits');
+  assert.deepEqual([await page.isHidden('#menu-releases'), await page.isVisible('#menu-commits')], [true, true], 'one menu open at a time');
   assert.equal(await page.inputValue('#optCommits'), '1000', '1,000 commits per repo by default');
   const choices = await page.locator('#optCommits option').evaluateAll(os => os.map(o => o.value));
   assert.ok(choices.length >= 8 && choices.at(-1) === '0', 'many commit limits, ALL last: ' + choices);
   assert.equal(await page.$('#optNotes'), null, 'no release-notes length choice: always whole');
   await page.selectOption('#optCommits', '10000');   // the fake repos hold 5,000 commits each: index all of them
-  await until(() => /Saved|Applied/.test(document.querySelector('#optNote').textContent), null, 10000);
-  step('toolbar is grouped; ⚙ opens the options panel (mentions stripped, links kept, 1,000 commits by default)');
+  await until(() => /Saved|Applied/.test(document.querySelector('#note-commits').textContent), null, 10000);
+  await page.keyboard.press('Escape');
+  assert.equal(await page.isHidden('#menu-commits'), true, 'Escape closes it');
+  step('toolbar is grouped; each Pull button has its own ▾ menu (mentions stripped, links kept, 1,000 commits by default)');
   await page.screenshot({path: process.env.E2E_SHOT || 'e2e-toolbar.png'});
 
   // ---- releases on their own: no commit is fetched ----
@@ -277,15 +295,17 @@ try {
 
   // ---- options change stored text without any request ----
   Object.assign(calls, {first: 0, after: 0, seq: 0, rel: 0});
+  await page.click('#caret-releases');
   await page.check('#optLinks');
-  await until(() => /Applied to the stored release notes of 2 repos/.test(document.querySelector('#optNote').textContent), null, 10000);
+  await until(() => /Applied to the stored release notes of 2 repos/.test(document.querySelector('#note-releases').textContent), null, 10000);
   assert.match(await search('pull/9'), /^0 of 3/, 'links stripped from stored notes');
   assert.match(await search('docs'), /^2 of 3/, 'markdown link text survives');
   assert.equal(calls.rel + calls.first + calls.after + calls.seq, 0, 'stripping needs no download');
   await page.uncheck('#optLinks');
-  await until(() => /downloaded again/.test(document.querySelector('#optNote').textContent), null, 10000);
+  await until(() => /download them again/.test(document.querySelector('#note-releases').textContent), null, 10000);
+  await page.keyboard.press('Escape');
   assert.match(await search('pull/9'), /^0 of 3/, 'the stripped text can not come back until it is downloaded again');
-  await page.click('#optReleases2');   // (the panel's button = 🏷 Releases) the status still shows the previous run's "🔎 … indexed": wait for this job to end
+  await page.click('#indexReleases');   // the status still shows the previous run's "🔎 … indexed": wait for this job to end
   await page.waitForSelector('#cancelTask', {state: 'hidden', timeout: 60000});
   await waitStatus(/🔎 .*indexed/);
   assert.equal(calls.rel, 2, 'only the release notes of repos that have releases are fetched again');
@@ -294,12 +314,73 @@ try {
   step('toggling links: stripped locally, restored by re-fetching releases only');
 
   // ---- "no limit" values ----
+  await page.click('#caret-commits');
   await page.selectOption('#optCommits', '0');
-  await until(() => /ALL commits/.test(document.querySelector('#optNote').textContent), null, 10000);
+  await until(() => /ALL commits/.test(document.querySelector('#note-commits').textContent), null, 10000);
   assert.equal(await page.$('#optNotes'), null, 'release notes are always whole: no length choice');
-  assert.match(await page.textContent('#histOptsSummary'), /ALL commits per repo · @mentions stripped/);
+  assert.match(await page.getAttribute('#indexCommits', 'title'), /ALL of them per repo/);
+  await page.keyboard.press('Escape');
   assert.match(await search('zebra crash'), /^1 of 3/, 'changing a cap never loses what is stored');
-  step('the commits dropdown offers ALL commits; release notes are always whole');
+  step('the commits menu offers ALL commits; release notes are always whole');
+
+  // ---- 📁 Files: one tree per repo, kinds in the sidebar and on the cards, has: / ext: / path: search ----
+  await page.fill('#q', '');
+  calls.trees = 0;
+  await page.click('#indexFiles');
+  await waitStatus(/📁 8 files listed in 3 repos/, 30000);
+  assert.equal(calls.trees, 3, 'one request per repo');
+  assert.equal(await page.isChecked('#inFiles'), true);
+  assert.match(await page.textContent('#facets'), /File kinds[\s\S]*PCB & schematic sources\s*1[\s\S]*Embedded firmware\s*1[\s\S]*3D CAD models\s*1/);
+  assert.match(await search('has:pcb'), /^1 of 3/);
+  assert.match(await search('has:hardware -has:3d'), /^0 of 3/);
+  assert.match(await search('ext:step'), /^1 of 3/);
+  assert.match(await search('build:platformio'), /^1 of 3/);
+  assert.match(await search('lid.step'), /^1 of 3/, 'file names are searched');
+  assert.match(await page.locator('.snip').first().innerText(), /File .*case\/lid\.step/);
+  await page.fill('#q', '');
+  await page.click('#facets [data-kind="pcb"]');
+  assert.match(await count(), /^1 of 3/, 'the sidebar row filters');
+  await page.click('#count [data-kind="pcb"]');   // the pill removes it
+  assert.match(await count(), /^3 of 3/);
+  if (process.env.E2E_FILES) { await page.click('#caret-files'); await page.screenshot({path: process.env.E2E_FILES}); await page.keyboard.press('Escape'); }   // optional: the menu, the sidebar and the cards
+  await page.selectOption('#sort', 'hardware');
+  assert.match(await page.locator('.card a').first().innerText(), /alpha/, 'Most hardware files first');
+  await page.selectOption('#sort', 'starred');
+  calls.trees = 0;
+  await page.click('#indexFiles');   // nothing pushed since: nothing to ask
+  await waitStatus(/file lists up to date|0 fetched/, 30000);
+  assert.equal(calls.trees, 0, 'repos not pushed since are not asked again');
+  step('📁 Files: file kinds, has: / ext: / path: search, sidebar filter, hardware sort');
+
+  // ---- 🗑 per category: clearing commits keeps the release notes ----
+  await page.click('#caret-commits');
+  await page.click('#clearCommits');
+  assert.match(await page.textContent('#clearCommits'), /Click again/);
+  await page.click('#clearCommits');
+  await waitStatus(/Commit messages of 3 repos deleted \(release notes kept\)/, 10000);
+  await page.check('#inReleases');
+  assert.match(await search('quokka'), /^2 of 3/, 'release notes still searchable');
+  assert.match(await search('zebra crash'), /^0 of 3/, 'commits gone');
+  await page.fill('#q', '');
+  await page.keyboard.press('Escape');
+  calls.rel = 0;
+  await page.click('#indexCommits');   // and pulled back for the rest of the test
+  await waitStatus(new RegExp(`🔎 ${TOTAL.toLocaleString()} commit messages indexed`), 60000);
+  assert.equal(calls.rel, 0, 'pulling commits back fetched no release');
+  step('🗑 clears one category only (commits), and 📝 Commits pulls them back');
+
+  // ---- ⬇ Pull all: the four categories in one job, every step announced up front ----
+  calls.trees = 0; calls.rel = 0;
+  {
+    await page.evaluate(() => window.__lanes.clear());
+    await page.click('#pullAll');
+    await waitStatus(/⬇ Pulled all: .*READMEs.*🔎 .*commit messages and .*releases indexed.*file lists up to date/, 60000);
+    const seen = await lanesSeen();
+    for (const lane of ['readmes', 'check', 'releases', 'commits', 'files']) assert.ok(seen.some(l => l.startsWith(lane + ':')), `step ${lane} shown: ${seen}`);
+    assert.equal(calls.trees, 0, 'nothing pushed since: no tree asked again');
+    assert.equal(await page.isChecked('#inReadme') && await page.isChecked('#inCommits') && await page.isChecked('#inReleases') && await page.isChecked('#inFiles'), true, 'every search box on');
+  }
+  step('⬇ Pull all runs the four categories in one job', await status());
 
   // ---- reload: state comes back from the shards, panel state is remembered ----
   await page.fill('#q', '');
@@ -307,7 +388,6 @@ try {
   // "N stars" shows as soon as the star list is read, before the commit index is; the check that follows the load means
   // everything was read.
   await waitStatus(/all checked/);
-  assert.equal(await page.isVisible('#histOpts'), true, 'panel stays open');
   assert.equal(await page.inputValue('#optCommits'), '0', 'the "no limit" choice is remembered');
   await page.check('#inCommits'); await page.check('#inReleases');
   assert.match(await search('zebra crash'), /^1 of 3/);

@@ -4,6 +4,8 @@ import {$} from './util.js';
 import {ghFetch, headers, forgetMe} from './github.js';
 import {saveConfig} from './store.js';
 import {info, warn} from './log.js';
+import {setBudgets, budgetNow, budgetLine} from './budget.js';
+import {readBudget} from './github.js';
 
 const PANEL_STATE = 'tokenPanelOpen';   // localStorage: remembered open/closed state (a UI preference only)
 
@@ -25,8 +27,9 @@ async function checkToken() {
       return;
     }
     if (!r.ok) throw new Error(`GitHub answered ${r.status} while checking the token; try again in a moment.`);
-    const {resources: {core, graphql}} = await r.json();
+    const {resources} = await r.json(), {core, graphql} = resources;
     if (token !== S.token) return;
+    setBudgets(resources);   // the real budget left this hour, including what other tabs and scripts used (budget.js)
     const scopes = r.headers.get('X-OAuth-Scopes');   // classic tokens only; null for fine-grained tokens
     info('token', S.token ? `token accepted · ${scopes == null ? 'fine-grained token' : 'classic token, scopes: ' + (scopes || 'none')} · REST budget ${core.remaining.toLocaleString()}/${core.limit.toLocaleString()} (resets ${new Date(core.reset * 1000).toLocaleTimeString()})${graphql ? ' · GraphQL budget ' + graphql.remaining.toLocaleString() + '/' + graphql.limit.toLocaleString() : ''}`
       : `no token · REST budget ${core.remaining}/${core.limit} per hour (resets ${new Date(core.reset * 1000).toLocaleTimeString()})`);
@@ -35,6 +38,32 @@ async function checkToken() {
     limit.textContent = `${S.token ? '✅ Token OK' + star : 'No token'} · REST: ${core.remaining}/${core.limit} left ` +
       `(resets ${new Date(core.reset * 1000).toLocaleTimeString()})` + (graphql ? ` · GraphQL: ${graphql.remaining}/${graphql.limit}` : '');
   } catch (e) { if (token === S.token) limit.textContent = '⚠ ' + e.message; }
+}
+
+// ---- the ⛽ budget indicator in the top bar ----
+const USES = {core: 'star list, file lists, READMEs without a token', graphql: 'details, READMEs, commits, releases, Users', search: 'Discover'};
+/** Draws the ⛽ indicator: what is left of the REST and GraphQL budgets, with every budget and its refill time in the tooltip. */
+function drawBudget() {
+  const btn = $('#budget');
+  if (!btn) return;
+  const core = budgetNow('core'), gql = S.token ? budgetNow('graphql') : null;
+  if (!core && !gql) { btn.textContent = '⛽ budget ?'; return; }
+  const low = [core, gql].some(b => b && b.limit && b.remaining / b.limit < 0.1);
+  btn.classList.toggle('low', low);
+  btn.textContent = `⛽ ${[core && `REST ${core.remaining.toLocaleString()}`, gql && `GraphQL ${gql.remaining.toLocaleString()}`].filter(Boolean).join(' · ')}`;
+  btn.title = `What is left of GitHub's budgets (${S.token ? 'they belong to your token' : 'without a token: to your IP address'}, so other tabs, scripts and earlier visits count too):\n` +
+    ['core', 'graphql', 'search'].filter(k => budgetNow(k)).map(k => `• ${budgetLine(k)}: ${USES[k]}`).join('\n') +
+    '\nREST and GraphQL refill one hour after the first request of their window, search after a minute. A pull that runs out waits for the refill and continues. Click to read them again from GitHub (free).';
+}
+export function initBudget() {
+  window.addEventListener('budget', drawBudget);
+  setInterval(drawBudget, 15_000);   // the countdown in the tooltip, and a refilled budget shows full again
+  $('#budget').onclick = async () => {
+    await readBudget();
+    info('budget', `read from GitHub: ${['core', 'graphql', 'search'].map(budgetLine).join(' · ')}`);
+    drawBudget();
+  };
+  drawBudget();
 }
 
 /** Opens or closes the panel. `remember` saves the choice; panels opened automatically aren't remembered. */

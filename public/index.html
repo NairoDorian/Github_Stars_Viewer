@@ -38,6 +38,7 @@
       <label title="Also search the text of every pulled README (pull them with 📄 READMEs below)"><input type="checkbox" id="inReadme"> READMEs <span class="muted" id="cntReadme"></span></label>
       <label title="Also search every pulled commit message (pull them with 📝 Commits below)"><input type="checkbox" id="inCommits"> Commits <span class="muted" id="cntCommits"></span></label>
       <label title="Also search every pulled release: tag, title and whole notes (pull them with 🏷 Releases below)"><input type="checkbox" id="inReleases"> Releases <span class="muted" id="cntReleases"></span></label>
+      <label title="Also search the file names and paths of every pulled file list (pull them with 📁 Files below). Search qualifiers: has:pcb, has:3d, has:hardware, has:firmware, ext:stl, path:gerber"><input type="checkbox" id="inFiles"> Files <span class="muted" id="cntFiles"></span></label>
     </div>
   </div>
 </header>
@@ -58,11 +59,41 @@ if (self !== top) document.documentElement.hidden = true;   // framed by another
 <div class="bar">
   <div class="grp" role="group" aria-label="Pull for search">
     <span class="grp-label">Pull for search</span>
-    <button id="indexReadme" title="Downloads the README of every starred repo so the search can look inside them. Later checks only fetch the READMEs that changed.">📄 READMEs</button>
-    <button id="indexCommits" title="Downloads the commit messages of every starred repo, newest first, up to the limit set in ⚙ (needs a token). Later checks only fetch new commits.">📝 Commits</button>
-    <button id="indexReleases" title="Downloads every release of every starred repo: tag, title and the whole release notes (needs a token). Later checks only fetch release lists that changed.">🏷 Releases</button>
-    <button id="histOptsToggle" aria-expanded="false" aria-controls="histOpts" title="Commits per repo, and stripping @mentions / links from release notes" aria-label="Commit and release options">⚙ Options</button>
-    <span id="histOptsSummary" class="muted small"></span>
+    <button id="pullAll" class="accent" title="Pulls all four in one go: READMEs, commit messages, release notes and file lists. Only what is missing or changed is downloaded; Cancel keeps the progress and the next click continues.">⬇ Pull all</button>
+    <span class="split">
+      <button id="indexReadme" title="Downloads the README of every starred repo so the search can look inside them. Later checks only fetch the READMEs that changed.">📄 READMEs</button><button id="caret-readmes" class="caret" aria-expanded="false" aria-controls="menu-readmes" aria-label="README options" title="Options">▾</button>
+      <div class="menu" id="menu-readmes" role="group" aria-label="READMEs" hidden>
+        <p class="menu-stat" id="stat-readmes"></p>
+        <button id="clearReadmes" class="danger"></button>
+      </div>
+    </span>
+    <span class="split">
+      <button id="indexCommits">📝 Commits</button><button id="caret-commits" class="caret" aria-expanded="false" aria-controls="menu-commits" aria-label="Commit options" title="Options">▾</button>
+      <div class="menu" id="menu-commits" role="group" aria-label="Commits" hidden>
+        <label title="How many commit messages are kept per repo, newest first. Lowering it trims what is stored at once; raising it downloads the rest at the next pull.">Per repo <select id="optCommits" aria-label="Commits per repo"></select></label><!-- options come from COMMIT_CHOICES in js/history.js -->
+        <p class="menu-note" id="note-commits"></p>
+        <p class="menu-stat" id="stat-commits"></p>
+        <button id="clearCommits" class="danger"></button>
+      </div>
+    </span>
+    <span class="split">
+      <button id="indexReleases" title="Downloads every release of every starred repo: tag, title and the whole release notes (needs a token). Later checks only fetch release lists that changed.">🏷 Releases</button><button id="caret-releases" class="caret" aria-expanded="false" aria-controls="menu-releases" aria-label="Release options" title="Options">▾</button>
+      <div class="menu" id="menu-releases" role="group" aria-label="Releases" hidden>
+        <label title="Removes @username mentions from release notes (credits, “by @user”, contributor lists). Code, e-mail addresses and scoped packages like @types/node are left alone. Applied to stored notes at once."><input type="checkbox" id="optMentions"> Strip @mentions</label>
+        <label title="Removes links from release notes (markdown links keep their text). Leave off to keep links searchable."><input type="checkbox" id="optLinks"> Strip links</label>
+        <p class="menu-note" id="note-releases"></p>
+        <p class="menu-stat" id="stat-releases"></p>
+        <button id="clearReleases" class="danger"></button>
+      </div>
+    </span>
+    <span class="split">
+      <button id="indexFiles" title="Lists the files of every starred repo: names and folders only, no file is downloaded (one request per repo, 304 = free when unchanged). Shows what a repo holds: PCB and schematic sources, Gerbers, 3D models, firmware, notebooks…">📁 Files</button><button id="caret-files" class="caret" aria-expanded="false" aria-controls="menu-files" aria-label="File list options" title="Options">▾</button>
+      <div class="menu" id="menu-files" role="group" aria-label="Files" hidden>
+        <p class="menu-stat" id="stat-files"></p>
+        <p class="menu-note">Search: <code>has:pcb</code> <code>has:3d</code> <code>has:hardware</code> <code>has:firmware</code> <code>has:platformio</code> <code>ext:stl</code> <code>path:gerber</code> <code>files:&gt;1000</code></p>
+        <button id="clearFiles" class="danger"></button>
+      </div>
+    </span>
   </div>
   <div class="grp" role="group" aria-label="View">
     <span class="grp-label">View</span>
@@ -73,6 +104,7 @@ if (self !== top) document.documentElement.hidden = true;   // framed by another
     <button id="enrich" title="Re-downloads the last commit and last release of every repo (shown on the cards and used by the Last commit / Last release sorting). With a token they are kept up to date automatically.">🕒 Refresh tiles</button>
   </div>
   <div class="statusrow">
+    <button id="budget" class="pill" title="GitHub's budgets: not read yet">⛽ budget ?</button>
     <button id="cancelTask" hidden title="Stop after the current batch; what was fetched so far is kept and the next run continues from there">■ Cancel</button>
     <span id="status" role="status"></span>
   </div>
@@ -95,23 +127,6 @@ if (self !== top) document.documentElement.hidden = true;   // framed by another
     <div id="conBody" role="log" aria-live="off" tabindex="0"></div>
   </section>
 </div>
-
-<section id="histOpts" hidden aria-label="Commit and release index options">
-  <h3>Commit &amp; release options</h3>
-  <div class="opt-grid">
-    <label title="Removes @username mentions from release notes (credits, “by @user”, contributor lists). Code, e-mail addresses and scoped packages like @types/node are left alone. Applied to stored notes at once."><input type="checkbox" id="optMentions"> Strip @mentions from release notes</label>
-    <label title="Removes links from release notes (markdown links keep their text). Leave off to keep links searchable: after compression they cost little."><input type="checkbox" id="optLinks"> Strip links from release notes</label>
-    <label title="How many commit messages are kept per repo, newest first. Lowering it trims what is stored at once; raising it downloads the rest at the next index. Release notes are always kept whole.">Commits per repo
-      <select id="optCommits" aria-label="Commits per repo"></select></label><!-- options come from COMMIT_CHOICES in js/history.js (filled by histopts.js) -->
-  </div>
-  <p id="optNote" class="muted small"></p>
-  <p id="optStats" class="muted small"></p>
-  <div class="opt-actions">
-    <button id="optCommits2" title="Same as 📝 Commits in the toolbar: pulls the commits the limit above now asks for">📝 Pull commits</button>
-    <button id="optReleases2" title="Same as 🏷 Releases in the toolbar: pulls release notes that need downloading again">🏷 Pull releases</button>
-    <button id="optClear" title="Deletes the stored commit messages and release notes of this profile (the next index downloads them again)">Clear commit &amp; release index</button>
-  </div>
-</section>
 
 <section id="tokenPanel">
   <div class="tp-head" id="tpToggle" role="button" tabindex="0" aria-expanded="false" aria-controls="tpBody">

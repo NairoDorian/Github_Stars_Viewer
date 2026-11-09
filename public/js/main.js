@@ -5,9 +5,12 @@
 //   state.js        the shared state object S, generation/cancellation, per-repo cache keys, search-text caches
 //   store.js        the cache: ./data files via server.js locally, or IndexedDB / memory online; sharded history; visit memory
 //   github.js       GitHub REST/GraphQL client: retries, rate limits, batching, data mapping, last commit / release
+//   budget.js       GitHub's budgets (rate limits): learned from every answer and /rate_limit, refill times, waiting
 //   sync.js         keeping stars, tiles and READMEs in sync with GitHub cheaply; one job at a time per profile
 //   history.js      every commit message and release note of every star: fetching, options, stripping
-//   histopts.js     the ▾ options panel of the commit & release index
+//   filekinds.js    what file names say about a repo (PCB sources, 3D models, firmware…): pure rules
+//   files.js        the file list (names only) of every star: fetching, top-up, clearing
+//   pullmenus.js    the ▾ menus of the four Pull buttons: options and 🗑 clear per category
 //   progress.js     the live progress panel: one bar per step, counts, speed, time left
 //   sort.js         shared ordering rules (stars and Discover results)
 //   list.js         search, qualifiers, facet filters, export, repo cards
@@ -22,15 +25,17 @@
 import {S, ukey, nextGen, bumpIndex, isMine, mineOf} from './state.js';
 import {starredOf} from './github.js';
 import {initLog, LOG, info, warn, debug} from './log.js';
-import {$, ago, esc, status} from './util.js';
-import {get, peek, saveConfig, initStore, setPersist, persisting, isUnreadable, clearAll, saveAll, loadHistory, forgetHistoryDirty, setVisit, adoptProfile, CACHE_VERSION} from './store.js';
-import {task, waitIdle, sync, enrich, indexReadmes, migrateReadmes} from './sync.js';
-import {indexCommits, indexReleases} from './history.js';
-import {initHistOpts, resetHistOpts, reconcileStored} from './histopts.js';
+import {$, ago, esc, status, secs} from './util.js';
+import {get, peek, saveConfig, initStore, setPersist, persisting, isUnreadable, clearAll, saveAll, loadHistory, loadFiles, forgetHistoryDirty, setVisit, adoptProfile, CACHE_VERSION} from './store.js';
+import {task, waitIdle, sync, enrich, indexReadmes, readmeSteps, migrateReadmes} from './sync.js';
+import {indexCommits, indexReleases, indexHistory} from './history.js';
+import {initPullMenus, resetHistOpts, reconcileStored} from './pullmenus.js';
+import {plan} from './progress.js';
+import {indexFiles} from './files.js';
 import {render, initList, resetFilters, resetListPrefs, prepareHistorySearch} from './list.js';
 import {initDiscover, closeDiscover, resetDiscoverPrefs} from './discover.js';
 import {initUsers, closeUsers, renderUsers, resetUsersPrefs} from './users.js';
-import {initToken, setToken} from './token.js';
+import {initToken, setToken, initBudget} from './token.js';
 import {forgetStarCharts} from './starhistory.js';
 
 /** The profile the LOCAL app opens when none is named or saved (the online version starts with an empty box). */
@@ -136,6 +141,7 @@ async function load({login, visit, push = false, why = ''} = {}) {
     S.starPages = (stars?.v || 0) >= CACHE_VERSION ? stars.pages || [] : [];
     S.readmes = {};
     S.history = {};
+    S.files = {};
     S.users = {};
     S.disc = disc || {dismissed: [], results: {}};
     info('load', `cache of ${u}: ${stars ? S.repos.length.toLocaleString() + ' stars saved ' + ago(stars.at) + ' (format v' + (stars.v || 1) + ((stars.v || 0) < CACHE_VERSION ? ', older: page ETags dropped, the list is downloaded once more' : '') + ')' : visiting ? 'nothing is read for a visit' : isUnreadable('stars:' + ukey()) ? 'the star list could not be read (kept untouched)' : 'no star list saved yet'} · ${disc ? Object.keys(disc.results || {}).length + ' Discover result(s), ' + (disc.dismissed || []).length + ' dismissed' : 'no Discover data'}`);
@@ -147,10 +153,11 @@ async function load({login, visit, push = false, why = ''} = {}) {
       : visiting ? `👁 Visiting ${u}: downloading their stars. Nothing is saved.`
       : 'No cache for this user yet, downloading…' + (persisting() ? '' : ' (💾 Keep cache is off: nothing will be saved)'));
 
-    const [readmes, commitHistory, users] = await Promise.all([get('readmes:' + ukey()), loadHistory(g), get('users:' + ukey())]);
+    const [readmes, commitHistory, users, fileLists] = await Promise.all([get('readmes:' + ukey()), loadHistory(g), get('users:' + ukey()), loadFiles(g)]);
     if (g !== S.gen) return;
     S.readmes = readmes || {};
     S.history = commitHistory || {};
+    S.files = fileLists || {};
     S.users = users || {};
     info('load', `cache of ${u}: ${Object.keys(S.readmes).length.toLocaleString()} READMEs · ${Object.keys(S.history).length.toLocaleString()} repos indexed for commits & releases · ${Object.keys(S.users).length.toLocaleString()} user star counts`);
     await reconcileStored(g);   // stored release notes follow the strip / length options
@@ -228,7 +235,7 @@ async function clearEverything() {
   setVisit('');         // a visit ends with everything else
   info('app', '🗑 clearing everything: stored files, IndexedDB, preferences, this tab and the token');
   const {files} = await clearAll();
-  Object.assign(S, {home: '', repos: [], starPages: [], readmes: {}, history: {}, users: {}, disc: {dismissed: [], results: {}}, starCurves: {}});
+  Object.assign(S, {home: '', repos: [], starPages: [], readmes: {}, history: {}, files: {}, users: {}, disc: {dismissed: [], results: {}}, starCurves: {}});
   setToken('', {save: false});
   resetFilters();
   resetListPrefs();      // the stored preferences are gone: the controls show the defaults again
@@ -241,6 +248,23 @@ async function clearEverything() {
   render();
   showVisit();
   status(`🗑 Cleared everything: ${files ? `${files} files in data/, ` : ''}this browser's storage, preferences and this tab. Click “Load stars” to start fresh.`);
+}
+
+/**
+ * "⬇ Pull all": the four categories one after the other in one job: READMEs, then commits and releases (one shared check),
+ * then file lists. Every step is announced up front; Cancel stops after the current batch and the next click continues.
+ * Without a token, commits and releases are skipped (they need GraphQL) and the rest is done over REST.
+ */
+async function pullAll(g) {
+  const t0 = performance.now();
+  info('task', `Pull all: READMEs, ${S.token ? 'commits & releases, ' : '(no token: commits & releases skipped) '}file lists of ${S.repos.length.toLocaleString()} repos`);
+  plan([...readmeSteps(), ...(S.token ? [['check', 'Check commits & releases'], ['releases'], ['commits']] : []), ['files']]);
+  const parts = [await indexReadmes(g, {planned: true})];
+  if (S.token && g === S.gen && !S.stop) parts.push(await indexHistory(g, {planned: true}));
+  if (g === S.gen && !S.stop) parts.push(await indexFiles(g, {planned: true}));
+  if (g !== S.gen) return;
+  const done = parts.filter(Boolean).join(' · ');
+  status(`⬇ ${S.stop ? 'Pull all stopped (progress saved: click again to continue)' : 'Pulled all'}: ${done}${S.token ? '' : ' · commits & releases need a token (🔑)'} · ${secs(t0)}`);
 }
 
 /** Two clicks (no native dialog) before anything is deleted. */
@@ -277,8 +301,9 @@ if (location.protocol !== 'file:') {   // ES modules can't run from file://; ind
   S.home = parseUser(String(config.user || '')) || (asked ? parseUser(params.get('user') || '') : '');   // ?user=<you>&visit=<them> names you when nothing is stored
   S.starCurves = (await get('starcurves')) || {};
   info('app', `config: ${S.home ? 'your profile is ' + S.home : 'no profile saved yet'} · token ${config.token ? 'found' : 'not set'} · ${Object.keys(S.starCurves).length.toLocaleString()} star-history charts cached`);
-  initToken(config.token || '');
-  initHistOpts();
+  initToken(config.token || '');   // its check reads every budget from GitHub (GET /rate_limit, free)
+  initBudget();
+  initPullMenus();
   // Only the local app (server.js running) opens a profile by itself when none is named or saved; online starts empty.
   $('#user').value = asked || params.get('user') || S.home || (storeInfo.serverUp ? LOCAL_DEFAULT_USER : '');
 
@@ -288,6 +313,8 @@ if (location.protocol !== 'file:') {   // ES modules can't run from file://; ind
   $('#refresh').onclick = () => task(sync);
   $('#enrich').onclick = () => task(enrich);
   $('#indexReadme').onclick = () => task(indexReadmes);
+  $('#indexFiles').onclick = () => task(indexFiles);
+  $('#pullAll').onclick = () => task(pullAll);
   $('#indexCommits').onclick = () => task(indexCommits);
   $('#indexReleases').onclick = () => task(indexReleases);
   $('#cancelTask').onclick = () => { S.stop = true; status('■ Stopping after the current batch (progress is kept)…'); };

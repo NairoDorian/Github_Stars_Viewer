@@ -11,6 +11,7 @@ export const S = {
   starPages: [],     // [{etag, ids}] per star-list page, for conditional (304) re-fetches
   readmes: {},       // {<repo id>: {t: text, sha, path, etag, at, pushed}}
   history: {},       // {<repo id>: {head, tail, c: [[oid10, unix s, message]…], rel: [[tag, name, unix s, notes, pre]…], done, capped, …}} (history.js)
+  files: {},         // {<repo id>: {p: [file paths…], n, s: summary, pushed, at, etag, …}}: the file list of each repo, names only (files.js)
   indexVer: 0,       // bumped when README / history text changes, so cached search facets are rebuilt
   disc: {dismissed: [], results: {}},   // discovery cache (see discover.js)
   users: {},         // {<owner login lower-cased>: {at, type, stars, followers, name} | {at, missing}}: how many repos each user of your stars starred (users.js)

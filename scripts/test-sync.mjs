@@ -222,7 +222,7 @@ test('a page that fails stops the check and leaves the cached list untouched', a
     const repos = S.repos, pages = S.starPages;
 
     fakeStarList([...list, star(999)], {fail: page => page === 2});
-    await assert.rejects(sync(g), /Rate limited/);
+    await assert.rejects(sync(g), /REST budget is used up/);
     assert.equal(S.repos, repos, 'a partial list never replaces the cache');
     assert.equal(S.starPages, pages);
   });
@@ -345,7 +345,7 @@ test('a renamed repo is found by its id: when it is not in the list it is unstar
 test('no token, no cache and too little budget for the whole list: the newest pages are shown read-only, nothing is saved, no budget is wasted', async () => {
   await check(async g => {
     const calls = fakeStarList(Array.from({length: 450}, (_, i) => star(i + 1)), {left: 2});   // 5 pages, but only 2 requests left after page 1
-    await assert.rejects(sync(g), /Rate limited: without a token.*Showing the 300 newest of about 500 stars/);
+    await assert.rejects(sync(g), /REST budget is used up: without a token.*Showing the 300 newest of about 500 stars/);
     assert.deepEqual(calls.map(c => c.page).sort(), [1, 2, 3], 'only as many pages as the budget allows');
     assert.equal(S.repos.length, 300, 'the pages that arrived are on screen');
     assert.deepEqual(S.starPages, [], 'but they are not the star list: no ETags, nothing saved');
@@ -356,7 +356,7 @@ test('the budget running out while the pages arrive also shows what arrived; a c
   await check(async g => {
     const list = Array.from({length: 450}, (_, i) => star(i + 1));
     fakeStarList(list, {fail: page => page >= 3});   // no budget header on the first page: only the 403s tell
-    await assert.rejects(sync(g), /Rate limited/);
+    await assert.rejects(sync(g), /REST budget is used up/);
     assert.ok(S.repos.length >= 100 && S.repos.length <= 200, 'pages 1 and 2 are shown, not the failed ones: ' + S.repos.length);
 
     Object.assign(S, {repos: [], starPages: []});
@@ -365,7 +365,7 @@ test('the budget running out while the pages arrive also shows what arrived; a c
     assert.equal(S.repos.length, 450);
     const repos = S.repos;
     fakeStarList(list, {fail: page => page >= 3, left: 0});
-    await assert.rejects(sync(g), /Rate limited/);
+    await assert.rejects(sync(g), /REST budget is used up/);
     assert.equal(S.repos, repos, 'with a cache the cached list stays exactly as it was');
   });
 });

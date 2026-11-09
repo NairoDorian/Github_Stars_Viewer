@@ -20,10 +20,12 @@ import {S, rkey, ukey, bumpIndex, indexedParts} from './state.js';   // S.visit:
 import {$, DAY, status, secs, pool, chunks} from './util.js';
 import {plan, start, report, finish, stopAll, settle} from './progress.js';
 import {gh, ghFetch, headers, gqlRepos, isFatalError, mapStar, gitSha, needToken, LANG_FIELDS, LAST_FIELDS, parseLast, languageShares, activityFields, parseActivity, recordStars} from './github.js';
-import {saveStars, saveReadmes, saveHistory, saveUsers, markHistory} from './store.js';
+import {saveStars, saveReadmes, saveHistory, saveUsers, markHistory, saveFiles, markFiles} from './store.js';
 import {debug, info, warn, error, names} from './log.js';
 import {render} from './list.js';
 import {syncHistory, partsLabel} from './history.js';
+import {fetchFiles, needsFiles} from './files.js';
+import {inTime} from './budget.js';
 
 const ENRICH_MAX_AGE = 7 * DAY, README_MAX_AGE = 30 * DAY;
 // READMEs are the first source of information and are never trimmed. Older versions cut them at this many characters;
@@ -214,14 +216,14 @@ async function fetchStarPages(g) {
   const rateError = total => {
     const got = pages.filter(Boolean), n = got.reduce((a, p) => a + p.items.length, 0);
     needToken();   // opens the token panel, like any other rate-limit error
-    return Object.assign(new Error(`Rate limited: without a token GitHub allows 60 requests an hour${first.left != null ? ` (${first.left} were left)` : ''}${first.reset ? `, resets ${new Date(first.reset * 1000).toLocaleTimeString()}` : ''}. Showing the ${n.toLocaleString()} newest of about ${(total * 100).toLocaleString()} stars: add a token to load them all`),
-      {fatal: true, partial: got});
+    return Object.assign(new Error(`GitHub's REST budget is used up: without a token GitHub allows 60 requests an hour${first.left != null ? ` (${first.left} were left)` : ''}${first.reset ? `, refilling at ${new Date(first.reset * 1000).toLocaleTimeString()} (in ${inTime(first.reset * 1000 - Date.now())})` : ''}. Showing the ${n.toLocaleString()} newest of about ${(total * 100).toLocaleString()} stars: add a token (5,000 an hour) to load them all`),
+      {fatal: true, rateLimited: true, kind: 'core', reset: first.reset || 0, partial: got});
   };
   if (affordable < lastPage) warn('sync', `no token and only ${first.left} request(s) left this hour, but the list has ${lastPage} pages: asking for the newest ${affordable} only, and showing them read-only (nothing is saved)`);
   try { await pool(Array.from({length: affordable - 1}, (_, i) => i + 2), 10, async p => { pages[p - 1] = await fetchPage(p); got++; shown(lastPage); }); }
   catch (e) {
     // the budget ran out while the pages were coming (other tabs or sites share it)
-    if (!S.token && !cachedPages.length && /^Rate limited/.test(e.message)) throw rateError(lastPage);
+    if (!S.token && !cachedPages.length && e.rateLimited) throw rateError(lastPage);
     throw e;
   }
   if (affordable < lastPage) throw rateError(lastPage);
@@ -255,8 +257,10 @@ export async function sync(g) {
   // The steps of this job, shown up front: what exists in the cache decides which later steps will run.
   const phase = (n, what) => info('sync', `── phase ${n} of 7: ${what} (${secs(t0)} since the start)`);
   const parts = indexedParts(), indexed = !!S.token && (parts.commits || parts.releases);   // only the parts that were pulled are topped up
+  const hadFiles = !lite && Object.keys(S.files).length > 0;   // file lists are topped up only once they were pulled
   plan([['stars'], (S.token || S.repos.some(r => r.enrichedAt)) && ['details'], Object.keys(S.readmes).length > 0 && ['readmes'],
-    indexed && ['check', `Check ${partsLabel(parts)}`], indexed && parts.releases && ['releases'], indexed && parts.commits && ['commits']].filter(Boolean));
+    indexed && ['check', `Check ${partsLabel(parts)}`], indexed && parts.releases && ['releases'], indexed && parts.commits && ['commits'],
+    hadFiles && ['files']].filter(Boolean));
   phase(1, `downloading the star list: every page at once, each conditional on its saved ETag (https://github.com/${S.user}?tab=stars)`);
   start('stars');
   let pages;
@@ -307,9 +311,13 @@ export async function sync(g) {
   S.starPages = pages.map(({etag, ids}) => ({etag, ids}));
   const keep = new Set(S.repos.map(rkey));
   if (gone.user !== ukey()) gone = {user: ukey(), keys: new Set()};
-  const orphans = [...new Set([...Object.keys(S.readmes), ...Object.keys(S.history)])].filter(k => !keep.has(k));
+  const orphans = [...new Set([...Object.keys(S.readmes), ...Object.keys(S.history), ...Object.keys(S.files)])].filter(k => !keep.has(k));
   const confirmed = orphans.filter(k => gone.keys.has(k));   // missing from the previous check too: really unstarred
-  for (const k of confirmed) { delete S.readmes[k]; if (S.history[k]) { delete S.history[k]; markHistory(k); } }
+  for (const k of confirmed) {
+    delete S.readmes[k];
+    if (S.history[k]) { delete S.history[k]; markHistory(k); }
+    if (S.files[k]) { delete S.files[k]; markFiles(k); }
+  }
   gone.keys = new Set(orphans.filter(k => !confirmed.includes(k)));
   if (orphans.length) info('sync', `${orphans.length - confirmed.length} README / commit index entr(ies) belong to repos missing from the list for the first time: kept until a second check agrees · ${confirmed.length} were missing twice in a row: dropped`);
   // Counts of users you no longer star anything from.
@@ -323,6 +331,7 @@ export async function sync(g) {
   if (confirmed.length) await saveReadmes(g);
   if (staleUsers.length) await saveUsers(g);
   await saveHistory(g);   // writes only the shards that changed
+  await saveFiles(g);
   if (g !== S.gen) return;   // a profile change may happen while a large cache file is being written
   debug('sync', `star list saved (${S.repos.length.toLocaleString()} repos, ${S.starPages.length} page ETags)`);
 
@@ -344,8 +353,16 @@ export async function sync(g) {
     hist = await syncHistory(g, S.repos.filter(r => !r.gone), {parts});
     if (g === S.gen) { bumpIndex(); render(); }
   }
+  // File lists: only if they were pulled before, and only for repos pushed since (an unchanged tree answers 304, free).
+  let filesRes = null;
+  if (g === S.gen && hadFiles) {
+    const todo = S.repos.filter(r => !r.gone && needsFiles(r));
+    debug('sync', `file lists: ${todo.length.toLocaleString()} repo(s) pushed since their list was fetched (or over a month old)`);
+    filesRes = await fetchFiles(g, todo, {quiet: true});
+    if (g === S.gen && todo.length) { bumpIndex(); render(); }
+  }
   if (g === S.gen) phase(7, `done: ${S.repos.length.toLocaleString()} stars on screen${hadHistory && !S.token ? '; the index needs a token to be topped up' : ''}`);
-  if (g === S.gen) status(`${S.repos.length} stars · ${diff} · ${res?.summary ? res.summary + ' · ' : ''}${hist?.summary ? hist.summary + ' · ' : ''}all checked in ${secs(t0)}`);
+  if (g === S.gen) status(`${S.repos.length} stars · ${diff} · ${res?.summary ? res.summary + ' · ' : ''}${hist?.summary ? hist.summary + ' · ' : ''}${filesRes?.got ? `📁 ${filesRes.got} file list(s) updated · ` : ''}all checked in ${secs(t0)}`);
 }
 
 // ---- 2-4. releases, commits, READMEs ----
@@ -499,14 +516,28 @@ export async function enrich(g) {
   if (g === S.gen) status(`${summary} · ${secs(t0)}`);
 }
 
-export async function indexReadmes(g) {
+/** Forgets every README of this profile (the 🗑 of the READMEs menu). */
+export async function clearReadmes(g) {
+  const n = Object.keys(S.readmes).length;
+  S.readmes = {};
+  await saveReadmes(g);
+  bumpIndex();
+  info('readmes', `READMEs cleared: ${n.toLocaleString()} deleted`);
+  return n;
+}
+
+/** Toolbar button "📄 READMEs". `planned`: part of "Pull all", whose steps are already on screen. Returns the summary. */
+export async function indexReadmes(g, {planned = false} = {}) {
   info('readmes', `Index READMEs: ${S.repos.length.toLocaleString()} repos, a README is downloaded only when its git hash changed`);
   const t0 = performance.now();
-  plan([S.token && ['details', 'Check repos & README versions'], ['readmes']].filter(Boolean));
+  if (!planned) plan(readmeSteps());
   const {summary} = await refreshDetails(g, {wantReadmes: true, wantEnrich: !!S.token});
-  if (g !== S.gen) return;
+  if (g !== S.gen) return '';
   $('#inReadme').checked = true;
   bumpIndex();
   render();
   status(`${summary} · ${secs(t0)}`);
+  return summary;
 }
+/** The progress steps of a README pull. */
+export const readmeSteps = () => [S.token && ['details', 'Check repos & README versions'], ['readmes']].filter(Boolean);

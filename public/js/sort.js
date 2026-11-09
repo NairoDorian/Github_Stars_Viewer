@@ -12,10 +12,18 @@ export const SORT_OPTIONS = [
   ['name', 'Name A–Z'],
   ['owner', 'Owner A–Z'],
   ['created', 'Newest repo'],
+  ['hardware', 'Most hardware files'],
+  ['models3d', 'Most 3D model files'],
+  ['files', 'Most files'],
 ];
+/** Sort orders that only make sense for your own stars (they need the file lists): Discover leaves them out. */
+export const STARS_ONLY = new Set(['starred', 'hardware', 'models3d', 'files']);
+/** Values computed elsewhere, by key: list.js registers the file-based ones (sort.js imports nothing). */
+export const EXTRA_VALUES = {};
 
 const value = (repo, key) => {
   const r = repo.x || repo.r || repo;
+  if (EXTRA_VALUES[key]) return EXTRA_VALUES[key](r);
   switch (key) {
     case 'relevance': return repo.score;
     case 'starred': return Date.parse(r.starred || '') || null;

@@ -42,8 +42,9 @@ import {S, rkey, bumpIndex, indexedParts, commitsPulled, releasesPulled} from '.
 export {indexedParts};
 import {$, DAY, status, secs, pool, chunks, sleep} from './util.js';
 import {plan, start, report, finish} from './progress.js';
-import {gqlRepos, isFatalError, needToken, parseLast} from './github.js';
-import {saveHistory, saveStars, markHistory, historyDirty} from './store.js';
+import {gqlRepos, isFatalError, needToken, parseLast, readBudget} from './github.js';
+import {waitForRefill, budgetLine} from './budget.js';
+import {saveHistory, saveStars, markHistory, markAllHistory, historyDirty} from './store.js';
 import {debug, info, warn, error, names} from './log.js';
 import {render, prepareHistorySearch} from './list.js';
 
@@ -299,6 +300,8 @@ async function gqlRun(run, items, fields, nameOf, what) {
   for (let attempt = 0; ; attempt++) {
     try { return await gqlRepos(items, fields, nameOf, what); }
     catch (e) {
+      // GraphQL budget used up: wait for the hourly refill (Cancel stops the wait), then ask again.
+      if (e.rateLimited && !S.stop && run.g === S.gen && await waitForRefill(e, run.g, `Pulling ${partsLabel(run.parts)}`)) { attempt--; continue; }
       if (!e.secondary || attempt >= 3 || halted(run)) throw e;
       run.slotCap = Math.max(1, Math.floor(Math.min(run.slotCap, 8) / 2));
       const wait = TUNING.slowDownMs * (attempt + 1);
@@ -608,24 +611,55 @@ export async function syncHistory(g, repos, {force = false, parts = BOTH} = {}) 
     (run.fatal ? ` · ⚠ ${run.fatal.message} (progress saved, click again to continue)` : '')};
 }
 
-/** Pulls (or re-checks) one or both parts for every starred repo, then turns on searching what was pulled. */
-async function pullParts(g, parts) {
+/**
+ * Forgets one part of the index, 'commits' or 'releases' (the 🗑 of the Commits / Releases menus), keeping the other; a
+ * record left with neither is deleted. The kept part keeps its "checked" stamp, so nothing is downloaded again for it.
+ * Returns how many repos lost that part.
+ */
+export async function clearPart(g, part) {
+  let n = 0;
+  for (const [k, h] of Object.entries(S.history)) {
+    if (k.startsWith('_') || !h) continue;
+    const had = part === 'commits' ? commitsPulled(h) : releasesPulled(h), other = part === 'commits' ? releasesPulled(h) : commitsPulled(h);
+    if (!had) continue;
+    n++;
+    if (!other) { delete S.history[k]; continue; }
+    const keep = {cAt: h.cAt ?? h.at, cPushed: h.cPushed ?? h.pushed, rAt: h.rAt ?? h.at, rPushed: h.rPushed ?? h.pushed};   // a record from before the split had one shared stamp
+    S.history[k] = part === 'commits'
+      ? {...h, ...keep, head: null, tail: null, c: [], done: false, capped: false, cAt: 0, cPushed: null}
+      : {...h, ...keep, rel: [], relN: -1, relTop: '', relAt: 0, rAt: 0, rPushed: null, ro: optFlags(histOpts())};
+  }
+  markAllHistory();
+  await saveHistory(g);
+  bumpIndex();
+  info('history', `${part === 'commits' ? 'commit messages' : 'release notes'} cleared from ${n.toLocaleString()} repos (the ${part === 'commits' ? 'release notes' : 'commit messages'} are kept)`);
+  return n;
+}
+
+/** Pulls (or re-checks) one or both parts for every starred repo, then turns on searching what was pulled. `planned`: part
+ *  of "Pull all", whose steps are already on screen. Returns the summary ('' when nothing ran). */
+async function pullParts(g, parts, {planned = false} = {}) {
   const what = partsLabel(parts);
-  if (!S.token) { needToken(); return status(`⚠ Pulling ${what} needs a token (GraphQL). Add one in the 🔑 panel.`); }
-  info('history', `Pull ${what}: ${[parts.commits && 'every commit message (up to the limit in ⚙ Index options)', parts.releases && 'every release note'].filter(Boolean).join(' and ')} of every star (resumes where a cancelled run stopped)`);
+  if (!S.token) { needToken(); status(`⚠ Pulling ${what} needs a token (GraphQL). Add one in the 🔑 panel.`); return ''; }
+  info('history', `Pull ${what}: ${[parts.commits && 'every commit message (up to the limit in the ▾ menu)', parts.releases && 'every release note'].filter(Boolean).join(' and ')} of every star (resumes where a cancelled run stopped)`);
   const t0 = performance.now();
   status(`Checking ${what}…`);
-  plan([['check', `Check ${what}`], parts.releases && ['releases'], parts.commits && ['commits']].filter(Boolean));
+  await readBudget();
+  info('history', `budget before the pull: ${budgetLine('graphql')} (a long pull that runs out waits for the refill and continues)`);
+  if (!planned) plan([['check', `Check ${what}`], parts.releases && ['releases'], parts.commits && ['commits']].filter(Boolean));
   const {summary} = await syncHistory(g, S.repos, {force: true, parts});
-  if (g !== S.gen) return;
+  if (g !== S.gen) return '';
   if (parts.commits) $('#inCommits').checked = true;
   if (parts.releases) $('#inReleases').checked = true;
   bumpIndex();
   await prepareHistorySearch();
   render();
   status(`${summary} · ${secs(t0)}`);
+  return summary;
 }
 /** Toolbar button "Commits": every commit message of every star, up to the limit per repo. */
 export const indexCommits = g => pullParts(g, {commits: true, releases: false});
 /** Toolbar button "Releases": every release of every star, notes kept whole. */
 export const indexReleases = g => pullParts(g, {commits: false, releases: true});
+/** Both parts, sharing one check (the "Pull all" button). */
+export const indexHistory = (g, opts) => pullParts(g, BOTH, opts);
