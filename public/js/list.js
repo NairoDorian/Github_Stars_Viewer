@@ -318,7 +318,7 @@ function filesBadge(r) {
   const kinds = Object.entries(f.kinds).sort((a, b) => b[1] - a[1]).map(([k, c]) =>
     `<span class="chip fk" tabindex="0" role="button" data-kind="${esc(k)}" title="${esc(kindLabel(k))}: ${c.toLocaleString()} file(s), e.g. ${esc((f.ex[k] || []).join(', '))}. Click to show every repo with such files">${kindIcon(k)} ${c.toLocaleString()}</span>`).join('');
   const build = f.build.length ? `<span class="muted" title="Build systems and platforms found from their marker files">${esc(f.build.slice(0, 4).join(' · '))}</span>` : '';
-  return `<a href="${esc(safeUrl(tree))}" target="_blank" rel="noopener" title="${rec.n.toLocaleString()} files${rec.trunc || rec.cut ? ' (only part of a very large tree)' : ''}. Most common: ${esc(exts)}. Open the file tree on GitHub">📁 ${rec.n.toLocaleString()} files</a>${kinds}${build}`;
+  return `<a href="${esc(safeUrl(tree))}" target="_blank" rel="noopener" title="${rec.n.toLocaleString()} files${rec.cut || (rec.trunc && !rec.walked) ? ' (incomplete, from an older version: completed at the next 📁 Files pull)' : ''}. Most common: ${esc(exts)}. Open the file tree on GitHub">📁 ${rec.n.toLocaleString()} files</a>${kinds}${build}`;
 }
 
 /** At most 8 topics; when there are more, the ones matching the active topic filter or the search come first. */

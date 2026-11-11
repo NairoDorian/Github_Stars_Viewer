@@ -128,3 +128,100 @@ test('clearing commits keeps the release notes and the other way round; a record
     S.history = {};
   });
 });
+
+test('file lists are always complete: nothing is left out, a truncated tree is walked folder by folder, old incomplete lists are fetched again', async () => {
+  const {walkTree, incomplete, FILES_VERSION} = await import('../public/js/files.js');
+  // nothing filtered: vendored folders are part of the list (the kinds still ignore them)
+  const rec = toRecord(repo(1, 'o/a'), {tree: [{path: 'node_modules/x/i.js', type: 'blob'}, {path: 'a.kicad_pcb', type: 'blob'}]}, null);
+  assert.deepEqual([rec.p, rec.n, rec.fv, rec.s.n], [['node_modules/x/i.js', 'a.kicad_pcb'], 2, FILES_VERSION, 1]);
+  // what an older version stored is recognised as incomplete
+  assert.equal(incomplete({p: ['a'], cut: true}), true, 'cut by the old cap');
+  assert.equal(incomplete({p: ['a'], trunc: true}), true, 'truncated by GitHub, never walked');
+  assert.equal(incomplete({p: ['a'], trunc: true, walked: true, fv: FILES_VERSION}), false);
+  assert.equal(incomplete({p: ['web/package.json']}), true, 'version 1 may have left node_modules out of this one');
+  assert.equal(incomplete({p: ['main.c']}), false, 'nothing could have been left out of this one');
+  assert.equal(incomplete({p: ['web/package.json'], fv: FILES_VERSION}), false);
+
+  // a huge repo: the root is walked without recursion, each folder recursively, and a folder still too big one level down
+  const realFetch = globalThis.fetch, asked = [];
+  const trees = {
+    'main?recursive=1': {sha: 'root', truncated: true, tree: [{path: 'README.md', type: 'blob'}]},
+    'root': {sha: 'root', tree: [{path: 'README.md', type: 'blob'}, {path: 'src', type: 'tree', sha: 's1'}, {path: 'big', type: 'tree', sha: 'b1'}, {path: 'lib', type: 'commit'}]},
+    's1?recursive=1': {sha: 's1', tree: [{path: 'main.c', type: 'blob'}, {path: 'drv', type: 'tree', sha: 'd'}, {path: 'drv/spi.c', type: 'blob'}]},
+    'b1?recursive=1': {sha: 'b1', truncated: true, tree: []},
+    'b1': {sha: 'b1', tree: [{path: 'x.stl', type: 'blob'}, {path: 'deep', type: 'tree', sha: 'dp'}]},
+    'dp?recursive=1': {sha: 'dp', tree: [{path: 'y.step', type: 'blob'}]},
+  };
+  globalThis.fetch = async url => {
+    const key = String(url).split('/git/trees/')[1];
+    asked.push(key);
+    const body = trees[key];
+    return body ? {ok: true, status: 200, headers: new Headers({etag: '"w"'}), json: async () => body} : {ok: false, status: 404, headers: new Headers(), json: async () => ({})};
+  };
+  try {
+    await withDoc(async () => {
+      S.token = 'tok'; S.files = {};
+      S.repos = [repo(7, 'o/huge')];
+      await fetchFiles(nextGen(), S.repos);
+      const got = S.files['7'];
+      assert.deepEqual(got.p.sort(), ['README.md', 'big/deep/y.step', 'big/x.stl', 'src/drv/spi.c', 'src/main.c']);
+      assert.deepEqual([got.trunc, got.walked, got.n], [true, true, 5]);
+      assert.deepEqual(asked, ['main?recursive=1', 'root', 's1?recursive=1', 'b1?recursive=1', 'b1', 'dp?recursive=1']);
+      assert.equal(incomplete(got), false);
+      assert.deepEqual(got.s.kinds, {cad: 1, mesh: 1});
+      const rec = {p: [], n: 0, subs: 0, trunc: true, walked: false, fv: FILES_VERSION, branch: 'main', etag: null, pushed: 'p1', at: 0, walk: {ref: 'root', requests: 0}};
+      await walkTree(S.repos[0], rec);
+      assert.equal(rec.walk.requests, 5, 'root, src, big (cut again), big one level down, deep');
+      assert.deepEqual(rec.p.sort(), ['README.md', 'big/deep/y.step', 'big/x.stl', 'src/drv/spi.c', 'src/main.c']);
+    });
+  } finally { globalThis.fetch = realFetch; S.token = ''; S.files = {}; S.repos = []; }
+});
+
+test('a walk the budget (or a reload) interrupts keeps its progress and continues where it stopped, not from the start', async () => {
+  const {incomplete, needsFiles, FILES_VERSION} = await import('../public/js/files.js');
+  const realFetch = globalThis.fetch;
+  const trees = {
+    'main?recursive=1': {sha: 'root', truncated: true, tree: [{path: 'README.md', type: 'blob'}]},
+    'root': {sha: 'root', tree: [{path: 'README.md', type: 'blob'}, {path: 'src', type: 'tree', sha: 's1'}, {path: 'big', type: 'tree', sha: 'b1'}]},
+    's1?recursive=1': {sha: 's1', tree: [{path: 'main.c', type: 'blob'}]},
+    'b1?recursive=1': {sha: 'b1', truncated: true, tree: []},
+    'b1': {sha: 'b1', tree: [{path: 'x.stl', type: 'blob'}]},
+  };
+  let b1Fails = true, asked = [];
+  globalThis.fetch = async url => {
+    const key = String(url).split('/git/trees/')[1];
+    asked.push(key);
+    if (key === 'b1' && b1Fails) return {ok: false, status: 404, headers: new Headers(), json: async () => ({})};
+    const body = trees[key];
+    return body ? {ok: true, status: 200, headers: new Headers({etag: '"w"'}), json: async () => body} : {ok: false, status: 404, headers: new Headers(), json: async () => ({})};
+  };
+  try {
+    await withDoc(async () => {
+      S.token = 'tok'; S.files = {};
+      const huge = repo(7, 'o/huge');
+      S.repos = [huge];
+      // 1st run: the walk dies on a bad answer for big/ halfway through — what was collected is kept, not thrown away
+      const first = await fetchFiles(nextGen(), S.repos);
+      assert.equal(first.failed, 1, 'the walk fails, the repo is tried again');
+      assert.deepEqual([first.got, first.same], [0, 0]);
+      const half = S.files['7'];
+      assert.deepEqual(half.p.sort(), ['README.md', 'src/main.c'], 'the files found before the failure are kept');
+      assert.deepEqual(half.walk.todo, [{sha: 'b1', prefix: 'big/', recursive: false}], 'the folder that failed is still to do');
+      assert.deepEqual([half.trunc, half.walked, half.walk.requests], [true, false, 4], 'the walk is not finished');
+      assert.equal(incomplete(half), true, 'a half-done walk is an incomplete list');
+      assert.equal(needsFiles(huge), true);
+      // 2nd run: it continues where it stopped — no fresh start (no recursive answer, no root, no src again)
+      b1Fails = false;
+      asked = [];
+      const second = await fetchFiles(nextGen(), S.repos);
+      assert.deepEqual(asked, ['b1'], 'only the folder that was still queued is asked for: no fresh start (no recursive answer, no root, no src again)');
+      assert.deepEqual([second.got, second.same, second.failed], [1, 0, 0], 'the walk completes');
+      const done = S.files['7'];
+      assert.equal(done.walk, undefined, 'the walk is over');
+      assert.deepEqual(done.p.sort(), ['README.md', 'big/x.stl', 'src/main.c']);
+      assert.deepEqual([done.trunc, done.walked, done.n, done.fv], [true, true, 3, FILES_VERSION]);
+      assert.equal(incomplete(done), false);
+      assert.equal(needsFiles(huge), false);
+    });
+  } finally { globalThis.fetch = realFetch; S.token = ''; S.files = {}; S.repos = []; }
+});
