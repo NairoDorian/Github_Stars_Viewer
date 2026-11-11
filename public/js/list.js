@@ -3,7 +3,8 @@
    Search: every positive term must match the card fields (name, owner, about, topics, languages) or, when ticked, the
    READMEs or the commit messages / release notes; each term may match somewhere different. "exact phrase", -exclude and
    qualifiers (lang: owner: topic: is: stars:) are supported. Matches outside the card fields are explained by snippets. */
-import {S, isMine, rkey, readmeEntry, readmeText, readmeLower, historyIndex, historyHit, warmHistoryIndex, partsKey, indexedParts, commitsPulled, releasesPulled} from './state.js';
+import {S, isMine, rkey, readmeEntry, readmeText, readmeLower, historyIndex, historyHit, warmHistoryIndex, partsKey, indexedParts, commitsPulled, releasesPulled, bumpIndex} from './state.js';
+import {saveStars, saveReadmes, saveHistory, saveFiles, markHistory, markFiles} from './store.js';
 import {$, esc, escRe, fmtN, fmtDate, ago, when, safeUrl, tally, status} from './util.js';
 import {activityNow, starGains, ACTIVITY_SPAN, ACTIVITY_BUCKETS, setStar, whoAmI, needToken} from './github.js';
 import {drawableCurve, starsAt, watchStarCharts} from './starhistory.js';
@@ -361,6 +362,40 @@ async function starVisited(full, btn) {
   }
 }
 
+/** The 🗑 button of a removed or hidden repo (only those have it): a repo that is still on GitHub and starred would
+ *  simply come back at the next check, so removing it from the cache there would be misleading. */
+function removeBtn(r) {
+  return `<button class="x" data-remove="${esc(rkey(r))}" title="Delete this local copy for good: the card, its README, its commit / release index and its file list. The repo is not on GitHub any more, so it only comes back if you star it again. Two clicks.">🗑 Remove</button>`;
+}
+
+/** The 🗑 button of a removed or hidden repo, clicked. The first click only arms it (two clicks, like every destructive
+ *  action in this app); the second deletes the repo's local copy for good — the card, its README, its commit / release
+ *  index and its file list — and saves every store it belonged to. Nothing brings it back but starring it again. */
+export async function removeRepo(btn) {
+  const r = S.repos.find(x => rkey(x) === btn.dataset.remove);
+  if (!r) return;
+  if (btn.dataset.armed !== '1') {
+    btn.dataset.armed = '1';
+    btn.textContent = '🗑 Remove for sure?';
+    btn.classList.add('armed');
+    setTimeout(() => {   // unarmed again unless the second click comes soon
+      if (btn.isConnected && btn.dataset.armed === '1') { btn.dataset.armed = ''; btn.classList.remove('armed'); btn.textContent = '🗑 Remove'; }
+    }, 6000);
+    return;
+  }
+  const k = rkey(r), parts = ['README', S.history[k] && 'commit / release index', S.files[k] && 'file list'].filter(Boolean);
+  S.repos = S.repos.filter(x => x !== r);   // a new array: everything cached per list (facet counts, starred sets) is rebuilt with it
+  if (S.readmes[k]) { delete S.readmes[k]; await saveReadmes(); }
+  if (S.history[k]) { delete S.history[k]; markHistory(k); await saveHistory(); }   // a marked shard is rewritten without the repo
+  if (S.files[k]) { delete S.files[k]; markFiles(k); await saveFiles(); }
+  bumpIndex();   // searchable text changed: the facets and search-in counts are rebuilt
+  const saved = await saveStars();
+  info('list', `🗑 ${r.full} removed from the local database (card${parts.length ? ' + ' + parts.join(' + ') : ''})${S.visit ? ' · a visit: nothing was stored anyway, this list forgets it now' : saved === false ? ' · the stored star list could not be written: it returns at the next reload' : ''}`);
+  status(`🗑 Removed ${r.full}${S.visit ? ' from this visit' : ''}. It is not on GitHub any more, so it only comes back if you star it again.`);
+  if (filters.gone && !S.repos.some(x => x.gone)) showOnlyRemoved(false);   // that was the last one: back to the normal list
+  else render();
+}
+
 /** "⧉ hidden fork of a/b" (with its evidence and a "not a copy" button) on a copy; "⧉ 2 hidden forks" on an original.
  *  Both open the family: the original and its copies. */
 function forkTags(r) {
@@ -399,7 +434,7 @@ export function card(r, {snips = [], re = null, suggestion = false, reasons = []
     ${suggestion ? `<div class="chips reasons">${reasons.slice(0, 5).map(reason => `<span class="why">${esc(reason)}</span>`).join('')}</div>
       <div class="suggestion-actions"><button class="starbtn" data-star="${esc(r.full)}" title="Star on GitHub">☆ Star</button>
       <button class="x" data-dismiss="${esc(r.full.toLowerCase())}" title="Never suggest this repo again">✕ Not interested</button></div>`
-      : `<div class="suggestion-actions"><button class="similar" data-similar="${esc(rkey(r))}" title="Find repos related to this one that you haven't starred">✨ Show suggestions</button>${visitStar(r)}</div>`}
+      : `<div class="suggestion-actions"><button class="similar" data-similar="${esc(rkey(r))}" title="Find repos related to this one that you haven't starred">✨ Show suggestions</button>${visitStar(r)}${r.gone ? removeBtn(r) : ''}</div>`}
   </${tag}>`;
 }
 
@@ -708,6 +743,8 @@ export function initList() {
     if (b) window.dispatchEvent(new CustomEvent('suggest-for', {detail: b.dataset.similar}));
     const star = e.target.closest('[data-vstar]');
     if (star) starVisited(star.dataset.vstar, star);
+    const rm = e.target.closest('[data-remove]');
+    if (rm) removeRepo(rm);
   });
   // Facet, chip and export clicks (sidebar, filter bar and cards).
   document.addEventListener('click', e => {

@@ -147,6 +147,7 @@ mark{background:var(--star);color:#000;border-radius:2px}
 .suggestion-actions{display:flex;gap:6px;margin-top:auto}
 .suggestion-actions .starbtn{color:var(--star);border-color:var(--star)}
 .suggestion-actions .x{margin-left:auto}
+.suggestion-actions .x.armed{color:var(--star);border-color:var(--star)}
 .discovery-controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:8px 0}
 .discovery-controls label{display:flex;align-items:center;gap:6px;margin-left:auto}
 .discovery-note:empty{display:none}
