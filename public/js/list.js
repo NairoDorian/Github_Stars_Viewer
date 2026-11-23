@@ -3,61 +3,101 @@
    Search: every positive term must match the card fields (name, owner, about, topics, languages) or, when ticked, the
    READMEs or the commit messages / release notes; each term may match somewhere different. "exact phrase", -exclude and
    qualifiers (lang: owner: topic: is: stars:) are supported. Matches outside the card fields are explained by snippets. */
-import {S, isMine, rkey, readmeEntry, readmeText, readmeLower, historyIndex, historyHit, warmHistoryIndex, partsKey, indexedParts, commitsPulled, releasesPulled, bumpIndex} from './state.js';
-import {saveStars, saveReadmes, saveHistory, saveFiles, markHistory, markFiles} from './store.js';
+import {S, isMine, rkey, readmeEntry, readmeText, readmeLower, readmeSummary, historyIndex, historyHit, warmHistoryIndex, partsKey, indexedParts, commitsPulled, releasesPulled, bumpIndex} from './state.js';
+import {saveStars, saveReadmes, saveHistory, saveFiles, markHistory} from './store.js';
 import {$, esc, escRe, fmtN, fmtDate, ago, when, safeUrl, tally, status} from './util.js';
 import {activityNow, starGains, ACTIVITY_SPAN, ACTIVITY_BUCKETS, setStar, whoAmI, needToken} from './github.js';
 import {drawableCurve, starsAt, watchStarCharts} from './starhistory.js';
 import {sortRepos, SORT_OPTIONS, EXTRA_VALUES} from './sort.js';
-import {summaryOf, hasKind, extOf, hardwareCount, models3dCount, KINDS, EMBEDDED, kindLabel, kindIcon, kindHelp} from './filekinds.js';
+import {summaryOf, hasKind, hasExt, hardwareCount, models3dCount, KINDS, EMBEDDED, kindLabel, kindIcon, kindHelp} from './filekinds.js';
+import {pathsReady, loadPaths, releasePaths, pathHit, pathHas, forgetFileList} from './files.js';
 import {debug, info, warn} from './log.js';
 import {hiddenFork, copiesOf, forkKind, forkVisible, setForkMode, scheduleForkScan, notACopy, resetForks, FORK_MODES} from './forks.js';
 
-const PAGE = 200;   // cards rendered per step; more load automatically when you reach the end (or via Show more)
-const filters = {lang: null, topic: null, owner: null, gone: false, family: null, kind: null};   // gone: only the repos GitHub no longer shows (removed, private or hidden) · family: rkey of an original, shown with its hidden forks
+const PAGE = 100;   // cards rendered per step; more load automatically when you reach the end (or via Show more)
+const filters = {lang: null, topic: null, owner: null, gone: false, family: null, kind: null, quick: new Set()};   // quick: Status rows of the sidebar (QUICK below)   // gone: only the repos GitHub no longer shows (removed, private or hidden) · family: rkey of an original, shown with its hidden forks
 let limit = PAGE;
 
 // ---- file lists (files.js): summaries, path search, has: / ext: / path: / files: ----
+// What the files say about a repo (S.files: counts, kinds, build systems, extensions) is always in memory and answers
+// has: / ext: / build: / files: and the "File kinds" filters. The paths themselves are only read when file NAMES are
+// searched (the Files checkbox, path:), and let go a while after no search uses them any more.
 const fileRec = r => S.files[rkey(r)];
 /** The file-list summary of a repo (kinds, build systems, extensions), or null when its files were not pulled. */
 export const filesOf = r => summaryOf(fileRec(r));
-// Lower-cased paths of a file-list record, one per line, built once per record (records are replaced, never edited).
-const pathCache = new WeakMap();
-function pathsLower(rec) {
-  if (!rec?.p?.length) return '';
-  let t = pathCache.get(rec);
-  if (t === undefined) pathCache.set(rec, t = rec.p.join('\n').toLowerCase());
-  return t;
-}
-/** First stored path containing `term` (lower-cased), or null. */
-function fileHit(r, term) {
-  const rec = fileRec(r), low = pathsLower(rec), i = low.indexOf(term);
-  if (i < 0) return null;
-  const start = low.lastIndexOf('\n', i) + 1, end = low.indexOf('\n', i), line = low.slice(start, end < 0 ? undefined : end);
-  return rec.p.find(x => x.toLowerCase() === line) || line;
-}
 /** Does the repo have a "file kind" (filters.kind / the sidebar): a kind key, or 'firmware' (an embedded build system). */
-const hasFileKind = (r, kind) => { const f = filesOf(r); return !!f && !!hasKind(f, kind, fileRec(r).p); };
+const hasFileKind = (r, kind) => { const f = filesOf(r); return !!f && !!hasKind(f, kind); };
+const RELEASE_PATHS_AFTER = 120_000;   // ms without a search of file names before their paths leave memory
+let pathsTimer = null;
+/** Called by every render: reads the paths when this search needs them (then draws again), lets them go when none does. */
+function wantPaths(wanted) {
+  if (wanted) {
+    clearTimeout(pathsTimer); pathsTimer = null;
+    // Shown next to the Files checkbox while it lasts (the status line belongs to whatever job is running).
+    const reading = f => { const el = $('#cntFiles'); if (el && f < 1) el.textContent = `reading… ${Math.round(f * 100)} %`; };
+    if (!pathsReady() && Object.keys(S.files).length) loadPaths(reading).then(ok => { countsFor = null; if (ok) render(); else indexCounts(); });
+  } else if (pathsReady() && !pathsTimer) {
+    pathsTimer = setTimeout(() => { pathsTimer = null; releasePaths(); }, RELEASE_PATHS_AFTER);
+    pathsTimer.unref?.();
+  }
+}
 // Sort orders that need the file lists (sort.js asks for them by key; repos without the kind sort last).
 EXTRA_VALUES.hardware = r => { const c = hardwareCount(filesOf(r)); return c || null; };
 EXTRA_VALUES.models3d = r => { const c = models3dCount(filesOf(r)); return c || null; };
 EXTRA_VALUES.files = r => fileRec(r)?.n || null;
 
-// Lower-cased searchable text per repo object: name, about, topics and languages. Repo objects are replaced on every
-// sync; the language breakdown (r.langs) is filled in later by the details check, so it is part of the cache check.
+/** What a card says the repo is: its description on GitHub, else the first real paragraph of its README (pulled with
+ *  📄 READMEs), marked as such. */
+export const aboutOf = r => r.about ? {text: r.about, fromReadme: false} : {text: readmeSummary(r), fromReadme: true};
+
+// Lower-cased searchable text per repo object: name, about (or the README summary standing in for it), topics and
+// languages. Repo objects are replaced on every sync; the language breakdown (r.langs) is filled in later by the details
+// check and the README arrives after the star list, so both are part of the cache check.
 const hayCache = new WeakMap();
 function hay(r) {
+  const readme = r.about ? null : readmeEntry(r) || null;
   let h = hayCache.get(r);
-  if (!h || h.langs !== r.langs) {
-    h = {langs: r.langs, text: [r.full, r.about, r.topics.join(' '), r.lang, ...(r.langs || []).map(l => l[0])].join(' ').toLowerCase()};
+  if (!h || h.langs !== r.langs || h.readme !== readme) {
+    h = {langs: r.langs, readme, text: [r.full, r.about || readmeSummary(r), r.topics.join(' '), r.lang, ...(r.langs || []).map(l => l[0])].join(' ').toLowerCase()};
     hayCache.set(r, h);
   }
   return h.text;
 }
 
+// ---- is it alive, and under which licence ----
+const YEAR = 365 * 864e5;
+/** When a repo last showed life (ms): its newest push or default-branch commit; 0 when neither is known. */
+const lastActive = r => Math.max(Date.parse(r.pushed || '') || 0, Date.parse(r.commitAt || '') || 0);
+/** 'archived' · 'alive' (something pushed within a year) · 'quiet' (one to two years ago) · 'stale' (over two years) · '' (unknown). */
+export function healthOf(r, now = Date.now()) {
+  if (r.archived) return 'archived';
+  const t = lastActive(r);
+  return !t ? '' : now - t < YEAR ? 'alive' : now - t < 2 * YEAR ? 'quiet' : 'stale';
+}
+/** Nothing pushed for two years (archived or not); null when no date is known. */
+const isStale = r => { const t = lastActive(r); return t ? Date.now() - t >= 2 * YEAR : null; };
+const HEALTH = {alive: 'Alive: something was pushed within the last year', quiet: 'Quiet: nothing pushed for over a year', stale: 'Stale: nothing pushed for over two years', archived: 'Archived by its owner: read-only'};
+const healthDot = r => { const h = r.gone ? '' : healthOf(r); return h ? `<i class="health ${h}" title="${HEALTH[h]}"></i>` : ''; };
+const COPYLEFT = /^(?:a?gpl|lgpl|mpl|epl|cddl|eupl|osl|cecill|sspl|odbl|cc-by-sa|cc-by-nc-sa|cern-ohl-[sw])/, PERMISSIVE = /^(?:mit|apache|bsd|isc|unlicense|0bsd|zlib|cc0|wtfpl|bsl|artistic|postgresql|ncsa|upl|mulanpsl|cc-by-4|cern-ohl-p)/;
+/** license:<v> — none · any · other (GitHub could not tell which) · copyleft · permissive · or the start of an SPDX id (gpl, mit, apache-2.0). */
+function licenseIs(r, v) {
+  const l = String(r.license || '').toLowerCase();
+  if (v === 'none' || v === 'no') return !l;
+  if (v === 'any' || v === 'yes') return !!l;
+  if (v === 'other' || v === 'unknown' || v === 'noassertion') return l === 'noassertion';
+  if (v === 'copyleft') return COPYLEFT.test(l);
+  if (v === 'permissive') return PERMISSIVE.test(l);
+  return l.startsWith(v);
+}
+/** The Status rows of the sidebar that are plain yes / no questions: [label, does it hold, the search that says the same]. */
+const QUICK = {
+  stale: ['💤 No push for 2 years', r => isStale(r) === true, 'is:stale'],
+  nolicense: ['⚖ No licence', r => !r.gone && !r.license, 'license:none'],
+};
+
 /** Parses search text into {inc, exc, quals, hasQuery}: supports "exact phrases", -negation, and key:value qualifiers. */
 export function parseQuery(raw) {
-  const inc = [], exc = [], quals = [], QK = /^(lang|language|owner|user|topic|tag|is|stars|has|ext|path|file|files|build)$/;
+  const inc = [], exc = [], quals = [], QK = /^(lang|language|owner|user|topic|tag|is|stars|has|ext|path|file|files|build|license|licence)$/;
   for (const m of (raw || '').toLowerCase().matchAll(/(-?)(?:([a-z]+):)?"([^"]+)"|(\S+)/g)) {
     if (m[3] !== undefined) {
       const neg = m[1] === '-', k = m[2], v = m[3].trim();
@@ -91,13 +131,17 @@ function checkQual(r, {k, v}) {
   if (k === 'topic' || k === 'tag') return (r.topics || []).some(t => t.toLowerCase() === v);
   // is:new / is:mine: did YOU star it (while visiting someone: unknown, hence ignored, until your stars are known). is:removed: deleted, private or hidden on GitHub.
   // is:fork: GitHub's forks · is:hiddenfork / is:copy: copies GitHub doesn't mark (forks.js) · is:anyfork: either · is:original: has hidden forks in your stars.
+  if (k === 'license' || k === 'licence') return licenseIs(r, v);
+  // is:alive / is:quiet / is:stale: when something was last pushed (see healthOf); unknown without a date.
+  if (k === 'is' && (v === 'stale' || v === 'quiet' || v === 'alive')) return v === 'stale' ? isStale(r) : lastActive(r) ? healthOf(r) === v : null;
   if (k === 'is') return v === 'archived' ? !!r.archived : v === 'active' ? !r.archived : v === 'fork' ? !!r.fork : v === 'removed' ? !!r.gone
     : v === 'hiddenfork' || v === 'hidden-fork' || v === 'copy' ? forkKind(r) === 'hidden' : v === 'anyfork' ? !!forkKind(r) : v === 'original' ? copiesOf(r).length > 0
     : v === 'mine' ? isMine(r) : v === 'new' ? (isMine(r) === null ? null : !isMine(r)) : null;
-  // File lists (📁 Files): unknown (ignored) for a repo whose files were not pulled.
-  if (k === 'has') { const f = filesOf(r); return f ? hasKind(f, v, fileRec(r).p) : null; }
-  if (k === 'ext') { const rec = fileRec(r); if (!rec?.p) return null; const e = v.replace(/^\./, ''); return rec.p.some(x => extOf(x) === e); }
-  if (k === 'path' || k === 'file') { const rec = fileRec(r); return rec?.p ? pathsLower(rec).includes(v) : null; }
+  // File lists (📁 Files): unknown (ignored) for a repo whose files were not pulled. has: and ext: are answered by the
+  // summary; path: needs the paths themselves, and is ignored for the moment it takes to read them (render draws again then).
+  if (k === 'has') { const f = filesOf(r); return f ? hasKind(f, v) : null; }
+  if (k === 'ext') { const f = filesOf(r); return f ? hasExt(f, v.replace(/^\./, '')) : null; }
+  if (k === 'path' || k === 'file') return fileRec(r) && pathsReady() ? pathHas(r, v) : null;
   if (k === 'build') { const f = filesOf(r); return f ? f.build.some(b => b.toLowerCase().replace(/\s+/g, '-') === v) : null; }
   if (k === 'stars' || k === 'files') {   // GitHub's forms: stars:>1000, stars:>=1k, stars:10..500, stars:100..*, stars:*..50 (files: the same, on the file count)
     if (k === 'files' && !fileRec(r)) return null;
@@ -128,7 +172,7 @@ const around = (text, term) => {
  *  message or a release note (one line per source, newest commit / release first, at most MAX_SNIPS). */
 export function match(r, q, inReadme, inHistory = false, inFiles = false) {
   for (const qual of q.quals) { const ok = checkQual(r, qual); if (ok !== null && ok === qual.neg) return null; }
-  for (const t of q.exc) if (hay(r).includes(t) || (inReadme && readmeLower(r).includes(t)) || (inHistory && inHistoryText(r, t, inHistory)) || (inFiles && pathsLower(fileRec(r)).includes(t))) return null;
+  for (const t of q.exc) if (hay(r).includes(t) || (inReadme && readmeLower(r).includes(t)) || (inHistory && inHistoryText(r, t, inHistory)) || (inFiles && pathHas(r, t))) return null;
   const snips = [];
   for (const t of q.inc) {
     if (hay(r).includes(t)) continue;
@@ -139,7 +183,7 @@ export function match(r, q, inReadme, inHistory = false, inFiles = false) {
     }
     const h = inHistory ? historyHit(r, t, inHistory) : null;
     if (!h) {
-      const path = inFiles ? fileHit(r, t) : null;
+      const path = inFiles ? pathHit(r, t) : null;
       if (!path) return null;
       if (!snips.some(x => x.kind === 'File' && x.id === path)) snips.push({kind: 'File', id: path, text: path});
       continue;
@@ -164,7 +208,9 @@ function hl(text, re) {
 /* ---- activity mini-charts: commits and stars per 2 weeks over the last 12 months ----
    One series each, so no legend: the row label names it. Bars have a 2px gap, a 1px baseline tick for empty
    periods (the rhythm stays readable), faint full-height blocks for periods the data doesn't cover, and a native
-   tooltip per bar. Values are text in ink colors; only the bars carry the series color. */
+   tooltip per bar. Values are text in ink colors; only the bars carry the series color.
+   The tooltips are written as a data-t attribute and only become a <title> when the pointer reaches the bar (see
+   initList): as <title> elements they were two fifths of a card's DOM nodes, for text that is hardly ever read. */
 const W = 260, H = 26, BAR = 8, GAP = 2;
 const day = t => fmtDate(t, {month: 'short', day: 'numeric'});
 
@@ -173,9 +219,9 @@ function sparkbars(counts, {end, unit, cls}) {
   const bars = counts.map((v, i) => {
     const from = start + i * ACTIVITY_SPAN, to = from + ACTIVITY_SPAN, x = i * (BAR + GAP);
     const tip = `${day(from)} – ${day(to)}`;
-    if (v == null) return `<rect class="nodata" x="${x}" y="0" width="${BAR}" height="${H}" rx="1"><title>${tip}: not tracked yet</title></rect>`;
+    if (v == null) return `<rect class="nodata" x="${x}" y="0" width="${BAR}" height="${H}" rx="1" data-t="${esc(tip)}: not tracked yet"/>`;
     const h = v ? Math.max(2, Math.round(v / max * (H - 1))) : 1;
-    return `<rect class="${v ? cls : 'zero'}" x="${x}" y="${H - h}" width="${BAR}" height="${h}" rx="${v ? 1.5 : 0}"><title>${tip}: ${v} ${unit}${v === 1 ? '' : 's'}</title></rect>`;
+    return `<rect class="${v ? cls : 'zero'}" x="${x}" y="${H - h}" width="${BAR}" height="${h}" rx="${v ? 1.5 : 0}" data-t="${esc(tip)}: ${v} ${unit}${v === 1 ? '' : 's'}"/>`;
   }).join('');
   return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="${unit}s per 2 weeks, last 12 months">${bars}</svg>`;
 }
@@ -189,7 +235,7 @@ function starTimeline(pts) {
   const month = t => fmtDate(t, {month: 'short', year: 'numeric'});
   const tips = Array.from({length: 26}, (_, i) => {
     const a = t0 + span * i / 26, b = t0 + span * (i + 1) / 26, va = Math.round(starsAt(pts, a)), vb = Math.round(starsAt(pts, b));
-    return `<rect class="hit" x="${x(a).toFixed(1)}" y="0" width="${(W / 26).toFixed(1)}" height="${H}"><title>${month(a)} – ${month(b)}: ${vb.toLocaleString()} stars (+${(vb - va).toLocaleString()})</title></rect>`;
+    return `<rect class="hit" x="${x(a).toFixed(1)}" y="0" width="${(W / 26).toFixed(1)}" height="${H}" data-t="${esc(`${month(a)} – ${month(b)}: ${vb.toLocaleString()} stars (+${(vb - va).toLocaleString()})`)}"/>`;
   }).join('');
   return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="stars over the repo's whole life">
     <path class="s-area" d="M0,${H} L${line.join(' L')} L${W},${H} Z"/><path class="s-line" d="M${line.join(' L')}" vector-effect="non-scaling-stroke"/>${tips}</svg>`;
@@ -272,8 +318,8 @@ function viewerLinks(r) {
 /** "🕒 last commit 3d ago" (head of the default branch). Without that date the repo's last push is shown and called
  *  a push: a push can be a tag or another branch, months after the last commit. */
 export function lastCommitTile(r) {
-  if (r.commitAt) return `<span class="lastcommit" title="Last commit on the default branch: ${esc(when(r.commitAt))}">🕒 last commit ${ago(r.commitAt)}</span>`;
-  if (r.pushed) return `<span class="lastcommit muted" title="Last push: ${esc(when(r.pushed))}. The exact last commit date is fetched with a token (🕒 Refresh tiles).">🕒 last push ${ago(r.pushed)}</span>`;
+  if (r.commitAt) return `<span class="lastcommit" title="Last commit on the default branch: ${esc(when(r.commitAt))}">${healthDot(r)}🕒 last commit ${ago(r.commitAt)}</span>`;
+  if (r.pushed) return `<span class="lastcommit muted" title="Last push: ${esc(when(r.pushed))}. The exact last commit date is fetched with a token (🕒 Refresh tiles).">${healthDot(r)}🕒 last push ${ago(r.pushed)}</span>`;
   return '';
 }
 
@@ -315,11 +361,15 @@ function filesBadge(r) {
   if (!f) return '';
   if (rec.miss) return `<span class="muted" title="GitHub has no file tree for it (HTTP ${rec.miss}: an empty repository)">📁 empty</span>`;
   const tree = `${r.url}/tree/${encodeURIComponent(rec.branch || 'HEAD')}`;
-  const exts = f.ext.slice(0, 8).map(([e, c]) => `.${e} ${c.toLocaleString()}`).join(', ');
+  const exts = (f.ext || []).slice(0, 8).map(([e, c]) => `.${e} ${c.toLocaleString()}`).join(', ');
   const kinds = Object.entries(f.kinds).sort((a, b) => b[1] - a[1]).map(([k, c]) =>
-    `<span class="chip fk" tabindex="0" role="button" data-kind="${esc(k)}" title="${esc(kindLabel(k))}: ${c.toLocaleString()} file(s), e.g. ${esc((f.ex[k] || []).join(', '))}. Click to show every repo with such files">${kindIcon(k)} ${c.toLocaleString()}</span>`).join('');
+    `<span class="chip fk" tabindex="0" role="button" data-kind="${esc(k)}" title="${esc(kindLabel(k))}: ${c.toLocaleString()} file(s), e.g. ${esc((f.ex?.[k] || []).join(', '))}. Click to show every repo with such files">${kindIcon(k)} ${c.toLocaleString()}</span>`).join('');
+  // Files of the code a repo carries along (an SDK, libraries, managed components) are counted apart: they say nothing about the repo itself.
+  const inBundled = Object.entries(f.bk || {}), nBundled = inBundled.reduce((a, [, c]) => a + c, 0);
+  const bundled = nBundled ? `<span class="muted" title="${esc(`In bundled folders (libraries, SDKs, managed components: other people's code, ${(f.bn || 0).toLocaleString()} files), not counted as the repo's own: ${inBundled.map(([k, c]) => `${kindLabel(k)} ${c.toLocaleString()}`).join(', ')}`)}">📦 +${nBundled.toLocaleString()} bundled</span>` : '';
   const build = f.build.length ? `<span class="muted" title="Build systems and platforms found from their marker files">${esc(f.build.slice(0, 4).join(' · '))}</span>` : '';
-  return `<a href="${esc(safeUrl(tree))}" target="_blank" rel="noopener" title="${rec.n.toLocaleString()} files${rec.cut || (rec.trunc && !rec.walked) ? ' (incomplete, from an older version: completed at the next 📁 Files pull)' : ''}. Most common: ${esc(exts)}. Open the file tree on GitHub">📁 ${rec.n.toLocaleString()} files</a>${kinds}${build}`;
+  const partial = rec.walk ? ' (so far: a very large tree is still being walked, continued at the next 📁 Files pull)' : rec.cut || rec.redo || (rec.trunc && !rec.walked) ? ' (incomplete, from an older version: completed at the next 📁 Files pull)' : '';
+  return `<a href="${esc(safeUrl(tree))}" target="_blank" rel="noopener" title="${rec.n.toLocaleString()} files${partial}. Most common: ${esc(exts)}. Open the file tree on GitHub">📁 ${rec.n.toLocaleString()} files</a>${kinds}${bundled}${build}`;
 }
 
 /** At most 8 topics; when there are more, the ones matching the active topic filter or the search come first. */
@@ -383,11 +433,11 @@ export async function removeRepo(btn) {
     }, 6000);
     return;
   }
-  const k = rkey(r), parts = ['README', S.history[k] && 'commit / release index', S.files[k] && 'file list'].filter(Boolean);
+  const k = rkey(r), parts = [S.readmes[k] && 'README', S.history[k] && 'commit / release index', S.files[k] && 'file list'].filter(Boolean);
   S.repos = S.repos.filter(x => x !== r);   // a new array: everything cached per list (facet counts, starred sets) is rebuilt with it
   if (S.readmes[k]) { delete S.readmes[k]; await saveReadmes(); }
   if (S.history[k]) { delete S.history[k]; markHistory(k); await saveHistory(); }   // a marked shard is rewritten without the repo
-  if (S.files[k]) { delete S.files[k]; markFiles(k); await saveFiles(); }
+  if (forgetFileList(k)) await saveFiles();
   bumpIndex();   // searchable text changed: the facets and search-in counts are rebuilt
   const saved = await saveStars();
   info('list', `🗑 ${r.full} removed from the local database (card${parts.length ? ' + ' + parts.join(' + ') : ''})${S.visit ? ' · a visit: nothing was stored anyway, this list forgets it now' : saved === false ? ' · the stored star list could not be written: it returns at the next reload' : ''}`);
@@ -412,12 +462,12 @@ export function card(r, {snips = [], re = null, suggestion = false, reasons = []
   const home = safeUrl(r.homepage);
   const license = r.license && r.license !== 'NOASSERTION' ? `<span>${esc(r.license)}</span>` : '';
   const tag = suggestion ? 'li' : 'div';
-  const shownTopics = pickTopics(r.topics || [], re);
+  const shownTopics = pickTopics(r.topics || [], re), about = suggestion ? {text: r.about, fromReadme: false} : aboutOf(r);
   return `<${tag} class="card${suggestion ? ' suggestion-card' : ''}${r.gone ? ' gone' : ''}">
     <div class="owner">${avatar ? `<img src="${esc(avatar)}" loading="lazy" alt="">` : ''}<span class="chip" tabindex="0" role="button" data-owner="${esc(r.owner)}">${hl(r.owner, re)}</span>${r.archived ? ' · archived' : ''}${r.fork ? ' · fork' : ''}${suggestion ? '' : forkTags(r)}${r.gone ? ' <span class="chip gone-tag" tabindex="0" role="button" data-gone="1" title="Deleted, made private or hidden on GitHub. Click to see all such repos">🚫 removed / private</span>' : ''}</div>
     <a href="${esc(safeUrl(r.url))}" target="_blank" rel="noopener">${hl(r.name, re)}</a>
     ${r.gone ? `<div class="gone-note" title="GitHub no longer shows this repository: it was deleted, made private or hidden. You still starred it, so this local copy is kept. It is not updated any more.">🚫 Removed, private or hidden on GitHub · local copy from ${esc(ago(r.gone.at))}</div>` : ''}
-    <p class="desc">${r.about ? hl(r.about, re) : '<span class="muted">No description</span>'}</p>
+    <p class="desc">${about.text ? (about.fromReadme ? `<span class="muted from-readme" title="No description on GitHub: this is how its README begins">${hl(about.text, re)}</span>` : hl(about.text, re)) : '<span class="muted">No description</span>'}</p>
     ${snips.map(s => snipHTML(r, s, re)).join('')}
     <div class="chips">${shownTopics.map(t => `<span class="chip" tabindex="0" role="button" data-topic="${esc(t)}">${hl(t, re)}</span>`).join('')}</div>
     <div class="meta">
@@ -446,6 +496,7 @@ export function resetFilters() {
   filters.lang = filters.topic = filters.owner = null;
   filters.gone = false;
   filters.family = filters.kind = null;
+  filters.quick.clear();
   limit = PAGE;
   shown.clear();
 }
@@ -477,6 +528,7 @@ export function render() {
   const q = parseQuery(rawQ);
   const re = q.inc.length ? new RegExp(q.inc.map(escRe).join('|'), 'gi') : null;
   const inReadme = $('#inReadme').checked, inHistory = searchParts(), inFiles = $('#inFiles').checked;
+  wantPaths(inFiles || q.quals.some(x => x.k === 'path' || x.k === 'file'));   // file names are read only for a search that looks at them
 
   const out = [], forLang = [], forTopic = [], forOwner = [];
   scheduleForkScan();   // finds hidden forks in the background when the repos, READMEs or commit index changed
@@ -487,6 +539,7 @@ export function render() {
     else if (!forkVisible(r)) continue;
     if (filters.gone && !r.gone) continue;   // "🚫 removed or hidden": only the repos kept as a local copy
     if (filters.kind && !hasFileKind(r, filters.kind)) continue;   // a "File kinds" row of the sidebar
+    if (filters.quick.size && ![...filters.quick].every(k => QUICK[k][1](r))) continue;   // Status rows: no push for 2 years, no licence
     if (S.visit && S.onlyNew && isMine(r) === true) continue;   // visiting: only what you have not starred yet
     const okLang = !filters.lang || r.lang === filters.lang;
     const okTopic = !filters.topic || r.topics.includes(filters.topic);
@@ -508,6 +561,7 @@ export function render() {
     .map(([k, label]) => `<button class="chip filter-pill" data-${k}="${esc(filters[k])}" title="Remove ${label.toLowerCase()} filter">${label}: ${esc(filters[k])} ✕</button>`);
   if (filters.gone) pills.push('<button class="chip filter-pill" data-gone="1" title="Show all repos again">Status: removed or hidden ✕</button>');
   if (filters.kind) pills.push(`<button class="chip filter-pill" data-kind="${esc(filters.kind)}" title="Show all repos again">Files: ${esc(kindName(filters.kind))} ✕</button>`);
+  for (const k of filters.quick) pills.push(`<button class="chip filter-pill" data-quick="${k}" title="Show all repos again (search: ${QUICK[k][2]})">Status: ${esc(QUICK[k][0])} ✕</button>`);
   if (family) pills.push(`<button class="chip filter-pill" data-family="${esc(filters.family)}" title="Show all repos again">${esc(family.full)} and its hidden forks ✕</button>`);
   const nGone = S.repos.filter(r => r.gone).length;
   const goneChip = nGone && !filters.gone ? `<button class="chip gone-chip" data-gone="1" title="Show only the repos that were deleted, made private or hidden on GitHub (kept here as a local copy). Search: is:removed">🚫 ${nGone} removed or hidden</button>` : '';
@@ -520,7 +574,7 @@ export function render() {
   moreButton();
   indexCounts();
   debug('list', `showing ${Math.min(out.length, limit)} of ${out.length} matches (${S.repos.length.toLocaleString()} repos) in ${Math.round(performance.now() - t0)} ms · sort ${$('#sort').value || 'default'}${rawQ.trim() ? ' · search “' + rawQ.trim() + '”' + (inReadme ? ' + READMEs' : '') + (inHistory ? ' + ' + {rc: 'commits & releases', c: 'commits', r: 'releases'}[inHistory] : '') + (inFiles ? ' + file names' : '') : ''}${filters.kind ? ' · files: ' + filters.kind : ''}${filters.lang ? ' · language ' + filters.lang : ''}${filters.topic ? ' · topic ' + filters.topic : ''}${filters.owner ? ' · owner ' + filters.owner : ''}${filters.gone ? ' · only removed/hidden' : ''}${S.forkMode !== 'all' ? ' · forks: ' + S.forkMode : ''}${family ? ' · family of ' + family.full : ''}`);
-  renderFacets({forLang, forTopic, forOwner}, `${rawQ.trim().toLowerCase()}\0${inReadme ? 1 : 0}${inHistory}${inFiles ? 'f' : ''}`);
+  renderFacets({forLang, forTopic, forOwner}, `${rawQ.trim().toLowerCase()}\0${inReadme ? 1 : 0}${inHistory}${inFiles ? 'f' : ''}${pathsReady() ? 'p' : ''}`);   // 'p': the file names arrived, a search of them now counts
   watchStarCharts($('#list'));
 }
 
@@ -567,7 +621,7 @@ function fileKindsBlock() {
   const lists = S.repos.map(filesOf).filter(Boolean);
   if (!lists.length && !filters.kind) return '';
   const counts = KINDS.map(([k]) => [k, lists.filter(f => f.kinds[k]).length]);
-  counts.splice(4, 0, ['firmware', lists.filter(f => f.build.some(b => EMBEDDED.has(b))).length]);
+  counts.splice(counts.findIndex(([k]) => k === 'datasheet') + 1, 0, ['firmware', lists.filter(f => f.build.some(b => EMBEDDED.has(b))).length]);   // the build-system "kind", after the hardware ones
   const rows = counts.filter(([k, c]) => c || filters.kind === k).map(([k, c]) =>
     `<div class="facet ${filters.kind === k ? 'on' : ''}" tabindex="0" role="button" data-kind="${esc(k)}" title="${esc(k === 'firmware' ? 'ESP-IDF, PlatformIO, Arduino, Zephyr, Rust embedded, MicroPython, STM32Cube projects' : kindHelp(k))} · search: has:${esc(k)}"><span>${esc(kindName(k))}</span><span class="muted">${c}</span></div>`);
   return `<h3 title="From the file lists (📁 Files): ${lists.length.toLocaleString()} of ${S.repos.length.toLocaleString()} repos listed">File kinds</h3>${rows.join('') || '<div class="muted small">No special files found</div>'}`;
@@ -576,7 +630,7 @@ function fileKindsBlock() {
 // Each facet group is cross-filtered by the active search and the other two facets, so counts reflect real matches.
 let facetsKey = null;
 function renderFacets({forLang, forTopic, forOwner}, queryKey) {
-  const k = [S.repos, S.forkMode, filters.lang, filters.topic, filters.owner, filters.gone, filters.family, filters.kind, queryKey, S.indexVer, hiddenVer];   // indexVer: README / history text changed · hiddenVer: a fork scan changed its result
+  const k = [S.repos, S.forkMode, filters.lang, filters.topic, filters.owner, filters.gone, filters.family, filters.kind, [...filters.quick].join(), queryKey, S.indexVer, hiddenVer];   // indexVer: README / history text changed · hiddenVer: a fork scan changed its result
   if (facetsKey && k.every((v, i) => v === facetsKey[i])) return;
   facetsKey = k;
   const row = (kind, active, [v, c]) =>
@@ -598,7 +652,11 @@ function renderFacets({forLang, forTopic, forOwner}, queryKey) {
   const forkRow = (mode, label, c, title) => c || S.forkMode === mode ? `<div class="facet ${S.forkMode === mode ? 'on' : ''}" tabindex="0" role="button" data-forkmode="${mode}" title="${title}"><span>${label}</span><span class="muted">${c}</span></div>` : '';
   const forks = forkRow('only', '⑂ Forks', nFork, 'Repos GitHub marks as forks') +
     forkRow('onlyHidden', '⧉ Hidden forks', nHidden, 'Copies of another of your stars that GitHub does not mark as forks (same commits, README, description or name)');
-  const status = gone || forks ? `<h3>Status</h3>${gone}${forks}` : '';
+  const quick = Object.entries(QUICK).map(([key, [label, test, query]]) => {
+    const c = S.repos.filter(test).length, on = filters.quick.has(key);
+    return c || on ? `<div class="facet ${on ? 'on' : ''}" tabindex="0" role="button" data-quick="${key}" title="Click to show only these · search: ${query}"><span>${label}</span><span class="muted">${c}</span></div>` : '';
+  }).join('');
+  const status = gone || forks || quick ? `<h3>Status</h3>${gone}${forks}${quick}` : '';
   $('#facets').innerHTML = status + fileKindsBlock() + block('Languages', 'lang', tally(forLang, r => r.lang), 15) +
     block('Topics', 'topic', tally(forTopic, r => r.topics), 30) +
     block('Owners', 'owner', tally(forOwner, r => r.owner).filter(([v, c]) => c > 1 || v === filters.owner), 15);
@@ -614,7 +672,7 @@ export function exportText(repos, fmt, user) {
   return fmt === 'json'
     ? JSON.stringify(repos.map(r => hiddenFork(r) ? {...r, hiddenForkOf: hiddenFork(r).of.full} : r), (k, v) => NOT_EXPORTED.has(k) ? undefined : v, 2)
     : `# ★ ${user}'s Starred Repositories (${repos.length})\n\n` +
-      repos.map(r => `- **[${r.full}](${r.url})** (★ ${fmtN(r.stars)}${r.lang ? ` · ${r.lang}` : ''})${r.about ? ` — ${oneLine(r.about)}` : ''}${r.fork ? ' (fork)' : hiddenFork(r) ? ` (hidden fork of ${hiddenFork(r).of.full})` : ''}`).join('\n') + '\n';
+      repos.map(r => `- **[${r.full}](${r.url})** (★ ${fmtN(r.stars)}${r.lang ? ` · ${r.lang}` : ''})${aboutOf(r).text ? ` — ${oneLine(aboutOf(r).text)}` : ''}${r.fork ? ' (fork)' : hiddenFork(r) ? ` (hidden fork of ${hiddenFork(r).of.full})` : ''}`).join('\n') + '\n';
 }
 
 /** Downloads the currently shown (filtered and sorted) repositories as Markdown or JSON. */
@@ -757,11 +815,14 @@ export function initList() {
     if (fam) { filters.family = filters.family === fam.dataset.family ? null : fam.dataset.family; limit = PAGE; render(); return; }
     const fk = e.target.closest('[data-kind]');
     if (fk) { filters.kind = filters.kind === fk.dataset.kind ? null : fk.dataset.kind; info('list', filters.kind ? `showing only repos with ${kindName(filters.kind)} files` : 'file-kind filter removed'); limit = PAGE; render(); return; }
+    const qk = e.target.closest('#facets [data-quick], #count [data-quick]');
+    if (qk) { const key = qk.dataset.quick; if (!filters.quick.delete(key)) filters.quick.add(key); limit = PAGE; render(); return; }
     const fm = e.target.closest('#facets [data-forkmode]');
     if (fm) { applyForkMode(S.forkMode === fm.dataset.forkmode ? 'all' : fm.dataset.forkmode); return; }
     if (e.target.closest('[data-clear-filters]')) {
       filters.lang = filters.topic = filters.owner = filters.family = filters.kind = null;
       filters.gone = false;
+      filters.quick.clear();
       limit = PAGE; render();
       return;
     }
@@ -769,6 +830,14 @@ export function initList() {
     if (!el) return;
     for (const k of ['lang', 'topic', 'owner']) if (el.dataset[k] !== undefined) filters[k] = filters[k] === el.dataset[k] ? null : el.dataset[k];
     limit = PAGE; render();
+  });
+  // A chart bar's tooltip becomes a real <title> the moment the pointer reaches it (see the charts above).
+  document.addEventListener('mouseover', e => {
+    const t = e.target;
+    if (!t?.dataset?.t || t.firstChild) return;
+    const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+    title.textContent = t.dataset.t;
+    t.append(title);
   });
   // "/" focuses the search box (unless typing in a field); Enter/Space activates role="button" elements.
   document.addEventListener('keydown', e => {

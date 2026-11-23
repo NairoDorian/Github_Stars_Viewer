@@ -119,6 +119,37 @@ export function waitForRefill(e, g, label) {
   return p;
 }
 
+/** GitHub's "slow down" (its secondary rate limit: too many requests in a short time, while the hourly budget still has
+ *  room). baseMs: the pause when GitHub names none (its documentation asks for at least a minute), doubled for every
+ *  pause in a row; max: that many pauses in a row end the pull. A knob so tests don't wait. */
+export const SLOW = {baseMs: 60_000, max: 4};
+let slowWait = null, slowStreak = 0;
+/**
+ * A REST pull was told to slow down: every worker shares one pause (the time GitHub named, at least baseMs, longer each
+ * time in a row), then the pull continues. Resolves true to ask again; false when it can't: Cancel, another profile
+ * (`g`), or GitHub still saying so after SLOW.max pauses in a row. The status line counts down meanwhile.
+ */
+export function waitSlowDown(e, g, label) {
+  if (!e?.secondary) return Promise.resolve(false);
+  if (slowWait) return slowWait;
+  if (slowStreak >= SLOW.max) { warn('budget', `${label}: GitHub still asks to slow down after ${SLOW.max} pauses in a row: stopping here, progress is kept`); return Promise.resolve(false); }
+  const ms = Math.max((e.retryAfter || 0) * 1000, SLOW.baseMs * 2 ** slowStreak), until = Date.now() + ms;
+  slowStreak++;
+  const run = async () => {
+    warn('budget', `${label}: GitHub asked to slow down (too many requests at once; the budget is not used up): pausing ${inTime(ms)}, then continuing with fewer requests at a time (pause ${slowStreak} of at most ${SLOW.max} in a row)`);
+    while (Date.now() < until) {
+      if (S.stop || g !== S.gen) return false;
+      status(`⏸ ${label}: GitHub asked to slow down. Continuing automatically in ${inTime(until - Date.now())} · ■ Cancel to stop now, progress is saved`);
+      await sleep(Math.min(1000, until - Date.now()));
+    }
+    return !(S.stop || g !== S.gen);
+  };
+  const p = slowWait = run().finally(() => { if (slowWait === p) slowWait = null; });
+  return p;
+}
+/** Requests go through again: the next "slow down" starts from the short pause. */
+export const slowDownOver = () => { slowStreak = 0; };
+
 /** One line for logs and pull plans: "REST 1,204 / 5,000 left (refills at 18:47:42, in 52 s)". */
 export function budgetLine(kind) {
   const b = budgetNow(kind);

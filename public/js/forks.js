@@ -411,9 +411,20 @@ export async function settleForks() { if (timer) await new Promise(r => setTimeo
 export function copyOfStar(x) {
   const name = normName(String(x.full_name || '').split('/')[1]), owner = String(x.full_name || '').split('/')[0].toLowerCase();
   if (!name || x.fork) return null;
-  for (const r of S.repos) {
-    if (normName(r.name) !== name || String(r.owner).toLowerCase() === owner) continue;
+  for (const r of starsNamed(name)) {
+    if (String(r.owner).toLowerCase() === owner) continue;
     if (descMatch(r.about, x.description) && older(r, {created: x.created_at, stars: x.stargazers_count}) === r) return r;
   }
   return null;
+}
+// Your stars by normalized name, built once per star list: every suggestion on screen asks, and normalizing thousands of
+// names for each of them added up.
+let namedFor = null, named = new Map();
+function starsNamed(name) {
+  if (namedFor !== S.repos) {
+    namedFor = S.repos;
+    named = new Map();
+    for (const r of S.repos) { const k = normName(r.name), list = named.get(k); if (list) list.push(r); else named.set(k, [r]); }
+  }
+  return named.get(name) || [];
 }

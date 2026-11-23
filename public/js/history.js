@@ -38,13 +38,13 @@
   of commits per repo can change. Release notes are always kept whole (records cut by an older version's length cap are
   fetched again). Stripping is applied to already stored notes without any request; going the other way (keeping what
   was stripped) marks the repos so their release notes are fetched again. */
-import {S, rkey, bumpIndex, indexedParts, commitsPulled, releasesPulled} from './state.js';
+import {S, rkey, ukey, bumpIndex, indexedParts, commitsPulled, releasesPulled} from './state.js';
 export {indexedParts};
 import {$, DAY, status, secs, pool, chunks, sleep} from './util.js';
 import {plan, start, report, finish} from './progress.js';
 import {gqlRepos, isFatalError, needToken, parseLast, readBudget} from './github.js';
 import {waitForRefill, budgetLine} from './budget.js';
-import {saveHistory, saveStars, markHistory, markAllHistory, historyDirty} from './store.js';
+import {saveHistory, saveStars, saveHistOpts, markHistory, markAllHistory, historyDirty} from './store.js';
 import {debug, info, warn, error, names} from './log.js';
 import {render, prepareHistorySearch} from './list.js';
 
@@ -106,6 +106,62 @@ export function keepLegacyCommitCap(history = S.history) {
   setHistOpts({commits: LEGACY_COMMITS});
   info('history', `this index was built with the old default of ${LEGACY_COMMITS.toLocaleString()} commits per repo: that limit is kept (pick another one in the ▾ panel)`);
   return true;
+}
+/**
+ * The options belong to the stored index, not to the browser that happens to open it. They are a per-browser preference
+ * (localStorage), but the index lives in the data/ folder (or IndexedDB): opened from another browser, or after its site
+ * data was cleared, the defaults would be applied to it — and applying a HIGHER commit limit to records cut at a lower
+ * one resets them (2,394 repos' commits gone when an index built with "100 per repo" met the default of 1,000), a lower
+ * one cuts them, and "strip @mentions" strips notes that were meant to keep theirs. So when a profile is loaded the
+ * options are fitted to what is stored, never the other way round:
+ *   · `stored`: the choice kept with the index (store.js saveHistOpts, written at every pull and option change) wins;
+ *   · without one (an index written by an older version), the commit limit is read from the records (the length they
+ *     were cut at; else a limit that cuts nothing), and the notes options are taken from the records unless this browser
+ *     has its own choice that strips nothing they kept.
+ * Changing an option in the ▾ menus still applies it to the stored records: that is an explicit choice.
+ * Returns true when the options changed.
+ */
+export function fitOptsToIndex(stored = null, history = S.history) {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(OPT_KEY) || '{}') || {}; } catch {}
+  const cur = histOpts(), next = {};
+  if (stored && typeof stored === 'object') Object.assign(next, {mentions: stored.mentions, links: stored.links, commits: stored.commits});
+  else {
+    let cutAt = 0, most = 0;
+    const flags = new Map();
+    for (const [k, h] of Object.entries(history)) {
+      if (k.startsWith('_') || !h) continue;
+      const n = h.c?.length || 0;
+      if (n > most) most = n;
+      if (h.capped && n > cutAt) cutAt = n;
+      if (h.rel?.length && typeof h.ro === 'string') { const f = h.ro.split(':')[0]; flags.set(f, (flags.get(f) || 0) + 1); }
+    }
+    if (cutAt) next.commits = cutAt;   // records were cut there: that is the limit this index was built with
+    else if (most > lim(cur.commits)) next.commits = saved.commits === undefined && most <= LEGACY_COMMITS ? LEGACY_COMMITS : COMMIT_CHOICES.find(c => c >= most) ?? UNLIMITED;   // nothing stored is cut
+    const usual = [...flags].sort((a, b) => b[1] - a[1])[0]?.[0];
+    if (usual !== undefined) {
+      const m = usual.includes('m'), l = usual.includes('l');
+      if (saved.mentions === undefined || (cur.mentions && !m)) next.mentions = m;   // this browser never chose, or its choice would strip what the index kept
+      if (saved.links === undefined || (cur.links && !l)) next.links = l;
+    }
+  }
+  for (const k of Object.keys(next)) if (next[k] === undefined || next[k] === null) delete next[k];   // a missing value keeps the current one
+  if (!Object.keys(next).length) return false;
+  const before = optFlags(cur) + '|' + cur.commits, now = setHistOpts(next);
+  if (optFlags(now) + '|' + now.commits === before) return false;
+  info('history', `options fitted to the stored index (${stored ? 'the choice kept with it' : 'read from its records'}): commits ${now.commits ? now.commits.toLocaleString() + ' per repo' : 'ALL'}, @mentions ${now.mentions ? 'stripped' : 'kept'}, links ${now.links ? 'stripped' : 'kept'} — nothing stored is cut, stripped or reset by opening it`);
+  return true;
+}
+// Which options the store holds for which profile, so they are written only when they differ.
+let keptFor = '', keptKey = null;
+const optsKey = o => `${optFlags(o)}|${o.commits}`;
+/** What the store holds for `user` (the record read at load, null when none). */
+export const noteStoredOpts = (user, stored) => { keptFor = user; keptKey = stored && typeof stored === 'object' ? optsKey(sanitize(stored)) : null; };
+/** Keeps the current options with the stored index (a small record of its own), so every browser that opens it uses them. */
+export async function keepOptsWithIndex(g = S.gen) {
+  const o = histOpts(), key = optsKey(o), user = ukey();
+  if (keptFor === user && keptKey === key) return;
+  if (await saveHistOpts(g, {mentions: o.mentions, links: o.links, commits: o.commits})) { keptFor = user; keptKey = key; }
 }
 /** What a release record was fetched with: "m" mentions stripped, "l" links stripped, then the notes length cap. */
 export const optFlags = o => `${o.mentions ? 'm' : ''}${o.links ? 'l' : ''}:${o.notes}`;
@@ -577,6 +633,7 @@ export async function syncHistory(g, repos, {force = false, parts = BOTH} = {}) 
   if (!S.token) return {summary: `${what} need a token`};
   if (!parts.commits && !parts.releases) return {summary: ''};
   const run = newRun(g, parts);
+  await keepOptsWithIndex(g);   // the options this index is built with are kept with it (see fitOptsToIndex)
   reconcile(run.o);   // options changed since the records were written? apply what can be applied locally
   repos = repos.filter(r => !r.gone);   // a repo GitHub no longer shows can't be indexed: its stored index stays
   const todo = force ? repos : repos.filter(r => needsHistory(r, parts));

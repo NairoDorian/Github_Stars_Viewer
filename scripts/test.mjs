@@ -17,6 +17,7 @@ const {detectThemes, keywordMembers, collector, pruneResults, linkRound} = await
 const {migrateReadmes, needsEnrich, needsReadme} = await import('../public/js/sync.js');
 const {card, languagesHTML, activityHTML, parseQuery, match, exportText} = await import('../public/js/list.js');
 import {spawn} from 'node:child_process';
+import {get as httpGet} from 'node:http';
 import {rmSync, readFileSync, writeFileSync, mkdtempSync, readdirSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -508,6 +509,16 @@ test('server.js: static serving, HEAD, cache PUT/GET, and DNS-rebinding / cross-
     assert.equal(onDisk[0] === 0x1f && onDisk[1] === 0x8b, true, 'stored gzip-compressed');
     assert.ok(onDisk.length < JSON.stringify(big).length / 3, 'and much smaller');
     assert.deepEqual(await (await fetch(`${base}/cache/${testKey}`)).json(), big);
+    // A client that accepts gzip gets the stored bytes as they are (the server inflates nothing); one that doesn't gets plain JSON.
+    const rawGet = accept => new Promise((resolve, reject) => {
+      httpGet(`${base}/cache/${testKey}`, {headers: accept ? {'Accept-Encoding': accept} : {}}, res => {
+        const chunks = [];
+        res.on('data', c => chunks.push(c)).on('end', () => resolve({status: res.statusCode, encoding: res.headers['content-encoding'] || '', body: Buffer.concat(chunks)})).on('error', reject);
+      }).on('error', reject);
+    });
+    const zipped = await rawGet('gzip, deflate, br'), plain = await rawGet('');
+    assert.deepEqual([zipped.encoding, zipped.body.equals(onDisk)], ['gzip', true], 'the compressed file is passed through untouched');
+    assert.deepEqual([plain.encoding, JSON.parse(plain.body.toString())], ['', big]);
     writeFileSync(testFile, JSON.stringify({legacy: true}));
     assert.deepEqual(await (await fetch(`${base}/cache/${testKey}`)).json(), {legacy: true});
     assert.equal((await fetch(`${base}/cache/%E0%A4%A`)).status, 400, 'a malformed URL is a 400, not a 500');
@@ -526,7 +537,9 @@ test('server.js: static serving, HEAD, cache PUT/GET, and DNS-rebinding / cross-
     // A file that exists but can't be read is an error, never "nothing stored": the app would otherwise build an empty
     // replacement and save it over the real data (it marks the key unreadable instead, see store.js).
     writeFileSync(testFile, Buffer.from([0x1f, 0x8b, 8, 0, 1, 2, 3]));   // a damaged compressed file
-    assert.equal((await fetch(`${base}/cache/${testKey}`)).status, 500);
+    assert.equal((await rawGet('')).status, 500, 'inflated by the server: it fails there');
+    // passed through as it is to a client that inflates it itself: reading the answer fails there (what store.js catches)
+    await assert.rejects(async () => (await fetch(`${base}/cache/${testKey}`)).json(), 'a damaged file is never read as "nothing stored"');
 
     // A missing key is "no data yet" (200 null), not an error.
     const missing = await fetch(`${base}/cache/__nothing_here__`);
@@ -556,5 +569,95 @@ test('server.js: static serving, HEAD, cache PUT/GET, and DNS-rebinding / cross-
     proc.kill();
     rmSync(dataDir, {recursive: true, force: true});
   }
+});
+
+// ---------- README summaries, health and licence, lighter samples, "slow down" on REST ----------
+test('a repo without a description shows how its README begins, and is found by it', async () => {
+  const {summarize} = await import('../public/js/state.js');
+  const {aboutOf} = await import('../public/js/list.js');
+  const readme = ['<p align="center"><img src="logo.png"></p>', '', '# Tiny Logger', '[![build](https://ci.test/b.svg)](https://ci.test) ![stars](https://img.test/s.svg)', '',
+    'English | 简体中文', '', '- [Install](#install)', '- [Usage](#usage)', '', '> [!NOTE]', '> Work in progress.', '', '| a | b |', '|---|---|', '',
+    'A **tiny** data logger for the [ESP32-S3](https://espressif.com) that stores samples on an SD card', 'and shows them on an e-paper display.', '',
+    '## Install', '```', 'pip install tiny', '```'].join('\n');
+  const first = 'A tiny data logger for the ESP32-S3 that stores samples on an SD card and shows them on an e-paper display.';
+  assert.equal(summarize(readme), first, 'the first real paragraph: no title, badge, language switch, table of contents, notice, table or code');
+  assert.equal(summarize('Title\n=====\n\nShort.\n\nThis second paragraph is long enough to say what the project is about.'), 'This second paragraph is long enough to say what the project is about.');
+  assert.deepEqual([summarize(''), summarize('# only a title\n\n![x](y.png)'), summarize(null)], ['', '', '']);
+  const long = summarize('word '.repeat(200), 60);
+  assert.ok(long.length <= 61 && long.endsWith('…') && !long.includes('  '), long);
+  // on a card, and in the search
+  const r = {id: 901, full: 'o/logger', name: 'logger', owner: 'o', about: '', topics: [], url: 'https://github.com/o/logger', stars: 1};
+  const described = {...r, id: 902, about: 'Has its own words'};
+  assert.equal(match(r, parseQuery('e-paper'), false), null, 'nothing to go by before its README is pulled');
+  assert.match(card(r), /No description/);
+  S.readmes = {901: {t: readme}, 902: {t: readme}};
+  assert.deepEqual(aboutOf(r), {text: first, fromReadme: true});
+  assert.ok(match(r, parseQuery('e-paper'), false), 'found by the summary, without ticking README search');
+  assert.match(card(r), /class="muted from-readme"[^>]*>A tiny data logger/);
+  assert.deepEqual([aboutOf(described).fromReadme, match(described, parseQuery('e-paper'), false)], [false, null], 'a repo with a description keeps it');
+  assert.match(exportText([r], 'md', 'me'), /o\/logger\]\(https:\/\/github\.com\/o\/logger\)\*\* \(★ 1\) — A tiny data logger/);
+  S.readmes = {};
+});
+
+test('search: is:alive / is:quiet / is:stale and license: say whether a repo is maintained and how it may be used', async () => {
+  const {healthOf} = await import('../public/js/list.js');
+  const daysAgo = days => new Date(Date.now() - days * DAY).toISOString();
+  const base = {owner: 'o', topics: [], stars: 1, url: 'https://github.com/o/x'};
+  const alive = {...base, id: 911, full: 'o/alive', name: 'alive', pushed: daysAgo(30), license: 'MIT'};
+  const quiet = {...base, id: 912, full: 'o/quiet', name: 'quiet', pushed: daysAgo(500), commitAt: daysAgo(600), license: 'GPL-3.0'};
+  const stale = {...base, id: 913, full: 'o/stale', name: 'stale', pushed: daysAgo(900), license: null};
+  const shelved = {...base, id: 914, full: 'o/shelved', name: 'shelved', pushed: daysAgo(1200), archived: true, license: 'NOASSERTION'};
+  const dateless = {...base, id: 915, full: 'o/dateless', name: 'dateless', license: 'Apache-2.0'};
+  const all = [alive, quiet, stale, shelved, dateless], which = q => all.filter(r => match(r, parseQuery(q), false)).map(r => r.name);
+  assert.deepEqual(all.map(r => healthOf(r)), ['alive', 'quiet', 'stale', 'archived', '']);
+  assert.deepEqual(which('is:alive'), ['alive', 'dateless'], 'a repo without any date is not judged (the qualifier is ignored for it)');
+  assert.deepEqual(which('is:quiet'), ['quiet', 'dateless']);
+  assert.deepEqual(which('is:stale'), ['stale', 'shelved', 'dateless'], 'nothing pushed for two years, archived or not');
+  assert.deepEqual(which('-is:stale'), ['alive', 'quiet', 'dateless']);
+  assert.deepEqual([which('license:none'), which('license:mit'), which('license:gpl'), which('license:copyleft'), which('license:permissive'), which('license:other'), which('licence:any')],
+    [['stale'], ['alive'], ['quiet'], ['quiet'], ['alive', 'dateless'], ['shelved'], ['alive', 'quiet', 'shelved', 'dateless']]);
+  assert.equal(match(alive, parseQuery('mit'), false), null, 'the licence is not free text: "mit" does not match every MIT repo');
+  // the dot on the card
+  assert.match(card(alive), /class="health alive"/);
+  assert.match(card(quiet), /class="health quiet"/);
+  assert.match(card(shelved), /class="health archived"/);
+  assert.ok(!card(dateless).includes('class="health'));
+});
+
+test('star samples: a stretch of days without a new star is kept as its two ends, and the gains drawn are the same', () => {
+  const d = n => Date.UTC(2026, 0, 1) + n * DAY;
+  const daily = [10, 10, 10, 10, 12, 12, 12, 15, 15, 15, 15, 15].map((c, i) => [d(i), c]);
+  let h = [];
+  for (const [t, c] of daily) h = recordStars(h, c, t);
+  assert.deepEqual(h, [[d(0), 10], [d(3), 10], [d(4), 12], [d(6), 12], [d(7), 15], [d(11), 15]]);
+  assert.deepEqual(starGains(h, d(11)), starGains(daily, d(11)), 'nothing is lost for the chart');
+  // samples stored one a day by an older version are packed the same way at the next check
+  assert.deepEqual(recordStars(daily, 15, d(12)), [[d(0), 10], [d(3), 10], [d(4), 12], [d(6), 12], [d(7), 15], [d(12), 15]]);
+  // the same day again replaces today's sample
+  assert.deepEqual(recordStars([[d(0), 5], [d(1), 5]], 9, d(1) + 1000), [[d(0), 5], [d(1), 9]]);
+  assert.deepEqual(recordStars([[d(0), 5], [d(1), 5], [d(2), 9]], 5, d(2) + 1000), [[d(0), 5], [d(2), 5]]);
+});
+
+test('github REST: "slow down" is told from a used-up budget and from a blocked repository; a failed page of stars is not read as stars', async () => {
+  const {gh, starredOf} = await import('../public/js/github.js');
+  const realFetch = globalThis.fetch;
+  const answer = (status, headers = {}, body = {}) => async () => ({ok: status >= 200 && status < 300, status, headers: new Headers(headers), json: async () => body});
+  try {
+    globalThis.fetch = answer(403, {'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(Math.floor(Date.now() / 1000) + 600), 'x-ratelimit-resource': 'core'});
+    await assert.rejects(gh('/repos/o/r'), e => e.rateLimited === true && e.fatal === true && !e.secondary, 'the hourly budget: wait for its refill');
+    globalThis.fetch = answer(429, {'x-ratelimit-remaining': '4100', 'retry-after': '90'});
+    await assert.rejects(gh('/repos/o/r'), e => e.secondary === true && e.retryAfter === 90 && !e.rateLimited && !isFatalError(e), 'a 429 with budget left is "slow down", not an hour-long wait');
+    globalThis.fetch = answer(403, {'x-ratelimit-remaining': '4100'}, {message: 'You have exceeded a secondary rate limit.'});
+    await assert.rejects(gh('/repos/o/r'), e => e.secondary === true && !isFatalError(e));
+    globalThis.fetch = answer(403, {'x-ratelimit-remaining': '4100'}, {message: 'Repository access blocked'});
+    await assert.rejects(gh('/repos/o/r'), e => e.status === 403 && e.detail === 'Repository access blocked' && !e.secondary && e.message === 'GitHub 403');
+    globalThis.fetch = answer(502);
+    await assert.rejects(gh('/repos/o/r'), e => e.status === 502 && e.message === 'GitHub 502');
+    // starredOf: page 2 of 2 answers 404 (the account vanished meanwhile)
+    globalThis.fetch = async url => /page=1$/.test(String(url))
+      ? {ok: true, status: 200, headers: new Headers({Link: '<https://api.github.com/x?per_page=100&page=2>; rel="last"'}), json: async () => [{id: 1, full_name: 'a/b'}]}
+      : {ok: false, status: 404, headers: new Headers(), json: async () => ({message: 'Not Found'})};
+    await assert.rejects(starredOf('someone'), /GitHub 404/);
+  } finally { globalThis.fetch = realFetch; }
 });
 

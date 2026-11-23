@@ -15,11 +15,29 @@ jobs:
       matrix:
         node: [20, 22, 24]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
       - run: npm run check
+  e2e:   # the app in a real browser (Playwright's Chromium) against a fake GitHub: catches what the unit tests can't see
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - run: npm i --no-save playwright
+      - run: npx playwright install --with-deps chromium
+      - run: node scripts/e2e.mjs
+        env:
+          E2E_CHANNEL: ''   # Playwright's own Chromium, not an installed Chrome
+      - if: failure()   # what the page looked like when it failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure
+          path: e2e-failure.png
+          if-no-files-found: ignore
   deploy:
     needs: test
     if: github.event_name != 'pull_request'
@@ -35,7 +53,7 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/configure-pages@v5
       - name: Stamp this deploy's version on every file URL   # a browser's 10-minute cache then can't mix files of two deploys
         run: |

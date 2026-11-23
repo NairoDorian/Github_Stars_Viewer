@@ -48,7 +48,7 @@ export const error = (area, text) => log(area, text, 'error');
 export const entries = () => buf.slice();
 /** The whole log as plain text, one line per entry (what Copy and Save give): time, gap, level, area, text. */
 export const text = () => buf.map(e => `${stamp(e.t)} ${gap(e.gap).padStart(7)} ${e.level.toUpperCase().padEnd(5)} [${e.area}] ${e.text}`).join('\n') + '\n';
-export function clearLog() { buf.length = 0; trimmed = 0; render(); }
+export function clearLog() { buf.length = 0; trimmed = 0; fromScratch = true; render(); }
 
 // ---------- what you do: clicks, links, switches ----------
 const clean = s => String(s ?? '').replace(/\s+/g, ' ').trim();
@@ -85,15 +85,37 @@ export function changeLine(e) {
 const el = sel => globalThis.document?.querySelector?.(sel) ?? null;
 const PREF = 'starsViewer.console';   // localStorage: {debug, collapsed}
 
+// A pull writes hundreds of lines a second. The panel is not rebuilt for them: only the new lines are added at the end
+// (and the oldest taken away beyond LOG.visible), and nothing at all is drawn while the panel is collapsed or the tab is
+// in the background — it catches up when it shows again.
+let drawn = 0;          // how many lines (counted since the page opened: trimmed + position in buf) the panel has dealt with
+let fromScratch = true; // the panel must be rebuilt: first draw, "detail" switched, cleared
+const lineHTML = e => `<div class="ln ${e.level}"><time>${stamp(e.t)}</time> <i>${gap(e.gap)}</i> <b>${escape(e.area)}</b> ${escape(e.text)}</div>`;
+
 function render() {
   const body = el('#conBody');
   if (!body) return;
-  const min = ui.debug ? 0 : 1, shown = [];
-  for (let i = buf.length - 1; i >= 0 && shown.length < LOG.visible; i--) if (LEVELS[buf[i].level] >= min) shown.push(buf[i]);
-  shown.reverse();
-  body.innerHTML = shown.map(e => `<div class="ln ${e.level}"><time>${stamp(e.t)}</time> <i>${gap(e.gap)}</i> <b>${escape(e.area)}</b> ${escape(e.text)}</div>`).join('');
   const count = el('#conCount');
   if (count) count.textContent = `${buf.length.toLocaleString()} lines${trimmed ? ` (${trimmed.toLocaleString()} older ones dropped)` : ''}`;
+  if (ui.collapsed || globalThis.document?.hidden) return;   // nobody is looking
+  const min = ui.debug ? 0 : 1, total = trimmed + buf.length;
+  let added = null;
+  if (!fromScratch && drawn >= trimmed && drawn <= total && typeof body.insertAdjacentHTML === 'function') {
+    added = [];
+    for (let i = drawn - trimmed; i < buf.length && added.length <= LOG.visible; i++) if (LEVELS[buf[i].level] >= min) added.push(buf[i]);
+    if (added.length > LOG.visible) added = null;   // more new lines than the panel shows: simpler from scratch
+  }
+  if (added) {
+    if (added.length) body.insertAdjacentHTML('beforeend', added.map(lineHTML).join(''));
+    for (let extra = body.childElementCount - LOG.visible; extra > 0; extra--) body.firstElementChild.remove();
+  } else {
+    const shown = [];
+    for (let i = buf.length - 1; i >= 0 && shown.length < LOG.visible; i--) if (LEVELS[buf[i].level] >= min) shown.push(buf[i]);
+    shown.reverse();
+    body.innerHTML = shown.map(lineHTML).join('');
+    fromScratch = false;
+  }
+  drawn = total;
   if (ui.follow) body.scrollTop = body.scrollHeight;
 }
 
@@ -117,8 +139,9 @@ export function initLog() {
     el('#conFollow').checked = ui.follow;
   };
   apply();
-  el('#conToggle').onclick = () => { ui.collapsed = !ui.collapsed; apply(); savePrefs(); };
-  el('#conDebug').onchange = e => { ui.debug = e.target.checked; savePrefs(); render(); };
+  el('#conToggle').onclick = () => { ui.collapsed = !ui.collapsed; apply(); savePrefs(); render(); };   // expanded: it catches up
+  el('#conDebug').onchange = e => { ui.debug = e.target.checked; savePrefs(); fromScratch = true; render(); };
+  doc?.addEventListener?.('visibilitychange', () => { if (!doc.hidden) render(); });   // back in front: it catches up
   el('#conFollow').onchange = e => { ui.follow = e.target.checked; render(); };
   el('#conClear').onclick = clearLog;
   el('#conCopy').onclick = async () => {

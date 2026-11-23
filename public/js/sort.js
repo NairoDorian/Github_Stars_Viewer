@@ -38,15 +38,19 @@ const value = (repo, key) => {
   return null;
 };
 
+/** Sorts `items` in place (and returns them). Every item's value is read once, not at every comparison: a list of
+ *  thousands is compared tens of thousands of times, and a value can be a date to parse or a count to add up. */
 export function sortRepos(items, key, fallback = 'name') {
   const direction = key === 'name' || key === 'owner' || key === 'starsAsc' ? 1 : -1;
-  return items.sort((a, b) => {
-    const x = value(a, key), y = value(b, key);
+  const rows = items.map(item => ({item, v: value(item, key), f: value(item, fallback) || ''}));
+  rows.sort((a, b) => {
+    const x = a.v, y = b.v;
     if (x == null && y != null) return 1;
     if (y == null && x != null) return -1;
     if (x != null && y != null && x !== y) return (x < y ? -1 : 1) * direction;
     // Equal values retain a predictable order even after new details arrive.
-    const ax = value(a, fallback) || '', bx = value(b, fallback) || '';
-    return ax < bx ? -1 : ax > bx ? 1 : 0;
+    return a.f < b.f ? -1 : a.f > b.f ? 1 : 0;
   });
+  for (let i = 0; i < rows.length; i++) items[i] = rows[i].item;
+  return items;
 }

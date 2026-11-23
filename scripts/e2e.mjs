@@ -41,7 +41,7 @@ page.on('console', m => { if (m.type() === 'error' && !/404|403|Failed to load r
 
 // ---- the cache lives in memory; we also record which keys were written ----
 const store = {config: JSON.stringify({token: 'ghp_fake', user: 'e2etest'})};
-let puts = [], wiped = 0;
+let puts = [], reads = [], wiped = 0;
 await page.route(/\/cache(\/.*)?$/, async r => {
   const req = r.request(), path = decodeURIComponent(new URL(req.url()).pathname), key = path.slice(7);
   if (req.method() === 'DELETE' && (path === '/cache' || path === '/cache/')) {
@@ -51,6 +51,8 @@ await page.route(/\/cache(\/.*)?$/, async r => {
     return r.fulfill({status: 200, contentType: 'application/json', body: JSON.stringify({deleted})});
   }
   if (req.method() === 'PUT') { store[key] = req.postData(); puts.push(key); return r.fulfill({status: 204}); }
+  if (req.method() === 'DELETE') { delete store[key]; return r.fulfill({status: 204}); }
+  reads.push(key);
   return r.fulfill({status: 200, contentType: 'application/json', body: store[key] || 'null'});
 });
 
@@ -330,13 +332,20 @@ try {
   await waitStatus(/📁 8 files listed in 3 repos/, 30000);
   assert.equal(calls.trees, 3, 'one request per repo');
   assert.equal(await page.isChecked('#inFiles'), true);
+  assert.ok(puts.includes('filesum:e2etest') && puts.some(k => /^paths:e2etest:\d+$/.test(k)) && !puts.some(k => k.startsWith('files:')),
+    'stored as one record of summaries plus the packed paths in their shards: ' + [...new Set(puts.map(k => k.replace(/:\d+$/, ':N')))]);
   assert.match(await page.textContent('#facets'), /File kinds[\s\S]*PCB & schematic sources\s*1[\s\S]*Embedded firmware\s*1[\s\S]*3D CAD models\s*1/);
   assert.match(await search('has:pcb'), /^1 of 3/);
   assert.match(await search('has:hardware -has:3d'), /^0 of 3/);
   assert.match(await search('ext:step'), /^1 of 3/);
   assert.match(await search('build:platformio'), /^1 of 3/);
+  // the file names themselves are read from the store for the search (shown next to the checkbox while it lasts)
+  const namesRead = () => until(() => /^\(\d/.test(document.querySelector('#cntFiles').textContent.trim()), null, 30000);
+  await namesRead();
   assert.match(await search('lid.step'), /^1 of 3/, 'file names are searched');
   assert.match(await page.locator('.snip').first().innerText(), /File .*case\/lid\.step/);
+  assert.match(await search('path:hardware/'), /^1 of 3/);
+  assert.match(await search('HARDWARE/board.kicad'), /^1 of 3/, 'across folder and name, any case');
   await page.fill('#q', '');
   await page.click('#facets [data-kind="pcb"]');
   assert.match(await count(), /^1 of 3/, 'the sidebar row filters');
@@ -384,10 +393,24 @@ try {
 
   // ---- reload: state comes back from the shards, panel state is remembered ----
   await page.fill('#q', '');
+  await page.uncheck('#inFiles');
+  reads = [];
   await page.reload();
   // "N stars" shows as soon as the star list is read, before the commit index is; the check that follows the load means
   // everything was read.
   await waitStatus(/all checked/);
+  // File lists: what the files are comes back with one small record; the names are not read until a search wants them.
+  assert.match(await page.textContent('#facets'), /File kinds[\s\S]*PCB & schematic sources\s*1/);
+  assert.match(await search('has:pcb'), /^1 of 3/);
+  if (!(await page.isChecked('#inFiles'))) {
+    assert.ok(reads.includes('filesum:e2etest') && !reads.some(k => k.startsWith('paths:')), 'a start reads the summaries, not a single path shard');
+    await page.check('#inFiles');
+  }
+  await until(() => /^\(\d/.test(document.querySelector('#cntFiles').textContent.trim()), null, 30000);
+  assert.ok(reads.some(k => k.startsWith('paths:e2etest:')), 'ticking Files reads them');
+  assert.match(await search('lid.step'), /^1 of 3/);
+  await page.uncheck('#inFiles');
+  await page.fill('#q', '');
   assert.equal(await page.inputValue('#optCommits'), '0', 'the "no limit" choice is remembered');
   await page.check('#inCommits'); await page.check('#inReleases');
   assert.match(await search('zebra crash'), /^1 of 3/);

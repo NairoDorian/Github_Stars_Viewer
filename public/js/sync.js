@@ -20,11 +20,11 @@ import {S, rkey, ukey, bumpIndex, indexedParts} from './state.js';   // S.visit:
 import {$, DAY, status, secs, pool, chunks} from './util.js';
 import {plan, start, report, finish, stopAll, settle} from './progress.js';
 import {gh, ghFetch, headers, gqlRepos, isFatalError, mapStar, gitSha, needToken, LANG_FIELDS, LAST_FIELDS, parseLast, languageShares, activityFields, parseActivity, recordStars} from './github.js';
-import {saveStars, saveReadmes, saveHistory, saveUsers, markHistory, saveFiles, markFiles} from './store.js';
+import {saveStars, saveReadmes, saveHistory, saveUsers, markHistory, saveFiles} from './store.js';
 import {debug, info, warn, error, names} from './log.js';
 import {render} from './list.js';
 import {syncHistory, partsLabel} from './history.js';
-import {fetchFiles, needsFiles} from './files.js';
+import {fetchFiles, needsFiles, forgetFileList} from './files.js';
 import {inTime} from './budget.js';
 
 const ENRICH_MAX_AGE = 7 * DAY, README_MAX_AGE = 30 * DAY;
@@ -79,6 +79,7 @@ async function withLock(fn) {
  *  A job of an earlier generation (the profile was loaded again) is stopping, but may still hold the profile's lock: the
  *  new job starts once it has ended, instead of finding the lock taken and reporting another tab. */
 export function task(job) {
+  if (!S.user) { status('👋 Enter a GitHub username (or profile URL) and click Load stars first.'); return Promise.resolve(); }   // nothing is loaded: there is nobody to ask GitHub about
   if (S.loading) { warn('task', `${job.name || 'job'} not started: the cached data of ${S.user} is still being read`); status('⏳ Still reading the cached data, try again in a moment'); return Promise.resolve(); }
   if (running && runningGen === S.gen) { warn('task', `${job.name || 'job'} not started: another task is still running`); status('⏳ Busy with another task, please wait'); return running; }
   const g = S.gen, cancel = $('#cancelTask'), previous = running || Promise.resolve();
@@ -316,7 +317,7 @@ export async function sync(g) {
   for (const k of confirmed) {
     delete S.readmes[k];
     if (S.history[k]) { delete S.history[k]; markHistory(k); }
-    if (S.files[k]) { delete S.files[k]; markFiles(k); }
+    forgetFileList(k);
   }
   gone.keys = new Set(orphans.filter(k => !confirmed.includes(k)));
   if (orphans.length) info('sync', `${orphans.length - confirmed.length} README / commit index entr(ies) belong to repos missing from the list for the first time: kept until a second check agrees · ${confirmed.length} were missing twice in a row: dropped`);

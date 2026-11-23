@@ -7,7 +7,8 @@
 //
 // Keys:  config {token, user} · stars:<user> {v, at, repos, pages} · readmes:<user> {<id>: {…}}
 //        history:<user>:<0-255> {<repo id>: {commit messages + release notes}} (sharded, see below; history.js)
-//        files:<user>:<0-63> {<repo id>: {file paths + what they say about the repo}} (sharded the same way; files.js)
+//        filesum:<user> {v, recs: {<repo id>: what the file list says about the repo}} · paths:<user>:<0-1023> {<repo id>:
+//        the file paths, packed} (read only when file names are searched; see "File lists" below and files.js)
 //        discover:<user> {dismissed, results} · users:<user> {<owner login>: {stars, followers…}} (users.js)
 //        starcurves {<owner/name>: {at, pts}} (star-history.com, all users)
 //
@@ -15,7 +16,7 @@
 // is never written to disk or IndexedDB and is emptied when the visit ends. That is the whole guarantee, enforced here in
 // get() / put(), the only door to storage.
 import {S, ukey} from './state.js';
-import {status} from './util.js';
+import {status, pool} from './util.js';
 import {debug, info, warn, error, bytes} from './log.js';
 
 export const CACHE_VERSION = 2;   // bump if the stored shape changes, and migrate in main.js load(). 2: repos carry ownerType, so older star lists are downloaded once more (their page ETags are dropped)
@@ -28,14 +29,14 @@ const mem = new Map();   // memory mode: the whole cache; browser mode: a copy o
 // "nothing stored", so this tab would build a near-empty replacement; put() refuses to overwrite the real file with it.
 const unreadable = new Set();
 /** Shards of the commit index are logged as a group (writeHistory), not one line each. */
-const quiet = key => /^(?:history|files):[^:]+:\d+$/.test(key);
+const quiet = key => /^(?:history|files|paths):[^:]+:\d+$/.test(key);
 /** "found" / "nothing stored" for a read. The old single-file commit index is expected to be absent: it lives in 256 shards now. */
 const found = (key, v) => v != null ? 'found' : /^history:[^:]+$/.test(key) ? 'nothing stored (normal: the commit index lives in 256 shards, this key only held an older single-file copy)' : 'nothing stored';
 const where = () => mode === 'server' ? 'the data/ folder' : mode === 'browser' ? 'IndexedDB' : 'memory';
 const visitMem = new Map();
 const visited = new Set();   // logins (lower-cased) visited in this tab and not adopted since: put() refuses their keys, whatever happens
 /** The login a profile key belongs to (stars:<user>, history:<user>:<n>…), or null for shared keys (config, starcurves). */
-const keyUser = key => key.match(/^(?:stars|readmes|discover|users|history|files):([^:]+)/)?.[1].toLowerCase() ?? null;
+const keyUser = key => key.match(/^(?:stars|readmes|discover|users|history|histopts|files|filesum|paths):([^:]+)/)?.[1].toLowerCase() ?? null;
 
 /** Starts, switches or (with '') ends a visit. A visit never inherits the previous visit's data. */
 export function setVisit(login) {
@@ -107,7 +108,8 @@ export async function initStore() {
  * files (or IndexedDB online); the caller decides what to do with this tab's data (see main.js). Off: this tab keeps
  * working from memory; IndexedDB is erased (its data is copied to memory first); the local server's files are left
  * untouched, use clearAll() to delete them. Either way this tab's data is kept in memory, so loading the profile again
- * finds it (the local server's files are never copied into memory: they can be hundreds of MB).
+ * finds it. The file paths of the profile on screen are not in this tab's memory (they are read when needed), so they are
+ * carried across by hand, whichever way the switch goes: the next saveAll() hands them to the store then in use.
  */
 export async function setPersist(on) {
   writeCookie(CACHE_COOKIE, on ? '1' : '0');
@@ -115,11 +117,16 @@ export async function setPersist(on) {
   persistOn = on;
   info('store', `Keep cache switched ${on ? 'ON: ' + (serverUp ? 'files in the data/ folder' : 'IndexedDB in this browser') : 'OFF: this tab keeps its data in memory'}`);
   unreadable.clear();   // read failures belong to the backend that was in use
-  if (on) { mode = serverUp ? 'server' : 'browser'; return; }
+  const mine = !!S.user && !S.visit;
+  if (on) {
+    if (mine && mode === 'memory') await carryPaths();   // out of this tab's memory, for the store being switched on
+    mode = serverUp ? 'server' : 'browser';
+    return;
+  }
   if (mode === 'browser') {
     for (const k of await idb('readonly', s => s.getAllKeys())) if (!mem.has(k)) mem.set(k, await idb('readonly', s => s.get(k)));
     await idb('readwrite', s => s.clear());
-  }
+  } else if (mine && mode === 'server') await carryPaths();   // out of the data/ folder: this tab goes on from memory
   mode = 'memory';
   while (S.loading) await S.loading;   // a profile still being read would be kept half-loaded
   if (S.user) await saveAll();   // memory mode: keeps references, nothing is copied or written anywhere
@@ -132,7 +139,7 @@ export async function clearAll() {
   visitMem.clear();
   visited.clear();
   historyShards.forget();
-  fileShards.forget();
+  forgetFiles();
   unreadable.clear();
   let files = 0;
   if (serverUp) {
@@ -156,25 +163,33 @@ export async function saveAll(g = S.gen) {
   await saveReadmes(g);
   markAllHistory();
   await saveHistory(g);
-  fileShards.markAll();
+  if (carried && mayWrite(g)) {   // the file paths carried over from the store that was in use (setPersist, a visit being adopted)
+    const list = carried;
+    carried = null;
+    debug('store', `file paths: ${list.length} shard(s) carried over to ${where()}`);
+    for (const [key, value] of list) await put(key, value, {keep: false});
+  }
+  markFiles();
   await saveFiles(g);
   await saveDisc(g);
   await saveUsers(g);
 }
 
-export async function get(key) {
+/** Reads a key. `keep: false`: online, no copy stays in this tab's memory (the file paths are read when needed and let go
+ *  again; everything else is small enough to keep, so the cache can be switched off without losing it). */
+export async function get(key, {keep = true} = {}) {
   if (S.visit && keyUser(key) !== null) {   // a visit reads nothing stored, not even a copy of that profile saved earlier
     const v = visitMem.get(key) ?? null;
     if (!quiet(key)) debug('visit', `read ${key} from visit memory: ${v == null ? 'nothing yet' : 'found'} (nothing is read from disk during a visit)`);
     return v;
   }
-  return readStored(key);
+  return readStored(key, keep);
 }
 
 /** Reads YOUR stored copy of a key, visit or not (a visit uses it to know which repos you starred). Never writes. */
 export const peek = key => readStored(key);
 
-async function readStored(key) {
+async function readStored(key, keep = true) {
   try {
     if (mode === 'memory') {
       const v = mem.get(key) ?? null;
@@ -184,7 +199,7 @@ async function readStored(key) {
     let v, via = '';
     if (mode === 'browser') {
       v = (await idb('readonly', s => s.get(key))) ?? null;
-      if (v !== null) mem.set(key, v);
+      if (v !== null && keep) mem.set(key, v);
     } else {
       const t0 = Date.now();
       const r = await fetch('/cache/' + encodeURIComponent(key), {cache: 'no-store'});
@@ -207,9 +222,9 @@ async function readStored(key) {
 export const isUnreadable = key => unreadable.has(key);
 
 /** Forgets which history / file-list shards are waiting to be saved (another profile is being loaded: they belong to the old one). */
-export const forgetHistoryDirty = () => { historyShards.forget(); fileShards.forget(); };
+export const forgetHistoryDirty = () => { historyShards.forget(); forgetFiles(); };
 
-export async function put(key, value) {
+export async function put(key, value, {keep = true} = {}) {
   if (S.visit && key !== 'config') {   // kept for this visit only
     visitMem.set(key, value);
     if (!quiet(key)) debug('visit', `${key}: kept in visit memory only, NOT saved`);
@@ -227,7 +242,7 @@ export async function put(key, value) {
     return false;
   }
   try {
-    if (mode !== 'server') mem.set(key, value);   // kept for online tabs (also lets the browser cache be switched on/off later)
+    if (mode === 'memory' || (mode === 'browser' && keep)) mem.set(key, value);   // kept for online tabs (also lets the browser cache be switched on/off later)
     if (mode === 'browser') await idb('readwrite', s => s.put(value, key));
     else if (mode === 'server') {
       const body = JSON.stringify(value), t0 = Date.now();
@@ -243,6 +258,28 @@ export async function put(key, value) {
   }
 }
 
+/** Deletes a stored key for good (a shard that was emptied, a record of an older format that was taken over). True when it
+ *  is gone. A visit only forgets its own memory; a profile that was merely visited is never touched. */
+export async function del(key) {
+  if (S.visit && key !== 'config') { visitMem.delete(key); return true; }
+  const owner = keyUser(key);
+  if (owner !== null && visited.has(owner)) { warn('visit', `refused to delete ${key}: ${owner} was only visited`); return false; }
+  try {
+    mem.delete(key);
+    if (mode === 'browser') await idb('readwrite', s => s.delete(key));
+    else if (mode === 'server') {
+      const r = await fetch('/cache/' + encodeURIComponent(key), {method: 'DELETE'});
+      if (!r.ok) throw new Error('server returned ' + r.status);
+    }
+    unreadable.delete(key);
+    if (!quiet(key)) debug('store', `deleted ${key} from ${where()}`);
+    return true;
+  } catch (e) {
+    error('store', `could not delete ${key} from ${where()}: ${e.message}`);
+    return false;
+  }
+}
+
 // `g` = generation the calling job started in. If the user switched profile meanwhile, nothing is written,
 // so data from one user can never be saved under another. While a profile is being read (S.loading) S still holds a mix of
 // the old and the new profile, so nothing is written then either.
@@ -251,6 +288,9 @@ export const saveStars = (g = S.gen) => mayWrite(g) && put('stars:' + ukey(), {v
 export const saveReadmes = (g = S.gen) => mayWrite(g) && put('readmes:' + ukey(), S.readmes);
 export const saveDisc = (g = S.gen) => mayWrite(g) && put('discover:' + ukey(), S.disc);
 export const saveUsers = (g = S.gen) => mayWrite(g) && put('users:' + ukey(), S.users);
+/** The options the commit / release index of this profile is built with (history.js fitOptsToIndex): kept with the index,
+ *  so another browser opening it uses them instead of applying its own defaults to it. */
+export const saveHistOpts = (g, opts) => mayWrite(g) && put('histopts:' + ukey(), opts);
 /** The config holds the token and YOUR login (S.home), never the profile on screen: a visit must not become the next start's profile. */
 export const saveConfig = () => put('config', {token: S.token, user: S.home});
 
@@ -302,9 +342,8 @@ function shardStore(name, count, label, data) {
   };
 }
 
-export const HISTORY_SHARDS = 256, FILE_SHARDS = 64;
+export const HISTORY_SHARDS = 256;
 const historyShards = shardStore('history', HISTORY_SHARDS, 'commit index', () => S.history);
-const fileShards = shardStore('files', FILE_SHARDS, 'file lists', () => S.files);
 export const shardOf = historyShards.shardOf;
 /** Marks a repo's history record as changed (written by the next saveHistory). */
 export const markHistory = historyShards.mark;
@@ -328,15 +367,191 @@ export async function loadHistory(g = S.gen) {
   return out;
 }
 
-/** Marks a repo's file list as changed (written by the next saveFiles). */
-export const markFiles = fileShards.mark;
-export const markAllFiles = fileShards.markAll;
-export const filesDirty = fileShards.dirty;
-export const saveFiles = (g = S.gen, files = S.files) => mayWrite(g) ? fileShards.save(g, files) : Promise.resolve(false);
-/** Reads the file lists of the profile ({} when none), or null if the profile changed meanwhile. */
+/* File lists. What a repo's files say about it (how many, which kinds, build systems, extensions: a few hundred bytes)
+   is kept for every repo in ONE record, `filesum:<user>`, read when the profile opens. The paths themselves are far
+   bigger (millions of them for a large star list) and only needed to search file names, so they live apart, packed
+   (paths.js), in `paths:<user>:<0-1023>` holding {<repo id>: {d, f}}: read when a search asks for them, never at start.
+   A shard is small (a handful of repos), so changing one repo's list reads, changes and writes a few hundred KB.
+   Earlier versions kept everything, paths as plain arrays, in 64 big shards `files:<user>:<0-63>` that were all read
+   at start: files.js takes those over once (upgradeFiles), shard by shard. */
+export const PATH_SHARDS = 1024, LEGACY_FILE_SHARDS = 64;
+const FILESUM_VERSION = 3;   // 3: summaries apart from the paths (1 and 2 were the 64-shard layouts)
+
+/** Shards of {<repo id>: value} that are NOT kept in memory: a change waits in `pending` until save() reads its shard,
+ *  applies it and writes the shard back. */
+function lazyShards(name, count, label) {
+  const shardOf = k => [...String(k)].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7) % count;
+  const keyOf = (user, i) => `${name}:${user}:${i}`;
+  const all = () => Array.from({length: count}, (_, i) => i);
+  const pending = new Map();   // repo id → the value to store, or null to delete it
+  let saves = Promise.resolve();
+  async function write(g) {
+    if (g !== S.gen) return false;
+    if (!pending.size) return true;
+    const user = ukey(), groups = new Map();
+    for (const [id, v] of pending) { const i = shardOf(id); let list = groups.get(i); if (!list) groups.set(i, list = []); list.push([id, v]); }
+    debug('store', `${label}: ${pending.size} repo(s) changed, in ${groups.size} of ${count} shards (each is read, changed and written back) → ${where()}`);
+    pending.clear();
+    let ok = true;
+    await pool([...groups], 4, async ([i, changes]) => {
+      const keep = () => { ok = false; for (const [id, v] of changes) if (!pending.has(id)) pending.set(id, v); };   // a newer change of the same repo wins
+      if (g !== S.gen) return;   // another profile now: what is left belonged to the old one (its pending changes were forgotten)
+      const key = keyOf(user, i), cur = await get(key, {keep: false});
+      if (g !== S.gen) return;
+      if (cur === null && unreadable.has(key)) return keep();   // never rebuilt from nothing: the stored shard could not be read
+      const next = {...(cur || {})};
+      for (const [id, v] of changes) { if (v == null) delete next[id]; else next[id] = v; }
+      if (cur === null && !Object.keys(next).length) return;   // only deletions, and nothing is stored: nothing to write
+      if (!(Object.keys(next).length ? await put(key, next, {keep: false}) : await del(key))) keep();   // a shard left empty is deleted, not kept as "{}"
+    });
+    if (g !== S.gen) return false;
+    if (!ok) warn('store', `${label}: some shards could not be saved; their changes are kept and written by the next save`);
+    return ok;
+  }
+  return {
+    count, shardOf,
+    /** Stores (or with null deletes) one repo's value at the next save. */
+    set: (id, value) => { pending.set(String(id), value ?? null); },
+    pending: () => pending.size,
+    forget: () => { pending.clear(); },
+    /** Writes the pending changes. True when every one is stored; saves run one after another. */
+    save(g = S.gen) {
+      const run = saves.then(() => write(g));
+      saves = run.catch(() => false);
+      return run;
+    },
+    /** One repo's value: a change not saved yet, else from its shard; null when there is none. */
+    async readOne(id) {
+      id = String(id);
+      if (pending.has(id)) return pending.get(id);
+      return (await get(keyOf(ukey(), shardOf(id)), {keep: false}))?.[id] ?? null;
+    },
+    /** Every repo's value as {out: Map(id → value), failed: shards that could not be read}; null if the profile changed.
+     *  `only(i)`: read just those shards. `onProgress(done, total)` after each one. */
+    async loadAll(g = S.gen, onProgress = null, only = null) {
+      const user = ukey(), out = new Map(), todo = all().filter(i => !only || only(i));
+      let done = 0, failed = 0;
+      await pool(todo, 8, async i => {
+        if (g !== S.gen) return;
+        const key = keyOf(user, i), part = await get(key, {keep: false});
+        if (part) for (const [id, v] of Object.entries(part)) out.set(id, v);
+        else if (unreadable.has(key)) failed++;
+        onProgress?.(++done, todo.length);
+      });
+      if (g !== S.gen) return null;
+      for (const [id, v] of pending) { if (v == null) out.delete(id); else if (!only || only(shardOf(id))) out.set(id, v); }
+      return {out, failed};
+    },
+    /** Every stored shard as [[key, {<id>: value}]…], pending changes not included (a snapshot to carry elsewhere). */
+    async exportAll() {
+      const user = ukey(), list = [];
+      await pool(all(), 8, async i => { const key = keyOf(user, i), part = await get(key, {keep: false}); if (part) list.push([key, part]); });
+      return list;
+    },
+    /** Deletes every shard. True when all are gone. */
+    async clear(g = S.gen) {
+      pending.clear();
+      const user = ukey();
+      let ok = true;
+      await pool(all(), 8, async i => { if (g !== S.gen || !(await del(keyOf(user, i)))) ok = false; });
+      return ok;
+    },
+  };
+}
+
+const pathShards = lazyShards('paths', PATH_SHARDS, 'file paths');
+let filesDirty = false, fileSaves = Promise.resolve(), carried = null, legacyLeft = [];
+
+/** Stores (or with null deletes) a repo's packed file paths at the next saveFiles. */
+export const setPaths = pathShards.set;
+/** A repo's packed file paths, or null. */
+export const readPaths = pathShards.readOne;
+/** Every repo's packed paths (see lazyShards.loadAll): what a search of file names reads, on demand. */
+export const loadAllPaths = pathShards.loadAll;
+export const pathShardOf = pathShards.shardOf;
+/** Writes the pending paths only (the upgrade of an older layout packs a lot of them before their summaries are due). */
+export const savePaths = (g = S.gen) => mayWrite(g) ? pathShards.save(g) : Promise.resolve(false);
+/** The summaries (S.files) changed: the next saveFiles writes them. */
+export const markFiles = () => { filesDirty = true; };
+function forgetFiles() { pathShards.forget(); filesDirty = false; carried = null; legacyLeft = []; }
+
+/**
+ * Writes what changed of the file lists: first the paths, then the summaries. In that order on purpose: a summary says
+ * "this repo's list is stored, as of this push", so it must never reach the store before the paths it describes (a tab
+ * closed in between leaves an older summary, and the repo is simply fetched again). Saves run one after another.
+ */
+export function saveFiles(g = S.gen) {
+  const run = fileSaves.then(async () => {
+    if (!mayWrite(g)) return false;
+    if (!(await pathShards.save(g))) return false;   // the summaries wait for their paths
+    if (!filesDirty) return true;
+    if (!mayWrite(g)) return false;
+    filesDirty = false;
+    const ok = await put('filesum:' + ukey(), {v: FILESUM_VERSION, at: Date.now(), recs: S.files, ...(legacyLeft.length ? {old: legacyLeft} : {})});
+    if (!ok) filesDirty = true;
+    return ok;
+  });
+  fileSaves = run.catch(() => false);
+  return run;
+}
+
+/**
+ * Reads the file-list summaries of the profile: {recs, legacy} — `legacy`: lists stored by an older version are still to
+ * be taken over (files.js upgradeFiles) — or null if the profile changed meanwhile. Without a summaries record the 64
+ * shards of the older layout are looked for: nothing there either means no list was ever pulled.
+ */
 export async function loadFiles(g = S.gen) {
-  const got = await fileShards.load(g);
-  if (!got) return null;
-  info('store', `file lists: ${Object.keys(got.out).length.toLocaleString()} repos read from ${FILE_SHARDS} shards`);
-  return got.out;
+  const user = ukey(), key = 'filesum:' + user, sum = await get(key);
+  if (g !== S.gen) return null;
+  if (sum?.recs && typeof sum.recs === 'object') {
+    legacyLeft = Array.isArray(sum.old) ? sum.old.filter(i => Number.isInteger(i) && i >= 0 && i < LEGACY_FILE_SHARDS) : [];
+    info('store', `file lists: ${Object.keys(sum.recs).length.toLocaleString()} summaries read (the paths stay in their ${PATH_SHARDS} shards until a search needs them)${legacyLeft.length ? ` · ${legacyLeft.length} shard(s) of the older layout are still to be taken over` : ''}`);
+    return {recs: sum.recs, legacy: legacyLeft.length > 0};
+  }
+  legacyLeft = [];
+  if (unreadable.has(key)) return {recs: {}, legacy: false};   // unknown, not empty: nothing is taken over on top of a record that could not be read
+  // Is there an older layout? Its shards are big, so they are asked about one after the other, up to the first that exists.
+  for (let i = 0; i < LEGACY_FILE_SHARDS; i++) {
+    const part = await get(`files:${user}:${i}`, {keep: false});
+    if (g !== S.gen) return null;
+    if (part || unreadable.has(`files:${user}:${i}`)) { legacyLeft = Array.from({length: LEGACY_FILE_SHARDS - i}, (_, k) => i + k); break; }
+  }
+  if (legacyLeft.length) info('store', `file lists: stored in the older layout (64 big shards, all read at every start): they are taken over once, into summaries and ${PATH_SHARDS} small shards of packed paths`);
+  return {recs: {}, legacy: legacyLeft.length > 0};
+}
+
+/** The shards of the older layout still to take over. */
+export const legacyFileShards = () => [...legacyLeft];
+/** One of them: {<repo id>: {p: [paths], …}}; null when it does not exist; undefined when it could not be read (it is
+ *  then left alone). */
+export async function readLegacyFiles(i) {
+  const key = `files:${ukey()}:${i}`, part = await get(key, {keep: false});
+  return part === null && unreadable.has(key) ? undefined : part;
+}
+/** An older shard was taken over (or never existed): it is deleted and no longer listed. False if it could not be deleted. */
+export async function dropLegacyFiles(i, existed = true) {
+  if (existed && !(await del(`files:${ukey()}:${i}`))) return false;
+  legacyLeft = legacyLeft.filter(x => x !== i);
+  filesDirty = true;
+  return true;
+}
+
+/** Deletes every stored file list of the profile: the summaries first (so nothing ever claims paths that are gone), then
+ *  the paths. Call with S.files already emptied. */
+export async function clearStoredFiles(g = S.gen) {
+  if (!mayWrite(g)) return false;
+  pathShards.forget();
+  filesDirty = false;
+  const user = ukey(), old = legacyLeft;
+  legacyLeft = [];   // lists of the older layout that were not taken over yet go too, or the next start would bring them back
+  let ok = await put('filesum:' + user, {v: FILESUM_VERSION, at: Date.now(), recs: S.files});
+  for (const i of old) if (!(await del(`files:${user}:${i}`))) ok = false;
+  return (await pathShards.clear(g)) && ok;
+}
+
+/** Takes the stored file paths of the profile on screen along (out of a visit's memory, or of the store being switched
+ *  off): the next saveAll() writes them to the store then in use. */
+export async function carryPaths() {
+  carried = await pathShards.exportAll();
+  if (!carried.length) carried = null;
 }

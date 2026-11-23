@@ -31,14 +31,14 @@
   </div>
   <!-- Row 2: the search, its order, and where it looks. -->
   <div class="hrow">
-    <input id="q" type="search" placeholder="Search name, about, topics, &quot;exact phrase&quot;, -exclude, lang:rust, stars:>1000…  (/ to focus)" title="Supports &quot;exact phrases&quot;, -excluded terms, and qualifiers: lang:, owner:, topic:, is:active, is:archived, is:fork, is:hiddenfork, is:anyfork, is:original, stars:>1000, stars:>=1k, stars:10..500" aria-label="Search">
+    <input id="q" type="search" placeholder="Search name, about, topics, &quot;exact phrase&quot;, -exclude, lang:rust, stars:>1000…  (/ to focus)" title="Supports &quot;exact phrases&quot;, -excluded terms, and qualifiers: lang:, owner:, topic:, is:active, is:archived, is:alive, is:quiet, is:stale, is:fork, is:hiddenfork, is:anyfork, is:original, is:removed, license:none, license:mit, license:copyleft, stars:>1000, stars:>=1k, stars:10..500; once file lists are pulled: has:pcb, has:hardware, has:3d, has:firmware, has:prebuilt, build:esp-idf, ext:stl, path:gerber, files:>1000" aria-label="Search">
     <select id="sort" aria-label="Sort"></select><!-- options come from SORT_OPTIONS in js/sort.js (filled by initList) -->
     <div class="grp searchin" role="group" aria-label="Search in">
       <span class="grp-label">Also search in</span>
       <label title="Also search the text of every pulled README (pull them with 📄 READMEs below)"><input type="checkbox" id="inReadme"> READMEs <span class="muted" id="cntReadme"></span></label>
       <label title="Also search every pulled commit message (pull them with 📝 Commits below)"><input type="checkbox" id="inCommits"> Commits <span class="muted" id="cntCommits"></span></label>
       <label title="Also search every pulled release: tag, title and whole notes (pull them with 🏷 Releases below)"><input type="checkbox" id="inReleases"> Releases <span class="muted" id="cntReleases"></span></label>
-      <label title="Also search the file names and paths of every pulled file list (pull them with 📁 Files below). Search qualifiers: has:pcb, has:3d, has:hardware, has:firmware, ext:stl, path:gerber"><input type="checkbox" id="inFiles"> Files <span class="muted" id="cntFiles"></span></label>
+      <label title="Also search the file names and paths of every pulled file list (pull them with 📁 Files below). The names are read into memory when you tick this (a few seconds for a large collection) and let go again a while after you untick it. What the files are (has:pcb, has:3d, has:hardware, has:firmware, ext:stl, build:platformio) is searchable without it."><input type="checkbox" id="inFiles"> Files <span class="muted" id="cntFiles"></span></label>
     </div>
   </div>
 </header>
@@ -90,7 +90,8 @@ if (self !== top) document.documentElement.hidden = true;   // framed by another
       <button id="indexFiles" title="Lists the files of every starred repo: names and folders only, no file is downloaded (one request per repo, 304 = free when unchanged). Shows what a repo holds: PCB and schematic sources, Gerbers, 3D models, firmware, notebooks…">📁 Files</button><button id="caret-files" class="caret" aria-expanded="false" aria-controls="menu-files" aria-label="File list options" title="Options">▾</button>
       <div class="menu" id="menu-files" role="group" aria-label="Files" hidden>
         <p class="menu-stat" id="stat-files"></p>
-        <p class="menu-note">Search: <code>has:pcb</code> <code>has:3d</code> <code>has:hardware</code> <code>has:firmware</code> <code>has:platformio</code> <code>ext:stl</code> <code>path:gerber</code> <code>files:&gt;1000</code></p>
+        <p class="menu-note">Search: <code>has:pcb</code> <code>has:eda</code> <code>has:hardware</code> <code>has:3d</code> <code>has:firmware</code> <code>has:prebuilt</code> <code>has:kicad</code> <code>build:platformio</code> <code>ext:stl</code> <code>path:gerber</code> <code>files:&gt;1000</code></p>
+        <p class="menu-note">Kinds count a repo's own files; what its bundled libraries and SDKs hold is shown apart (📦).</p>
         <button id="clearFiles" class="danger"></button>
       </div>
     </span>

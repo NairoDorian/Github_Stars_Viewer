@@ -89,15 +89,27 @@ const rateNote = r => {
 };
 
 
-/** REST GET. Throws on auth / rate-limit / unexpected errors; returns the response for 2xx, 304 and 404. */
+/** REST GET. Throws on auth / rate-limit / unexpected errors; returns the response for 2xx, 304 and 404.
+ *  A 403 / 429 is one of three things, told apart here: the hourly budget used up (`rateLimited`, with its refill time);
+ *  GitHub's secondary limit, "slow down, too many requests at once" (`secondary`, with `retryAfter` seconds when GitHub
+ *  names them: it still has budget, so waiting for the hourly refill would be an hour lost); or a repository GitHub
+ *  blocks (`status` 403 with GitHub's own words in `detail`). */
 export async function gh(path, extraHeaders) {
   const r = await ghFetch(path, {headers: headers(extraHeaders)});
   if (r.status === 401) { needToken(); throw Object.assign(new Error('Token rejected by GitHub. Update it in the 🔑 panel.'), {fatal: true}); }
-  if (r.status === 429 || (r.status === 403 && r.headers.get('x-ratelimit-remaining') === '0')) {
-    if (!S.token) needToken();
-    throw rateLimitError(r, 'core');   // says which budget, its size, and the exact refill time
+  if (r.status === 403 || r.status === 429) {
+    if (r.headers.get('x-ratelimit-remaining') === '0') {
+      if (!S.token) needToken();
+      throw rateLimitError(r, 'core');   // says which budget, its size, and the exact refill time
+    }
+    const detail = String((await r.json().catch(() => null))?.message || ''), retryAfter = Number(r.headers.get('retry-after')) || 0;
+    if (r.status === 429 || retryAfter || /secondary rate limit|abuse detection|too many requests/i.test(detail)) {
+      warn('http', `GitHub asked to slow down (secondary rate limit${retryAfter ? ', retry after ' + retryAfter + ' s' : ''}): the budget is not used up`);
+      throw Object.assign(new Error('GitHub asked to slow down (secondary limit)'), {secondary: true, retryAfter});
+    }
+    throw Object.assign(new Error('GitHub 403'), {status: 403, detail});
   }
-  if (!r.ok && r.status !== 404 && r.status !== 304) throw new Error('GitHub ' + r.status);
+  if (!r.ok && r.status !== 404 && r.status !== 304) throw Object.assign(new Error('GitHub ' + r.status), {status: r.status});
   return r;
 }
 
@@ -245,8 +257,12 @@ export async function starredOf(login) {
   const first = await gh(path(1));
   if (!first.ok) throw new Error(first.status === 404 ? `User "${login}" not found` : 'GitHub ' + first.status);
   const last = Number(first.headers.get('Link')?.match(/[?&]page=(\d+)>; rel="last"/)?.[1] || 1), pages = [await first.json()];
-  await pool(Array.from({length: last - 1}, (_, i) => i + 2), 6, async p => { pages[p - 1] = await (await gh(path(p))).json(); });
-  return pages.flat().map(x => ({id: x.id, full: x.full_name}));
+  await pool(Array.from({length: last - 1}, (_, i) => i + 2), 6, async p => {
+    const r = await gh(path(p));
+    if (!r.ok) throw new Error('GitHub ' + r.status);   // a page that isn't a list (404: the user vanished meanwhile) must not pass as stars
+    pages[p - 1] = await r.json();
+  });
+  return pages.flat().filter(x => x?.full_name).map(x => ({id: x.id, full: x.full_name}));
 }
 
 /** One user's starred-repo count with a single REST request: the page number of the "last" link when each page holds one
@@ -293,9 +309,14 @@ export function activityNow(a) {
    current star count, and one sample per day is kept in `r.starHist` = [[dayTimestamp, count], …] (≤ 400 days).
    The fallback shows gains between local samples; it fills in as the app is used. */
 const MAX_SAMPLES = 400;
+/** Adds today's star count to the samples. A stretch of days with the same count is kept as its first and last day only
+ *  (most repos gain no star on most days: one sample a day for every repo was the heaviest field of the stored star
+ *  list, and it is rewritten at every check). The gains drawn from the samples are exactly the same. */
 export function recordStars(hist, count, now = Date.now()) {
-  const day = Math.floor(now / DAY) * DAY, h = hist ? [...hist] : [];
-  if (h.length && h.at(-1)[0] === day) h[h.length - 1] = [day, count]; else h.push([day, count]);
+  const day = Math.floor(now / DAY) * DAY, h = [];
+  const add = s => { const n = h.length; if (n >= 2 && h[n - 1][1] === s[1] && h[n - 2][1] === s[1]) h[n - 1] = s; else h.push(s); };
+  for (const s of hist || []) add(s);
+  if (h.length && h.at(-1)[0] === day) { h.pop(); add([day, count]); } else add([day, count]);
   return h.length > MAX_SAMPLES ? h.slice(-MAX_SAMPLES) : h;
 }
 /** Stars gained per 2-week bucket over the last 12 months from the samples. Buckets before the first sample are

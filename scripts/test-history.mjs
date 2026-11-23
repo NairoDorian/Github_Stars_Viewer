@@ -514,6 +514,67 @@ test('options: release notes are always whole, 1,000 commits by default, and an 
   S.history = {};
 });
 
+test('opening an index from another browser never cuts, strips or resets it: the options are fitted to what is stored', async () => {
+  const {fitOptsToIndex, keepOptsWithIndex, noteStoredOpts, LEGACY_COMMITS} = await import('../public/js/history.js');
+  const {get} = await import('../public/js/store.js');
+  const fresh = () => { setHistOpts(DEFAULT_OPTS); storage.delete('starsViewer.histOpts'); };   // a browser that never saved a choice
+  const commits = n => Array.from({length: n}, (_, i) => ['o' + i, i, 'm']);
+  // The index was built with "100 commits per repo", mentions kept. A browser with the defaults (1,000, strip mentions)
+  // opens it: applied as they are, they would reset every repo cut at 100 and strip every note.
+  const built = () => ({
+    cut: {c: commits(100), head: 'h', tail: 't', done: true, capped: true, rel: [['v1', '', 1, 'thanks @alice', 0]], relN: 1, ro: ':0'},
+    small: {c: commits(7), head: 'h', tail: 't', done: true, capped: false, rel: [['v1', '', 1, 'by @bob', 0]], relN: 1, ro: ':0'},
+    _meta: 'not a record',
+  });
+  fresh();
+  S.history = built();
+  assert.equal(fitOptsToIndex(null), true);
+  assert.deepEqual(histOpts(), {mentions: false, links: false, notes: 0, commits: 100}, 'read from the records: the length they were cut at, and what their notes kept');
+  let r = reconcile();
+  assert.deepEqual([r.stripped, r.refetch, r.trimmed, r.restart], [0, 0, 0, 0], 'nothing to apply');
+  assert.deepEqual([S.history.cut.c.length, S.history.cut.done, S.history.cut.rel[0][3], S.history.small.rel[0][3]], [100, true, 'thanks @alice', 'by @bob']);
+  assert.equal(fitOptsToIndex(null), false, 'already fitted');
+  // without the fit, the same defaults would have wiped it (what used to happen)
+  const wiped = reconcile({...DEFAULT_OPTS});
+  assert.deepEqual([wiped.restart, wiped.stripped, S.history.cut.c.length], [1, 2, 0]);
+
+  // An index never cut, longer than this browser's limit: the limit is raised to one that cuts nothing.
+  fresh();
+  S.history = {long: {c: commits(4000), done: true, capped: false, rel: [], ro: 'm:0'}};
+  fitOptsToIndex(null);
+  assert.deepEqual([histOpts().commits, reconcile().trimmed], [LEGACY_COMMITS, 0], 'an index of the old 10,000 default keeps it');
+  setHistOpts({commits: 500});   // this browser chose 500 earlier, for another index
+  S.history = {long: {c: commits(30_000), done: true, capped: false, rel: [], ro: 'm:0'}};
+  fitOptsToIndex(null);
+  assert.deepEqual([histOpts().commits, reconcile().trimmed, S.history.long.c.length], [50_000, 0, 30_000]);
+
+  // This browser's own notes choice stands when it strips nothing the index kept (a "keep @mentions" still being
+  // downloaded again is not reverted) …
+  fresh(); setHistOpts({mentions: false});
+  S.history = {a: {c: [], done: true, rel: [['v1', '', 1, 'thanks', 0]], relN: -1, ro: 'm:0'}, b: {c: [], done: true, rel: [['v1', '', 1, 'thanks', 0]], relN: -1, ro: 'm:0'}};
+  assert.equal(fitOptsToIndex(null), false);
+  assert.equal(histOpts().mentions, false);
+  // … but not when it would strip what the index kept
+  fresh(); setHistOpts({links: true});
+  S.history = {a: {c: [], done: true, rel: [['v1', '', 1, 'see https://x.test', 0]], relN: 1, ro: 'm:0'}};
+  fitOptsToIndex(null);
+  assert.deepEqual([histOpts().links, reconcile().stripped, S.history.a.rel[0][3]], [false, 0, 'see https://x.test']);
+
+  // The choice is kept with the index (a record of its own), and wins over whatever the browser has.
+  fresh(); setHistOpts({commits: 250, mentions: false, links: true});
+  S.user = 'optuser'; S.loading = null;
+  noteStoredOpts('optuser', null);
+  await keepOptsWithIndex();
+  assert.deepEqual(await get('histopts:optuser'), {mentions: false, links: true, commits: 250});
+  fresh();
+  S.history = built();
+  assert.equal(fitOptsToIndex(await get('histopts:optuser')), true);
+  assert.deepEqual(histOpts(), {mentions: false, links: true, notes: 0, commits: 250}, 'the stored choice, not the defaults and not a guess');
+  assert.equal(fitOptsToIndex({commits: 250}), false, 'a record that lacks a value keeps the current one');
+  setHistOpts(DEFAULT_OPTS);
+  S.history = {}; S.user = '';
+});
+
 // ---------- sharded storage ----------
 const store = await import('../public/js/store.js');
 

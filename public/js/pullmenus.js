@@ -1,14 +1,14 @@
 // The ▾ menus of the four "Pull for search" buttons (📄 READMEs, 📝 Commits, 🏷 Releases, 📁 Files): a small drop-down under
 // each button with that category's options and a 🗑 to clear what was pulled. Commits: how many per repo. Releases:
 // strip @mentions / links from the notes (always kept whole). The rules themselves live in history.js / files.js.
-import {S, bumpIndex} from './state.js';
+import {S, ukey, bumpIndex} from './state.js';
 import {$, status} from './util.js';
 import {ghFetch, headers} from './github.js';
-import {saveHistory} from './store.js';
+import {get, saveHistory} from './store.js';
 import {render} from './list.js';
 import {waitIdle, clearReadmes} from './sync.js';
 import {info} from './log.js';
-import {histOpts, setHistOpts, forgetHistOpts, reconcile, historyTotals, partCounts, keepLegacyCommitCap, clearPart, COMMIT_CHOICES} from './history.js';
+import {histOpts, setHistOpts, forgetHistOpts, reconcile, historyTotals, partCounts, fitOptsToIndex, noteStoredOpts, keepOptsWithIndex, clearPart, COMMIT_CHOICES} from './history.js';
 import {clearFiles, fileTotals} from './files.js';
 
 const n = x => x.toLocaleString();
@@ -67,7 +67,7 @@ async function change(patch, noteId) {
   while (S.loading) await S.loading;   // the records must be loaded before they can be changed
   await waitIdle();   // never edit records while a pull is writing them
   const o = histOpts(), g = S.gen, r = reconcile(o);
-  if (g === S.gen) await saveHistory(g);
+  if (g === S.gen) { await saveHistory(g); await keepOptsWithIndex(g); }   // the choice is kept with the index it was applied to
   bumpIndex();
   render();
   const warn = patch.commits === 0 ? ' ALL commits: repos with 100k+ commits (Linux, Chromium…) cost about one request per 100 commits and tens of MB each. Cancel keeps the progress.' : '';
@@ -105,9 +105,14 @@ export function resetHistOpts() {
   for (const id of ['#note-commits', '#note-releases']) $(id).textContent = '';
 }
 
-/** Brings stored records in line with the saved options after the cache was loaded (a no-op when nothing differs). */
+/** After the cache was loaded: the options are fitted to the stored index (it is never cut, stripped or reset just by
+ *  being opened, see history.js fitOptsToIndex), then the records are brought in line with them (a no-op unless a
+ *  change of options was left half applied). */
 export async function reconcileStored(g) {
-  if (keepLegacyCommitCap()) fill();
+  const stored = await get('histopts:' + ukey());
+  if (g !== S.gen) return {};
+  noteStoredOpts(ukey(), stored);
+  if (fitOptsToIndex(stored)) fill();
   const r = reconcile();
   if (r.stripped || r.refetch || r.trimmed || r.restart) { if (g === S.gen) await saveHistory(g); bumpIndex(); }
   return r;

@@ -15,12 +15,15 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 // read checks for the gzip signature, so plain files written by older versions still load.
 // Only a missing file means "nothing stored yet" (null). Any other failure (a damaged file, a file still locked) throws, so
 // the app marks the key unreadable instead of building an empty replacement and saving it over the real data.
+// A browser that accepts gzip (they all do) gets the stored bytes as they are, marked "Content-Encoding: gzip": the
+// server neither inflates hundreds of MB at every start nor holds them in memory, and the browser inflates off its main
+// thread. Returns {data, gz}: the file's bytes and whether they are gzip-compressed; null when there is no file.
 const GZIP_MIN = 64 * 1024;
 async function readCache(file) {
   for (let i = 0; ; i++) {
     try {
       const d = await fsp.readFile(file);
-      return d[0] === 0x1f && d[1] === 0x8b ? await gunzip(d) : d;
+      return {data: d, gz: d[0] === 0x1f && d[1] === 0x8b};
     } catch (e) {
       if (e.code === 'ENOENT') return null;
       if (i >= 5 || !LOCKED.has(e.code)) throw e;
@@ -132,8 +135,10 @@ async function handle(req, res) {
     const file = dataFile(key);
     if (req.method === 'GET') {
       await queues.get(file)?.catch(() => {});   // never read while a write is pending
-      const d = await readCache(file);   // a failed read is a 500 (see readCache)
-      return send(res, 200, d || 'null', 'application/json');   // a missing key is "no data yet", not an error (a cold load reads ~260 keys)
+      const got = await readCache(file);   // a failed read is a 500 (see readCache)
+      if (!got) return send(res, 200, 'null', 'application/json');   // a missing key is "no data yet", not an error (a cold load reads ~260 keys)
+      if (got.gz && /\bgzip\b/i.test(String(req.headers['accept-encoding'] || ''))) return send(res, 200, got.data, 'application/json', {'Content-Encoding': 'gzip', Vary: 'Accept-Encoding'});
+      return send(res, 200, got.gz ? await gunzip(got.data) : got.data, 'application/json');   // a damaged file fails to inflate: a 500, never passed on as "empty"
     }
     if (req.method === 'PUT') { await save(file, await readBody(req)); return send(res, 204); }
     if (req.method === 'DELETE') { await settled(); await fsp.rm(file, {force: true}); return send(res, 204); }

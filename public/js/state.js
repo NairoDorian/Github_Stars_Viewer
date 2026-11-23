@@ -70,6 +70,46 @@ export function readmeLower(r) {
   return low;
 }
 
+/**
+ * What a README says the project is: its first real paragraph, as plain text of at most `max` characters. Headings,
+ * badges and images, HTML-only lines, tables, lists of links (a table of contents), code blocks, rules and notices are
+ * skipped; links keep their text. '' when nothing of the kind is found. Used when a repo has no description on GitHub.
+ */
+export function summarize(text, max = 240) {
+  const lines = String(text || '').slice(0, 20_000).replace(/\r\n?/g, '\n').replace(/<!--[\s\S]*?-->/g, '').split('\n');
+  const plain = s => s.replace(/!\[[^\]]*\]\([^)]*\)/g, ' ').replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/\[([^\]]*)\]\[[^\]]*\]/g, '$1')
+    .replace(/<[^>]+>/g, ' ').replace(/(?:https?:\/\/|www\.)\S+/g, ' ').replace(/[*_`~]+/g, '').replace(/&nbsp;|&#160;/g, ' ').replace(/\s+/g, ' ').trim();
+  let block = [], fence = false;
+  const done = () => {
+    const t = plain(block.join(' '));
+    block = [];
+    // real prose: enough letters, and not a line of bare labels ("English | 中文", "Docs · Demo · Discord")
+    return (t.match(/\p{L}/gu) || []).length >= 25 && !/^[^.!?。]{0,60}(?:\s[|·•]\s[^.!?。]{0,40}){1,}$/.test(t) ? t : '';
+  };
+  for (let i = 0; i <= lines.length; i++) {
+    const line = i < lines.length ? lines[i].trim() : '';
+    if (/^(```|~~~)/.test(line)) { fence = !fence; block = []; continue; }
+    if (fence) continue;
+    const skip = /^(#{1,6}\s|[-=*_]{3,}\s*$|\||>|[-*+]\s+\[|\d+[.)]\s+\[|\[[^\]]+\]:\s|---$)/.test(line) || (i + 1 < lines.length && /^(={3,}|-{3,})\s*$/.test(lines[i + 1].trim()) && line);
+    if (line && !skip) { block.push(line); continue; }
+    if (block.length) {
+      const t = done();
+      if (t) return t.length <= max ? t : t.slice(0, t.lastIndexOf(' ', max) > max * 0.6 ? t.lastIndexOf(' ', max) : max).replace(/[\s,;:.]+$/, '') + '…';
+    }
+  }
+  return '';
+}
+// Per README entry (entries are replaced when a README changes).
+const summaryCache = new WeakMap();
+/** The summary of a repo's README (see summarize), '' when it has none. */
+export function readmeSummary(r) {
+  const e = readmeEntry(r);
+  if (!e?.t) return '';
+  let s = summaryCache.get(e);
+  if (s === undefined) summaryCache.set(e, s = summarize(e.t));
+  return s;
+}
+
 export const bumpIndex = () => { S.indexVer++; };
 
 // Commit messages and/or release notes of one repo as a single lower-cased text (one line per message, releases first,

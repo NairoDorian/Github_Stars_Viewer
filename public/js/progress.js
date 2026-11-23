@@ -43,7 +43,7 @@ function row(id, l, n, now) {
   return `<div class="lane ${l.state}" data-lane="${esc(id)}"><span class="lane-label"><b>${n}</b> ${esc(l.label)}</span>${bar}<span class="lane-text">${esc(text)}</span></div>`;
 }
 function draw() {
-  const el = $('#lanes');
+  const el = globalThis.document ? $('#lanes') : null;   // a redraw timer can outlive its page (the unit tests)
   if (!el) return;
   el.hidden = lanes.size === 0;
   if (!lanes.size) { el.innerHTML = ''; return; }

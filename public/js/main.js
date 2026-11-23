@@ -9,7 +9,8 @@
 //   sync.js         keeping stars, tiles and READMEs in sync with GitHub cheaply; one job at a time per profile
 //   history.js      every commit message and release note of every star: fetching, options, stripping
 //   filekinds.js    what file names say about a repo (PCB sources, 3D models, firmware…): pure rules
-//   files.js        the file list (names only) of every star: fetching, top-up, clearing
+//   paths.js        file paths packed (each folder once) and searched in that form: pure functions
+//   files.js        the file list (names only) of every star: fetching, top-up, clearing; paths read on demand
 //   pullmenus.js    the ▾ menus of the four Pull buttons: options and 🗑 clear per category
 //   progress.js     the live progress panel: one bar per step, counts, speed, time left
 //   sort.js         shared ordering rules (stars and Discover results)
@@ -24,14 +25,14 @@
 // panel's 👁 Visit button and ?visit=<login> all start a visit; "★ Make this my profile" turns a visit into your profile.
 import {S, ukey, nextGen, bumpIndex, isMine, mineOf} from './state.js';
 import {starredOf} from './github.js';
-import {initLog, LOG, info, warn, debug} from './log.js';
+import {initLog, LOG, info, warn, debug, bytes} from './log.js';
 import {$, ago, esc, status, secs} from './util.js';
-import {get, peek, saveConfig, initStore, setPersist, persisting, isUnreadable, clearAll, saveAll, loadHistory, loadFiles, forgetHistoryDirty, setVisit, adoptProfile, CACHE_VERSION} from './store.js';
+import {get, peek, saveConfig, initStore, setPersist, persisting, isUnreadable, clearAll, saveAll, loadHistory, loadFiles, forgetHistoryDirty, carryPaths, setVisit, adoptProfile, CACHE_VERSION} from './store.js';
 import {task, waitIdle, sync, enrich, indexReadmes, readmeSteps, migrateReadmes} from './sync.js';
 import {indexCommits, indexReleases, indexHistory} from './history.js';
 import {initPullMenus, resetHistOpts, reconcileStored} from './pullmenus.js';
 import {plan} from './progress.js';
-import {indexFiles} from './files.js';
+import {indexFiles, upgradeFiles, filesNeedUpgrade, releasePaths} from './files.js';
 import {render, initList, resetFilters, resetListPrefs, prepareHistorySearch} from './list.js';
 import {initDiscover, closeDiscover, resetDiscoverPrefs} from './discover.js';
 import {initUsers, closeUsers, renderUsers, resetUsersPrefs} from './users.js';
@@ -115,6 +116,7 @@ async function load({login, visit, push = false, why = ''} = {}) {
   const g = nextGen();          // running jobs see the new generation and abort without saving
   if (visiting && !S.mine) loadMine(g);
   forgetHistoryDirty();         // shards the previous profile had not saved yet must not be written for this one
+  releasePaths();               // nor do its file names stay in memory
   // Nothing of the old profile may be clicked or saved from here on: S.user changes now, but S.disc & co. only after the read.
   closeDiscover();
   closeUsers();
@@ -157,9 +159,9 @@ async function load({login, visit, push = false, why = ''} = {}) {
     if (g !== S.gen) return;
     S.readmes = readmes || {};
     S.history = commitHistory || {};
-    S.files = fileLists || {};
+    S.files = fileLists?.recs || {};
     S.users = users || {};
-    info('load', `cache of ${u}: ${Object.keys(S.readmes).length.toLocaleString()} READMEs · ${Object.keys(S.history).length.toLocaleString()} repos indexed for commits & releases · ${Object.keys(S.users).length.toLocaleString()} user star counts`);
+    info('load', `cache of ${u}: ${Object.keys(S.readmes).length.toLocaleString()} READMEs · ${Object.keys(S.history).length.toLocaleString()} repos indexed for commits & releases · ${Object.keys(S.files).length.toLocaleString()} file lists · ${Object.keys(S.users).length.toLocaleString()} user star counts`);
     await reconcileStored(g);   // stored release notes follow the strip / length options
     bumpIndex();
     migrateReadmes();
@@ -169,11 +171,19 @@ async function load({login, visit, push = false, why = ''} = {}) {
   }
   const searchHistory = $('#inCommits').checked || $('#inReleases').checked;
   if (searchHistory) { await prepareHistorySearch(); if (g !== S.gen) return; }   // build the search text in slices, not in the first render
-  if ($('#inReadme').checked || searchHistory) render();
+  // The cards drawn before this point know nothing of the READMEs, the commit index or the file lists (their badges, the
+  // "File kinds" filters, the search-in counts, hidden forks by README or history). The check below redraws too, but it
+  // may never get that far (offline, a used-up budget, another tab holding this profile's lock).
+  render();
   renderUsers();
   // Show the new user's cache immediately. The old profile's network job can finish before this sync starts.
   await waitIdle();
   if (g !== S.gen) return;
+  // File lists kept by an older version (or summarized by older rules) are brought up to date first: no request, once.
+  if (filesNeedUpgrade()) {
+    await task(async function upgrade(gen) { if (await upgradeFiles(gen)) { bumpIndex(); render(); } });
+    if (g !== S.gen) return;
+  }
   await task(sync);
   if (g !== S.gen) return;
   // The first profile that GitHub really answered for becomes yours: a typo is never remembered as the next start's profile.
@@ -187,6 +197,7 @@ async function load({login, visit, push = false, why = ''} = {}) {
 async function adopt() {
   const u = S.user;
   info('visit', `★ ${u} becomes your profile`);
+  await carryPaths();   // the file names this visit pulled live in its memory only: they come along (saveAll below stores them)
   setVisit('');
   adoptProfile(u);
   S.home = u;
@@ -194,7 +205,9 @@ async function adopt() {
   await saveConfig();
   if (persisting() && (await get('stars:' + ukey()) || isUnreadable('stars:' + ukey()))) return load({login: u, visit: false, why: 'you adopted this profile and a saved copy of it exists'});
   while (S.loading) await S.loading;
-  if (persisting()) await saveAll();
+  // With 💾 off this writes nothing anywhere: it only hands the data to this tab's memory store (the visit's own memory
+  // was emptied when the visit ended), so loading the profile again in this tab doesn't download it all a second time.
+  await saveAll();
   showVisit();
   status(`★ ${u} is now your profile` + (persisting() ? ': everything fetched so far was saved.' : ' (💾 Keep cache is off: nothing is stored).'));
 }
@@ -206,7 +219,23 @@ function initCacheToggle({serverUp, persistOn}) {
   const box = $('#browserCache');
   const where = serverUp ? "in the data/ folder next to the app (compressed)" : 'in this browser (IndexedDB)';
   cacheLabel = serverUp ? '💾 Keep cache on disk' : '💾 Keep cache in this browser';
-  $('#cacheToggle').title = `Off (default): nothing is stored, the data lives in this tab only. On: stars, READMEs, commits & releases, suggestions and your token are kept ${where}, so reloads are instant. Remembered by a cookie. Never used for profiles you only visit.`;
+  const about = `Off (default): nothing is stored, the data lives in this tab only. On: stars, READMEs, commits & releases, file lists, suggestions and your token are kept ${where}, so reloads are instant. Remembered by a cookie. Never used for profiles you only visit.`;
+  $('#cacheToggle').title = about;
+  /** Online the cache is this browser's IndexedDB, which a browser may clear on its own when space runs low: it is asked
+   *  to keep it, and the tooltip says how much room is used and left. (With the local server the data is in data/.) */
+  const browserStorage = async () => {
+    const st = globalThis.navigator?.storage;
+    if (serverUp || !st?.estimate) return;
+    try {
+      const kept = persisting() ? (await st.persisted?.()) || (await st.persist?.()) || false : null;
+      const {usage = 0, quota = 0} = await st.estimate();
+      const line = `This browser's storage: ${bytes(usage)} used of ${bytes(quota)} allowed${kept === true ? ' · protected: the browser will not clear it on its own' : kept === false ? ' · the browser may clear it when space runs low' : ''}`;
+      $('#cacheToggle').title = `${about}\n${line}`;
+      info('store', line);
+      if (persisting() && quota && usage / quota > 0.8) status(`⚠ This browser's storage is ${Math.round(usage / quota * 100)} % full (${bytes(usage)} of ${bytes(quota)}): saving may start to fail. The local version (node server.js) has no such limit.`);
+    } catch {}
+  };
+  browserStorage();
   showCacheBox();
   box.checked = persistOn;
   box.onchange = async () => {
@@ -216,14 +245,18 @@ function initCacheToggle({serverUp, persistOn}) {
     if (!on) return status(serverUp ? '💾 Cache off: this tab keeps working, nothing more is saved. Files already in data/ are untouched (🗑 Clear cache deletes them).'
       : '💾 Cache off and erased from this browser: the data (and your token) stay in this tab only.');
     while (S.loading) await S.loading;
+    // A token stored earlier is taken over when this tab has none — before anything is saved: saving this tab's config
+    // (no token) first would erase the stored one for good.
+    const stored = await get('config');
+    if (stored?.token && !S.token) setToken(stored.token, {save: false});
     if (S.user && await get('stars:' + ukey())) {
       status('💾 Cache found: loading it…');
-      const stored = await get('config');
-      if (stored?.token && !S.token) setToken(stored.token);
+      if (S.home) await saveConfig();   // your profile is known: the stored config names it (with the token kept above)
       return load({login: S.user, visit: false, why: 'Keep cache switched on and a saved copy exists'});   // the profile on screen, not whatever is typed in the box
     }
     await saveAll();
     status('💾 Cache on: everything fetched so far was saved, reloads will be instant.');
+    browserStorage();
   };
 }
 
@@ -261,8 +294,10 @@ async function pullAll(g) {
   plan([...readmeSteps(), ...(S.token ? [['check', 'Check commits & releases'], ['releases'], ['commits']] : []), ['files']]);
   const parts = [await indexReadmes(g, {planned: true})];
   if (S.token && g === S.gen && !S.stop) parts.push(await indexHistory(g, {planned: true}));
-  if (g === S.gen && !S.stop) parts.push(await indexFiles(g, {planned: true}));
+  if (g === S.gen && !S.stop) { parts.push(await indexFiles(g, {planned: true})); if (g === S.gen) $('#inFiles').checked = true; }   // like the other three: what was pulled is searched
   if (g !== S.gen) return;
+  bumpIndex();
+  render();
   const done = parts.filter(Boolean).join(' · ');
   status(`⬇ ${S.stop ? 'Pull all stopped (progress saved: click again to continue)' : 'Pulled all'}: ${done}${S.token ? '' : ' · commits & releases need a token (🔑)'} · ${secs(t0)}`);
 }
@@ -313,7 +348,13 @@ if (location.protocol !== 'file:') {   // ES modules can't run from file://; ind
   $('#refresh').onclick = () => task(sync);
   $('#enrich').onclick = () => task(enrich);
   $('#indexReadme').onclick = () => task(indexReadmes);
-  $('#indexFiles').onclick = () => task(indexFiles);
+  $('#indexFiles').onclick = () => task(async function files(g) {
+    await indexFiles(g);
+    if (g !== S.gen) return;
+    $('#inFiles').checked = true;   // searching the file names is turned on (their paths are read for it, see list.js wantPaths)
+    bumpIndex();
+    render();
+  });
   $('#pullAll').onclick = () => task(pullAll);
   $('#indexCommits').onclick = () => task(indexCommits);
   $('#indexReleases').onclick = () => task(indexReleases);
